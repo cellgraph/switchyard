@@ -86,7 +86,9 @@ GitHub requires a publicly reachable webhook URL for live deliveries. Keep local
 
 ## Branch policy and human handoff
 
-Recommend a ruleset or branch protection for `main` that requires pull requests and the formatting, lint, type, test, and independent Codex review checks. Do not require owner approval for every PR by default. Before configuring anything, inspect actual settings with `gh` and report existing policy; do not reduce existing protections. The repository is not assumed to have any specific setting until it is queried. `ready_for_human` only means Switchyard has satisfied its automation gate; it does not approve or merge the PR.
+Live settings were inspected with `gh` on 2026-11-15. The repository has no rulesets (`gh api repos/cellgraph/switchyard/rulesets` returned `[]`), and the `main` branch-protection endpoint returned “Branch not protected.” No settings were changed.
+
+Recommend a ruleset for `main` that requires pull requests and the `Quality checks` CI status, which runs formatting, lint, type checking, and tests. Enable automatic Codex review for the repository in Codex's GitHub settings. The observed Codex integration publishes a summary comment, not a GitHub status check, so do not configure a required Codex check unless the integration later exposes an enforceable status. Do not require owner approval for every PR by default, and do not reduce any protections already present when applying this recommendation elsewhere. `ready_for_human` only means Switchyard has satisfied its automation gate; it does not approve or merge the PR.
 
 ## References and open questions
 

@@ -31,7 +31,7 @@ Install dependencies with `npm install`. Run `npm run format:check`, `npm run li
 
 ## GitHub setup
 
-The first milestone will need a GitHub App installation with narrowly scoped repository access, webhook configuration, and a reachable webhook URL for live delivery. See [the architecture](docs/architecture.md#github-integration) and [plan 001](docs/plans/001-pr-review-loop.md#phase-2-github-app-and-webhook-inbox) for the proposed permissions and local setup. Repository branch protection or rulesets must keep pull requests required for merging. The recommended settings are documented in the architecture; this project has not configured repository settings.
+The first milestone will need a GitHub App installation with narrowly scoped repository access, webhook configuration, and a reachable webhook URL for live delivery. Enable automatic Codex code review for the repository in Codex's GitHub settings. See [the architecture](docs/architecture.md#github-integration) and [plan 001](docs/plans/001-pr-review-loop.md#phase-2-github-app-and-webhook-inbox) for the proposed permissions and local setup. Configure a ruleset for `main` that requires pull requests and the `Quality checks` CI status. The Codex review summary currently appears as a PR comment; GitHub cannot require that comment as a status check. Do not require owner approval for every PR.
 
 ## Contributing
 
