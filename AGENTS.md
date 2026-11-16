@@ -25,3 +25,17 @@ These shared instructions apply to Codex, Claude Code, and other coding agents. 
 - Implementation PRs need independent automated Codex review and passing CI. Do not require owner approval by default.
 - Do not change GitHub repository security settings as a workaround for automation.
 - Keep the PR open for human approval; Switchyard must never merge it automatically.
+
+## Git Branch Naming
+
+Use semantic branch names with the following prefixes:
+
+- `feat/` — New features
+- `fix/` — Bug fixes
+- `docs/` — Documentation
+- `refactor/` — Code restructuring
+- `test/` — Tests
+- `chore/` — Maintenance and tooling
+
+Do not use the default `codex/` prefix.
+Follow these conventions when creating branches in worktrees.
