@@ -17,7 +17,7 @@
     "test": "vitest run --passWithNoTests"
   },
   "devDependencies": {
-    "@types/node": "^24.10.0",
+    "@types/node": "^26.6.6",
     "@eslint/js": "^10.0.1",
     "eslint": "^10.15.0",
     "globals": "^17.14.0",
