@@ -27,15 +27,15 @@ No message broker or distributed scheduler is needed. A durable local work queue
 
 One workflow row has one of these states:
 
-| State | Meaning and allowed next action |
-| --- | --- |
-| `awaiting_review` | A PR head SHA is recorded. Wait for a review completion signal or reconcile GitHub state. |
-| `review_running` | A recognized Codex review for that head is visibly in progress. Wait; do not start another fix. |
-| `fixing` | Findings for the current reviewed SHA were delivered to the implementation session, which may edit its worktree. |
-| `validating` | The agent turn ended; run the configured validation and inspect the resulting diff before push. |
-| `ready_for_human` | Latest head has an explicit clean review for the same SHA and all configured required checks pass. Human decides what happens next. |
-| `escalated` | Cycle limit, ambiguous review, unsafe change, merge conflict, unavailable session, repeated infrastructure failure, or judgment call requires a person. |
-| `stopped` | User or external lifecycle action stopped/closed the workflow. No automatic restart. |
+| State             | Meaning and allowed next action                                                                                                                         |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `awaiting_review` | A PR head SHA is recorded. Wait for a review completion signal or reconcile GitHub state.                                                               |
+| `review_running`  | A recognized Codex review for that head is visibly in progress. Wait; do not start another fix.                                                         |
+| `fixing`          | Findings for the current reviewed SHA were delivered to the implementation session, which may edit its worktree.                                        |
+| `validating`      | The agent turn ended; run the configured validation and inspect the resulting diff before push.                                                         |
+| `ready_for_human` | Latest head has an explicit clean review for the same SHA and all configured required checks pass. Human decides what happens next.                     |
+| `escalated`       | Cycle limit, ambiguous review, unsafe change, merge conflict, unavailable session, repeated infrastructure failure, or judgment call requires a person. |
+| `stopped`         | User or external lifecycle action stopped/closed the workflow. No automatic restart.                                                                    |
 
 State transitions are performed by controller code and recorded with the triggering event/reason. A later `synchronize` event changes the tracked head and invalidates prior review and CI evidence before returning to `awaiting_review`. An agent cannot set `ready_for_human`; only controller policy can.
 

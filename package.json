@@ -18,12 +18,17 @@
   },
   "devDependencies": {
     "@types/node": "^24.10.0",
-    "@eslint/js": "^9.39.1",
-    "eslint": "^9.39.1",
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.15.0",
     "globals": "^16.5.0",
     "prettier": "^3.6.2",
     "typescript": "^5.9.3",
-    "typescript-eslint": "^8.46.3",
+    "typescript-eslint": "^8.72.2",
     "vitest": "^4.0.8"
+  },
+  "overrides": {
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "^11.0.1"
+    }
   }
 }
