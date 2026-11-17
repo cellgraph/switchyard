@@ -28,6 +28,7 @@ export type Workflow = {
   review: ReviewEvidence | null;
   checks: CheckEvidence[];
   fixCycles: number;
+  cycleAwaitingReview: boolean;
   escalationReason: string | null;
 };
 
@@ -96,10 +97,19 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
           headSha: current.headSha,
         };
       next.review = command.evidence;
-      if (command.evidence.outcome === "completed_with_findings") next.state = "fixing";
-      else if (command.evidence.outcome === "in_progress") next.state = "review_running";
+      if (command.evidence.outcome === "completed_with_findings") {
+        if (current.cycleAwaitingReview) next.fixCycles += 1;
+        next.cycleAwaitingReview = false;
+        if (next.fixCycles >= 3) {
+          next.state = "escalated";
+          next.escalationReason = "Three fix cycles received findings in review.";
+        } else next.state = "fixing";
+      } else if (command.evidence.outcome === "in_progress") next.state = "review_running";
       else if (command.evidence.outcome === "indeterminate") next.state = "escalated";
-      else next.state = isReady(next) ? "ready_for_human" : "awaiting_review";
+      else {
+        next.cycleAwaitingReview = false;
+        next.state = isReady(next) ? "ready_for_human" : "awaiting_review";
+      }
       if (command.evidence.outcome === "indeterminate")
         next.escalationReason = "Review evidence is indeterminate.";
       break;
@@ -132,7 +142,13 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
       if (next.fixCycles >= 3 && command.outcome === "unsuccessful") {
         next.state = "escalated";
         next.escalationReason = "Three unsuccessful fix cycles.";
-      } else next.state = command.outcome === "unsuccessful" ? "fixing" : "awaiting_review";
+      } else if (command.outcome === "unsuccessful") {
+        next.cycleAwaitingReview = false;
+        next.state = "fixing";
+      } else {
+        next.cycleAwaitingReview = true;
+        next.state = "awaiting_review";
+      }
       break;
     case "escalate":
       if (!command.reason.trim())

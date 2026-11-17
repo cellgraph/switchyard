@@ -24,6 +24,7 @@ function fixture(): Workflow {
     review: null,
     checks: [],
     fixCycles: 0,
+    cycleAwaitingReview: false,
     escalationReason: null,
   };
 }
@@ -175,6 +176,32 @@ describe("workflow state and durable store", () => {
     }
     expect(db.getWorkflow("wf-1")).toMatchObject({ state: "escalated", fixCycles: 3 });
     expect(() => db.transition("wf-1", { type: "fix_started" })).toThrow(InvalidTransitionError);
+  });
+
+  it("counts fix cycles rejected by a later review", () => {
+    const db = memoryStore();
+    db.transition("wf-1", {
+      type: "review_received",
+      evidence: { sha: "abc", outcome: "completed_with_findings" },
+    });
+
+    for (let cycle = 1; cycle <= 3; cycle += 1) {
+      expect(db.getWorkflow("wf-1")?.state).toBe("fixing");
+      db.transition("wf-1", { type: "validation_started" });
+      db.transition("wf-1", { type: "cycle_finished", outcome: "successful" });
+      expect(db.getWorkflow("wf-1")?.cycleAwaitingReview).toBe(true);
+      db.transition("wf-1", { type: "head_changed", sha: `head-${cycle}` });
+      db.transition("wf-1", {
+        type: "review_received",
+        evidence: { sha: `head-${cycle}`, outcome: "completed_with_findings" },
+      });
+    }
+
+    expect(db.getWorkflow("wf-1")).toMatchObject({
+      state: "escalated",
+      fixCycles: 3,
+      cycleAwaitingReview: false,
+    });
   });
 
   it("recovers processing deliveries and marks uncertain operations ambiguous without replay", () => {
