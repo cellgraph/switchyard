@@ -132,7 +132,7 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
       if (next.fixCycles >= 3 && command.outcome === "unsuccessful") {
         next.state = "escalated";
         next.escalationReason = "Three unsuccessful fix cycles.";
-      } else next.state = "awaiting_review";
+      } else next.state = command.outcome === "unsuccessful" ? "fixing" : "awaiting_review";
       break;
     case "escalate":
       if (!command.reason.trim())

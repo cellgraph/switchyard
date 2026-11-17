@@ -164,14 +164,14 @@ describe("workflow state and durable store", () => {
   it("escalates after three unsuccessful fix cycles", () => {
     const db = memoryStore();
     for (let i = 0; i < 3; i += 1) {
-      const sha = i === 0 ? "abc" : `head-${i}`;
       db.transition("wf-1", {
         type: "review_received",
-        evidence: { sha, outcome: "completed_with_findings" },
+        evidence: { sha: "abc", outcome: "completed_with_findings" },
       });
+      expect(db.getWorkflow("wf-1")?.state).toBe("fixing");
       db.transition("wf-1", { type: "validation_started" });
       db.transition("wf-1", { type: "cycle_finished", outcome: "unsuccessful" });
-      if (i < 2) db.transition("wf-1", { type: "head_changed", sha: `head-${i + 1}` });
+      if (i < 2) expect(db.getWorkflow("wf-1")?.state).toBe("fixing");
     }
     expect(db.getWorkflow("wf-1")).toMatchObject({ state: "escalated", fixCycles: 3 });
     expect(() => db.transition("wf-1", { type: "fix_started" })).toThrow(InvalidTransitionError);
