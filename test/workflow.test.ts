@@ -127,16 +127,51 @@ describe("workflow state and durable store", () => {
     expect(calls).toBe(1);
   });
 
+  it("makes a failed delivery visible and retryable", () => {
+    const db = memoryStore();
+    db.receiveDelivery("delivery-retry", { action: "review" }, "wf-1");
+    expect(() =>
+      db.processDelivery("delivery-retry", () => {
+        throw new Error("temporary failure");
+      }),
+    ).toThrow("temporary failure");
+    expect(db.pendingDeliveries()).toHaveLength(1);
+    let calls = 0;
+    expect(
+      db.processDelivery("delivery-retry", () => {
+        calls += 1;
+      }),
+    ).toBe(true);
+    expect(calls).toBe(1);
+  });
+
+  it("ignores repeated finding evidence during and after its fix cycle", () => {
+    const db = memoryStore();
+    const finding = { sha: "abc", outcome: "completed_with_findings" as const };
+    db.transition("wf-1", { type: "review_received", evidence: finding });
+    db.transition("wf-1", { type: "validation_started" });
+    const historyLength = db.transitions("wf-1").length;
+    db.transition("wf-1", { type: "review_received", evidence: finding });
+    expect(db.getWorkflow("wf-1")?.state).toBe("validating");
+    expect(db.transitions("wf-1")).toHaveLength(historyLength);
+    db.transition("wf-1", { type: "cycle_finished", outcome: "successful" });
+    const historyAfterCycle = db.transitions("wf-1").length;
+    db.transition("wf-1", { type: "review_received", evidence: finding });
+    expect(db.getWorkflow("wf-1")).toMatchObject({ state: "awaiting_review", fixCycles: 0 });
+    expect(db.transitions("wf-1")).toHaveLength(historyAfterCycle);
+  });
+
   it("escalates after three unsuccessful fix cycles", () => {
     const db = memoryStore();
     for (let i = 0; i < 3; i += 1) {
+      const sha = i === 0 ? "abc" : `head-${i}`;
       db.transition("wf-1", {
         type: "review_received",
-        evidence: { sha: "abc", outcome: "completed_with_findings" },
+        evidence: { sha, outcome: "completed_with_findings" },
       });
       db.transition("wf-1", { type: "validation_started" });
       db.transition("wf-1", { type: "cycle_finished", outcome: "unsuccessful" });
-      if (i < 2) db.transition("wf-1", { type: "review_started" });
+      if (i < 2) db.transition("wf-1", { type: "head_changed", sha: `head-${i + 1}` });
     }
     expect(db.getWorkflow("wf-1")).toMatchObject({ state: "escalated", fixCycles: 3 });
     expect(() => db.transition("wf-1", { type: "fix_started" })).toThrow(InvalidTransitionError);

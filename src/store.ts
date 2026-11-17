@@ -99,6 +99,10 @@ export class WorkflowStore {
       if (!current) throw new Error(`Workflow ${id} does not exist.`);
       const result = transitionWorkflow(current, command);
       const w = result.workflow;
+      if (JSON.stringify(w) === JSON.stringify(current)) {
+        this.#db.exec("COMMIT");
+        return w;
+      }
       const now = new Date().toISOString();
       this.#db
         .prepare(
@@ -154,7 +158,7 @@ export class WorkflowStore {
     return (
       this.#db
         .prepare(
-          "SELECT delivery_id, payload, workflow_id FROM deliveries WHERE status IN ('pending','processing') ORDER BY received_at",
+          "SELECT delivery_id, payload, workflow_id FROM deliveries WHERE status IN ('pending','processing','failed') ORDER BY received_at",
         )
         .all() as Array<Record<string, unknown>>
     ).map((row) => ({
@@ -185,7 +189,7 @@ export class WorkflowStore {
     return (
       this.#db
         .prepare(
-          "UPDATE deliveries SET status='processing', error=NULL WHERE delivery_id=? AND status='pending'",
+          "UPDATE deliveries SET status='processing', error=NULL WHERE delivery_id=? AND status IN ('pending','failed')",
         )
         .run(deliveryId).changes === 1
     );

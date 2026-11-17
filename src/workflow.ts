@@ -84,6 +84,17 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
     case "review_received":
       if (command.evidence.sha !== current.headSha)
         throw new InvalidTransitionError("Review evidence must match the current head SHA.");
+      if (
+        current.review?.sha === command.evidence.sha &&
+        current.review.outcome === command.evidence.outcome
+      )
+        return {
+          workflow: current,
+          from,
+          to: from,
+          reason: `duplicate review evidence: ${command.evidence.outcome} for ${command.evidence.sha}`,
+          headSha: current.headSha,
+        };
       next.review = command.evidence;
       if (command.evidence.outcome === "completed_with_findings") next.state = "fixing";
       else if (command.evidence.outcome === "in_progress") next.state = "review_running";
