@@ -61,6 +61,8 @@ GitHub check runs and legacy commit statuses are separate APIs. Read both for th
 
 ## Persistence and recovery
 
+Phase 1 implements the controller-owned state model and local SQLite store in `src/workflow.ts` and `src/store.ts`; see [the state model and recovery notes](state-model.md). Schema migrations are versioned from the initial schema. State plus transition history and evidence snapshots are written in one transaction. Delivery IDs are unique, and operations persist intent before an external side effect. Startup recovery requeues interrupted inbox processing and marks pending operations ambiguous, escalating affected workflows instead of replaying them.
+
 Minimum durable records are:
 
 - workflow identity, PR identity, current state, current head SHA, cycle count, timestamps, last error, and escalation reason;
