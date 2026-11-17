@@ -111,36 +111,37 @@ describe("workflow state and durable store", () => {
     });
   });
 
-  it("deduplicates webhook deliveries and processes a delivery only once", () => {
+  it("deduplicates webhook deliveries and processes a delivery only once", async () => {
     const db = memoryStore();
     expect(db.receiveDelivery("delivery-1", { action: "opened" }, "wf-1")).toBe(true);
     expect(db.receiveDelivery("delivery-1", { action: "changed" }, "wf-1")).toBe(false);
     let calls = 0;
     expect(
-      db.processDelivery("delivery-1", () => {
+      await db.processDelivery("delivery-1", () => {
         calls += 1;
       }),
     ).toBe(true);
     expect(
-      db.processDelivery("delivery-1", () => {
+      await db.processDelivery("delivery-1", () => {
         calls += 1;
       }),
     ).toBe(false);
     expect(calls).toBe(1);
   });
 
-  it("makes a failed delivery visible and retryable", () => {
+  it("makes a failed delivery visible and retryable", async () => {
     const db = memoryStore();
     db.receiveDelivery("delivery-retry", { action: "review" }, "wf-1");
-    expect(() =>
-      db.processDelivery("delivery-retry", () => {
+    await expect(
+      db.processDelivery("delivery-retry", async () => {
+        await Promise.resolve();
         throw new Error("temporary failure");
       }),
-    ).toThrow("temporary failure");
+    ).rejects.toThrow("temporary failure");
     expect(db.pendingDeliveries()).toHaveLength(1);
     let calls = 0;
     expect(
-      db.processDelivery("delivery-retry", () => {
+      await db.processDelivery("delivery-retry", () => {
         calls += 1;
       }),
     ).toBe(true);
