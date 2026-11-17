@@ -25,6 +25,7 @@ function fixture(): Workflow {
     checks: [],
     fixCycles: 0,
     cycleAwaitingReview: false,
+    validationHeadSha: null,
     escalationReason: null,
   };
 }
@@ -188,13 +189,24 @@ describe("workflow state and durable store", () => {
     for (let cycle = 1; cycle <= 3; cycle += 1) {
       expect(db.getWorkflow("wf-1")?.state).toBe("fixing");
       db.transition("wf-1", { type: "validation_started" });
-      db.transition("wf-1", { type: "cycle_finished", outcome: "successful" });
-      expect(db.getWorkflow("wf-1")?.cycleAwaitingReview).toBe(true);
       db.transition("wf-1", { type: "head_changed", sha: `head-${cycle}` });
-      db.transition("wf-1", {
-        type: "review_received",
-        evidence: { sha: `head-${cycle}`, outcome: "completed_with_findings" },
-      });
+      if (cycle === 2) {
+        db.transition("wf-1", {
+          type: "review_received",
+          evidence: { sha: `head-${cycle}`, outcome: "completed_with_findings" },
+        });
+        expect(db.getWorkflow("wf-1")?.state).toBe("validating");
+        db.transition("wf-1", { type: "cycle_finished", outcome: "successful" });
+        expect(db.getWorkflow("wf-1")?.state).toBe("fixing");
+      } else {
+        expect(db.getWorkflow("wf-1")?.state).toBe("validating");
+        db.transition("wf-1", { type: "cycle_finished", outcome: "successful" });
+        expect(db.getWorkflow("wf-1")?.cycleAwaitingReview).toBe(true);
+        db.transition("wf-1", {
+          type: "review_received",
+          evidence: { sha: `head-${cycle}`, outcome: "completed_with_findings" },
+        });
+      }
     }
 
     expect(db.getWorkflow("wf-1")).toMatchObject({

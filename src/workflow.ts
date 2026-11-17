@@ -29,6 +29,7 @@ export type Workflow = {
   checks: CheckEvidence[];
   fixCycles: number;
   cycleAwaitingReview: boolean;
+  validationHeadSha: string | null;
   escalationReason: string | null;
 };
 
@@ -76,7 +77,7 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
       next.headSha = command.sha;
       next.review = null;
       next.checks = [];
-      next.state = "awaiting_review";
+      next.state = current.state === "validating" ? "validating" : "awaiting_review";
       break;
     case "review_started":
       requireState(current, ["awaiting_review"]);
@@ -98,17 +99,25 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
         };
       next.review = command.evidence;
       if (command.evidence.outcome === "completed_with_findings") {
-        if (current.cycleAwaitingReview) next.fixCycles += 1;
-        next.cycleAwaitingReview = false;
-        if (next.fixCycles >= 3) {
-          next.state = "escalated";
-          next.escalationReason = "Three fix cycles received findings in review.";
-        } else next.state = "fixing";
-      } else if (command.evidence.outcome === "in_progress") next.state = "review_running";
+        if (current.state !== "validating") {
+          if (current.cycleAwaitingReview) next.fixCycles += 1;
+          next.cycleAwaitingReview = false;
+          if (next.fixCycles >= 3) {
+            next.state = "escalated";
+            next.escalationReason = "Three fix cycles received findings in review.";
+          } else next.state = "fixing";
+        }
+      } else if (command.evidence.outcome === "in_progress")
+        next.state = current.state === "validating" ? "validating" : "review_running";
       else if (command.evidence.outcome === "indeterminate") next.state = "escalated";
       else {
         next.cycleAwaitingReview = false;
-        next.state = isReady(next) ? "ready_for_human" : "awaiting_review";
+        next.state =
+          current.state === "validating"
+            ? "validating"
+            : isReady(next)
+              ? "ready_for_human"
+              : "awaiting_review";
       }
       if (command.evidence.outcome === "indeterminate")
         next.escalationReason = "Review evidence is indeterminate.";
@@ -118,11 +127,14 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
         throw new InvalidTransitionError("Check evidence must match the current head SHA.");
       next.checks = command.evidence;
       next.requiredChecks = command.configuredNames;
-      next.state = isReady(next)
-        ? "ready_for_human"
-        : current.state === "ready_for_human"
-          ? "awaiting_review"
-          : current.state;
+      next.state =
+        current.state === "validating"
+          ? "validating"
+          : isReady(next)
+            ? "ready_for_human"
+            : current.state === "ready_for_human"
+              ? "awaiting_review"
+              : current.state;
       break;
     case "fix_started":
       requireState(current, ["fixing"]);
@@ -134,14 +146,44 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
       break;
     case "validation_started":
       requireState(current, ["fixing"]);
+      next.validationHeadSha = current.headSha;
       next.state = "validating";
       break;
     case "cycle_finished":
       requireState(current, ["validating"]);
       if (command.outcome === "unsuccessful") next.fixCycles += 1;
+      if (
+        command.outcome === "successful" &&
+        current.validationHeadSha !== current.headSha &&
+        current.validationHeadSha !== null &&
+        current.review?.sha === current.headSha &&
+        current.review.outcome === "completed_with_findings"
+      )
+        next.fixCycles += 1;
+      next.validationHeadSha = null;
       if (next.fixCycles >= 3 && command.outcome === "unsuccessful") {
         next.state = "escalated";
         next.escalationReason = "Three unsuccessful fix cycles.";
+      } else if (next.fixCycles >= 3 && command.outcome === "successful") {
+        next.cycleAwaitingReview = false;
+        next.state = "escalated";
+        next.escalationReason = "Three fix cycles received findings in review.";
+      } else if (
+        command.outcome === "successful" &&
+        current.validationHeadSha !== current.headSha &&
+        current.validationHeadSha !== null &&
+        current.review?.sha === current.headSha &&
+        current.review.outcome === "completed_with_findings"
+      ) {
+        next.cycleAwaitingReview = false;
+        next.state = "fixing";
+      } else if (
+        command.outcome === "successful" &&
+        current.review?.sha === current.headSha &&
+        current.review.outcome === "completed_clean"
+      ) {
+        next.cycleAwaitingReview = false;
+        next.state = isReady(next) ? "ready_for_human" : "awaiting_review";
       } else if (command.outcome === "unsuccessful") {
         next.cycleAwaitingReview = false;
         next.state = "fixing";

@@ -49,6 +49,7 @@ const migrations = [
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT
   );`,
   "ALTER TABLE workflows ADD COLUMN cycle_awaiting_review INTEGER NOT NULL DEFAULT 0;",
+  "ALTER TABLE workflows ADD COLUMN validation_head_sha TEXT;",
 ];
 
 export class WorkflowStore {
@@ -68,8 +69,8 @@ export class WorkflowStore {
     const now = new Date().toISOString();
     this.#db
       .prepare(
-        `INSERT INTO workflows (id, repository, pull_request, state, head_sha, required_checks, review, checks, fix_cycles, cycle_awaiting_review, escalation_reason, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO workflows (id, repository, pull_request, state, head_sha, required_checks, review, checks, fix_cycles, cycle_awaiting_review, validation_head_sha, escalation_reason, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         workflow.id,
@@ -82,6 +83,7 @@ export class WorkflowStore {
         JSON.stringify(workflow.checks),
         workflow.fixCycles,
         workflow.cycleAwaitingReview ? 1 : 0,
+        workflow.validationHeadSha,
         workflow.escalationReason,
         now,
         now,
@@ -108,7 +110,7 @@ export class WorkflowStore {
       const now = new Date().toISOString();
       this.#db
         .prepare(
-          `UPDATE workflows SET state=?, head_sha=?, required_checks=?, review=?, checks=?, fix_cycles=?, cycle_awaiting_review=?, escalation_reason=?, updated_at=? WHERE id=?`,
+          `UPDATE workflows SET state=?, head_sha=?, required_checks=?, review=?, checks=?, fix_cycles=?, cycle_awaiting_review=?, validation_head_sha=?, escalation_reason=?, updated_at=? WHERE id=?`,
         )
         .run(
           w.state,
@@ -118,6 +120,7 @@ export class WorkflowStore {
           JSON.stringify(w.checks),
           w.fixCycles,
           w.cycleAwaitingReview ? 1 : 0,
+          w.validationHeadSha,
           w.escalationReason,
           now,
           id,
@@ -338,6 +341,7 @@ function decodeWorkflow(row: Record<string, unknown>): Workflow {
     checks: JSON.parse(String(row.checks)) as CheckEvidence[],
     fixCycles: Number(row.fix_cycles),
     cycleAwaitingReview: Number(row.cycle_awaiting_review) === 1,
+    validationHeadSha: row.validation_head_sha === null ? null : String(row.validation_head_sha),
     escalationReason: row.escalation_reason === null ? null : String(row.escalation_reason),
   };
 }
