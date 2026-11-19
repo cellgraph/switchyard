@@ -61,7 +61,7 @@ function tokenRetryKey(target: GitHubRepository): string {
   return `token:${target.installationId}:${target.repository}`;
 }
 
-function belongsToReconciliation(
+export function belongsToReconciliation(
   key: string,
   target: GitHubRepository,
   pullRequest: number,
@@ -80,24 +80,15 @@ function belongsToReconciliation(
   );
 }
 
-type ReconciliationTarget = GitHubRepository & { pullRequest: number };
-
 export function retireInactiveGitHubRetry(
   rateLimits: GitHubRateLimits,
-  targets: readonly ReconciliationTarget[],
-  isActive: (target: ReconciliationTarget) => boolean,
+  isRetryOwnerActive: (key: string) => boolean,
 ): void {
   const state = rateLimits.get("secondary");
   if (!state || state.throttledAttempts === 0 || state.throttledAttempts >= maxSecondaryAttempts)
     return;
   const key = state.retryRequest;
-  if (
-    key &&
-    targets.some(
-      (target) => belongsToReconciliation(key, target, target.pullRequest) && isActive(target),
-    )
-  )
-    return;
+  if (key && isRetryOwnerActive(key)) return;
   rateLimits.set("secondary", { ...state, throttledAttempts: 0, retryRequest: null });
 }
 
@@ -107,14 +98,14 @@ export function createGitHubAppClient({
   fetcher = fetch,
   now = Date.now,
   rateLimits = new Map<RateLimitScope, GitHubRateLimitState>(),
-  retireInactiveRetry,
+  isRetryOwnerActive = () => true,
 }: {
   clientId: string;
   privateKey: string;
   fetcher?: typeof fetch;
   now?: () => number;
   rateLimits?: GitHubRateLimits;
-  retireInactiveRetry?: () => void;
+  isRetryOwnerActive?: (key: string) => boolean;
 }) {
   const key = createPrivateKey(privateKey);
   if (key.asymmetricKeyType !== "rsa") throw new Error("GitHub App requires an RSA private key.");
@@ -216,19 +207,24 @@ export function createGitHubAppClient({
         (await reportsSecondaryLimit(response));
       const observedAt = now();
       if (secondaryLimited) {
-        retireInactiveRetry?.();
+        retireInactiveGitHubRetry(rateLimits, isRetryOwnerActive);
         const previous = rateLimits.get("secondary");
+        const previousAttempts = previous?.throttledAttempts ?? 0;
+        const ownerActive = isRetryOwnerActive(requestKey);
         // Concurrent responses from before the current cooldown describe the same attempt.
-        const alreadyCounted =
-          previous && previous.throttledAttempts > 0 && previous.retryAt > startedAt;
-        const throttledAttempts = alreadyCounted
-          ? previous.throttledAttempts
-          : Math.min((previous?.throttledAttempts ?? 0) + 1, maxSecondaryAttempts);
-        const delay = Math.max(retryDelay ?? 0, fallbackRetryDelay * 2 ** (throttledAttempts - 1));
+        const alreadyCounted = previousAttempts > 0 && (previous?.retryAt ?? 0) > startedAt;
+        const countAttempt =
+          ownerActive && !alreadyCounted && previousAttempts < maxSecondaryAttempts;
+        const throttledAttempts = previousAttempts + (countAttempt ? 1 : 0);
+        // A late throttle from a stopped workflow still sets a cooldown without advancing the streak.
+        const delay = Math.max(
+          retryDelay ?? 0,
+          fallbackRetryDelay * 2 ** (ownerActive ? Math.max(throttledAttempts - 1, 0) : 0),
+        );
         rateLimits.set("secondary", {
           retryAt: Math.max(previous?.retryAt ?? 0, observedAt + delay),
           throttledAttempts,
-          retryRequest: alreadyCounted ? previous.retryRequest : requestKey,
+          retryRequest: countAttempt ? requestKey : (previous?.retryRequest ?? null),
         });
       }
       if (primaryLimited) {
@@ -249,7 +245,17 @@ export function createGitHubAppClient({
         );
       }
     }
-    if (!response.ok && !response.bodyUsed) await response.body?.cancel();
+    if (!response.ok && !response.bodyUsed) {
+      try {
+        await response.body?.cancel();
+      } catch (cause) {
+        const cleanupError = new Error("GitHub API response body could not be canceled.", {
+          cause,
+        });
+        if (!rateLimitError) throw cleanupError;
+        rateLimitError.cause = cleanupError;
+      }
+    }
     if (rateLimitError) throw rateLimitError;
     // Reads in a reconciliation only clear the count when the entire reconciliation succeeds.
     if (response.ok && limit.throttledAttempts > 0 && reconcilePullRequest === undefined)

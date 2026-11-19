@@ -1,8 +1,8 @@
 import type { PullRequestTarget } from "./github-api.ts";
 import {
+  belongsToReconciliation,
   GitHubRateLimitError,
   retireInactiveGitHubRetry,
-  type GitHubRateLimits,
 } from "./github-app.ts";
 import { isReconciliationTerminal } from "./reconcile.ts";
 import type { WorkflowStore } from "./store.ts";
@@ -12,16 +12,14 @@ export function describeError(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown controller error.";
 }
 
-export function createGitHubRetryRetirement(
+export function createGitHubRetryOwnerCheck(
   store: WorkflowStore,
   targets: readonly PullRequestTarget[],
-  rateLimits: GitHubRateLimits = store.githubRateLimits(),
-): () => void {
-  return () =>
-    retireInactiveGitHubRetry(
-      rateLimits,
-      targets,
+) {
+  return (key: string): boolean =>
+    targets.some(
       (target) =>
+        belongsToReconciliation(key, target, target.pullRequest) &&
         !isReconciliationTerminal(store.findWorkflow(target.repository, target.pullRequest)),
     );
 }
@@ -33,7 +31,7 @@ export function createController({
   reportError,
   reconcileIntervalMs,
   now = Date.now,
-  retireInactiveRetry = createGitHubRetryRetirement(store, targets),
+  isRetryOwnerActive = createGitHubRetryOwnerCheck(store, targets),
 }: {
   store: WorkflowStore;
   targets: PullRequestTarget[];
@@ -41,8 +39,9 @@ export function createController({
   reportError: (message: string) => void;
   reconcileIntervalMs: number;
   now?: () => number;
-  retireInactiveRetry?: () => void;
+  isRetryOwnerActive?: (key: string) => boolean;
 }) {
+  const rateLimits = store.githubRateLimits();
   let nextSweep = 0;
   let running: Promise<boolean> | undefined;
 
@@ -68,7 +67,7 @@ export function createController({
   }
 
   async function pass(): Promise<boolean> {
-    retireInactiveRetry();
+    retireInactiveGitHubRetry(rateLimits, isRetryOwnerActive);
     const observations = new Map<PullRequestTarget, Promise<void>>();
     async function reconcileTargets(
       selected: PullRequestTarget[],

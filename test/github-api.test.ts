@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setImmediate } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
-import { createController, createGitHubRetryRetirement } from "../src/controller.ts";
+import { createController, createGitHubRetryOwnerCheck } from "../src/controller.ts";
 import { createGitHubReader } from "../src/github-api.ts";
 import { createGitHubAppClient, resumeGitHubAfterSecondaryLimit } from "../src/github-app.ts";
 import { createReconciler } from "../src/reconcile.ts";
@@ -573,6 +573,51 @@ describe("GitHub App and REST adapter", () => {
     },
   );
 
+  it("preserves the GitHub retry deadline when discarding a throttled response body fails", async () => {
+    const store = new WorkflowStore();
+    const now = Date.UTC(2026, 0, 1);
+    const retryAt = now + 120_000;
+    const body = new ReadableStream({
+      start(stream) {
+        stream.error(new Error("Fixture response stream failed"));
+      },
+    });
+    const fetcher = vi.fn<typeof fetch>(async (_input, options) => {
+      if (options?.method === "POST")
+        return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+      return new Response(body, { status: 429, headers: { "retry-after": "120" } });
+    });
+    try {
+      const rateLimits = store.githubRateLimits();
+      const client = createGitHubAppClient({
+        clientId: "fixture-client-id",
+        privateKey,
+        fetcher,
+        rateLimits,
+        now: () => now,
+      });
+      const { runPass } = createController({
+        store,
+        targets: [target],
+        reconcile: createReconciler(store, createGitHubReader(client)),
+        reportError: vi.fn(),
+        reconcileIntervalMs: 0,
+        now: () => now,
+      });
+      store.receiveDelivery("fixture-delivery", target);
+      expect(await runPass()).toBe(false);
+      expect(rateLimits.get("secondary")?.retryAt).toBe(retryAt);
+      expect(store.deliveryStatus("fixture-delivery")).toMatchObject({
+        status: "failed",
+        retryAt,
+        error: expect.stringContaining("GitHub API rate limit reached (HTTP 429)"),
+      });
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    } finally {
+      store.close();
+    }
+  });
+
   it.each(["check head", "comment page"] as const)(
     "clears a throttle for an obsolete %s after the same PR reconciles successfully",
     async (resource) => {
@@ -798,80 +843,93 @@ describe("GitHub App and REST adapter", () => {
     }
   });
 
-  it("retires a stopped retry owner's count when another PR is throttled mid-pass", async () => {
-    const store = new WorkflowStore();
-    let now = Date.UTC(2026, 0, 1);
-    const other = { repository: "other/repo", installationId: 84, pullRequest: 8 };
-    const targets = [other, target];
-    const pending = Promise.withResolvers<Response>();
-    const started = Promise.withResolvers<void>();
-    let throttle = false;
-    const fetcher = vi.fn<typeof fetch>(async (input, options) => {
-      if (options?.method === "POST")
-        return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
-      const path = requestUrl(input).pathname;
-      if (path.endsWith("/pulls/8") && throttle) {
-        started.resolve();
-        return pending.promise;
-      }
-      if (path.endsWith("/pulls/7"))
-        return Response.json({ number: 7, state: "open", head: { sha } });
-      if (path.endsWith("/pulls/8"))
-        return Response.json({ number: 8, state: "open", head: { sha } });
-      if (path.endsWith("/check-runs")) return Response.json({ check_runs: [] });
-      if (path.endsWith("/status")) return Response.json({ sha, statuses: [] });
-      return Response.json([]);
-    });
-    try {
-      const rateLimits = store.githubRateLimits();
-      const retireInactiveRetry = createGitHubRetryRetirement(store, targets, rateLimits);
-      const client = createGitHubAppClient({
-        clientId: "fixture-client-id",
-        privateKey,
-        fetcher,
-        rateLimits,
-        retireInactiveRetry,
-        now: () => now,
+  it.each(["existing", "incoming"] as const)(
+    "accounts for a stopped %s retry owner when a PR is throttled mid-pass",
+    async (stoppedOwner) => {
+      const store = new WorkflowStore();
+      let now = Date.UTC(2026, 0, 1);
+      const other = { repository: "other/repo", installationId: 84, pullRequest: 8 };
+      const targets = [other, target];
+      const pending = Promise.withResolvers<Response>();
+      const started = Promise.withResolvers<void>();
+      let throttle = false;
+      const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+        if (options?.method === "POST")
+          return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+        const path = requestUrl(input).pathname;
+        if (path.endsWith("/pulls/8") && throttle) {
+          started.resolve();
+          return pending.promise;
+        }
+        if (path.endsWith("/pulls/7"))
+          return Response.json({ number: 7, state: "open", head: { sha } });
+        if (path.endsWith("/pulls/8"))
+          return Response.json({ number: 8, state: "open", head: { sha } });
+        if (path.endsWith("/check-runs")) return Response.json({ check_runs: [] });
+        if (path.endsWith("/status")) return Response.json({ sha, statuses: [] });
+        return Response.json([]);
       });
-      const { runPass } = createController({
-        store,
-        targets,
-        reconcile: createReconciler(store, createGitHubReader(client)),
-        reportError: vi.fn(),
-        reconcileIntervalMs: 60_000,
-        now: () => now,
-        retireInactiveRetry,
-      });
-      expect(await runPass()).toBe(true);
-      now += 60_000;
-      rateLimits.set("secondary", {
-        retryAt: now,
-        throttledAttempts: 4,
-        retryRequest: "pr:42:owner/repo:7",
-      });
-      throttle = true;
-      const pass = runPass();
       try {
-        await started.promise;
-        expect(rateLimits.get("secondary")?.throttledAttempts).toBe(4);
-        store.transition(store.findWorkflow(target.repository, target.pullRequest)!.id, {
-          type: "stop",
-          reason: "Operator stop",
+        const rateLimits = store.githubRateLimits();
+        const isRetryOwnerActive = createGitHubRetryOwnerCheck(store, targets);
+        const client = createGitHubAppClient({
+          clientId: "fixture-client-id",
+          privateKey,
+          fetcher,
+          rateLimits,
+          isRetryOwnerActive,
+          now: () => now,
         });
+        const { runPass } = createController({
+          store,
+          targets,
+          reconcile: createReconciler(store, createGitHubReader(client)),
+          reportError: vi.fn(),
+          reconcileIntervalMs: 60_000,
+          now: () => now,
+          isRetryOwnerActive,
+        });
+        expect(await runPass()).toBe(true);
+        now += 60_000;
+        rateLimits.set("secondary", {
+          retryAt: now,
+          throttledAttempts: 4,
+          retryRequest: "pr:42:owner/repo:7",
+        });
+        throttle = true;
+        const stoppedTarget = stoppedOwner === "existing" ? target : other;
+        const retryAt = now + 120_000;
+        const pass = runPass();
+        try {
+          await started.promise;
+          expect(rateLimits.get("secondary")?.throttledAttempts).toBe(4);
+          store.transition(
+            store.findWorkflow(stoppedTarget.repository, stoppedTarget.pullRequest)!.id,
+            {
+              type: "stop",
+              reason: "Operator stop",
+            },
+          );
+        } finally {
+          pending.resolve(new Response(null, { status: 429, headers: { "retry-after": "120" } }));
+          await pass;
+        }
+        expect(await pass).toBe(false);
+        expect(rateLimits.get("secondary")).toEqual({
+          retryAt,
+          throttledAttempts: stoppedOwner === "existing" ? 1 : 4,
+          retryRequest: stoppedOwner === "existing" ? "pr:84:other/repo:8" : "pr:42:owner/repo:7",
+        });
+        if (stoppedOwner === "incoming") {
+          now = retryAt;
+          expect(await runPass()).toBe(true);
+          expect(rateLimits.get("secondary")?.throttledAttempts).toBe(0);
+        }
       } finally {
-        pending.resolve(new Response(null, { status: 429 }));
-        await pass;
+        store.close();
       }
-      expect(await pass).toBe(false);
-      expect(rateLimits.get("secondary")).toEqual({
-        retryAt: now + 60_000,
-        throttledAttempts: 1,
-        retryRequest: "pr:84:other/repo:8",
-      });
-    } finally {
-      store.close();
-    }
-  });
+    },
+  );
 
   it("sends no further evidence requests after the last successful GET exhausts the quota", async () => {
     const store = new WorkflowStore();
