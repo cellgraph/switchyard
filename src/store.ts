@@ -9,6 +9,8 @@ import {
 } from "./workflow.ts";
 
 export type DeliveryStatus = "pending" | "processing" | "processed" | "failed";
+type InboxDelivery = { deliveryId: string; payload: unknown; workflowId: string | null };
+type DeliveryRow = { delivery_id: string; payload: string; workflow_id: string | null };
 export type OperationStatus = "pending" | "completed" | "failed" | "ambiguous";
 
 const migrations = [
@@ -225,29 +227,41 @@ export class WorkflowStore {
     return result.changes === 1;
   }
 
-  pendingDeliveries(): Array<{ deliveryId: string; payload: unknown; workflowId: string | null }> {
+  pendingDeliveries(): InboxDelivery[] {
     return (
       this.#db
         .prepare(
           "SELECT delivery_id, payload, workflow_id FROM deliveries WHERE status IN ('pending','processing','failed') ORDER BY received_at",
         )
-        .all() as Array<Record<string, unknown>>
-    ).map((row) => ({
-      deliveryId: String(row.delivery_id),
-      payload: JSON.parse(String(row.payload)) as unknown,
-      workflowId: row.workflow_id === null ? null : String(row.workflow_id),
-    }));
+        .all() as DeliveryRow[]
+    ).map(decodeDelivery);
   }
 
   dueDeliveryIds(now: number, limit: number): string[] {
+    return this.dueDeliveries(now, limit).map((row) => row.deliveryId);
+  }
+
+  dueDeliveries(
+    now: number,
+    limit: number,
+    eligible?: (delivery: InboxDelivery) => boolean,
+  ): InboxDelivery[] {
+    if (limit === 0) return [];
     const rows = this.#db
       .prepare(
-        `SELECT delivery_id FROM deliveries
+        `SELECT delivery_id, payload, workflow_id FROM deliveries
          WHERE status = 'pending' OR (status = 'failed' AND (retry_at IS NULL OR retry_at <= ?))
          ORDER BY COALESCE(retry_at, unixepoch(received_at) * 1000), rowid LIMIT ?`,
       )
-      .all(now, limit) as Array<{ delivery_id: string }>;
-    return rows.map((row) => row.delivery_id);
+      .iterate(now, eligible ? -1 : limit) as Iterable<DeliveryRow>;
+    const selected: InboxDelivery[] = [];
+    for (const row of rows) {
+      const delivery = decodeDelivery(row);
+      if (eligible && !eligible(delivery)) continue;
+      selected.push(delivery);
+      if (selected.length === limit) break;
+    }
+    return selected;
   }
 
   deliveryStatus(deliveryId: string): {
@@ -421,6 +435,14 @@ export class WorkflowStore {
       }
     }
   }
+}
+
+function decodeDelivery(row: DeliveryRow): InboxDelivery {
+  return {
+    deliveryId: row.delivery_id,
+    payload: JSON.parse(row.payload) as unknown,
+    workflowId: row.workflow_id,
+  };
 }
 
 function decodeWorkflow(row: Record<string, unknown>): Workflow {

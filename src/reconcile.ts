@@ -3,10 +3,18 @@ import { GitHubRateLimitError } from "./github-app.ts";
 import type { WorkflowStore } from "./store.ts";
 import type { CheckEvidence, Workflow } from "./workflow.ts";
 
-export function isReconciliationTerminal(workflow: Workflow | null): boolean {
+function isReconciliationTerminal(workflow: Workflow | null): boolean {
   return (
     workflow?.state === "escalated" || (workflow?.state === "stopped" && !workflow.closedByGitHub)
   );
+}
+
+export function canReconcilePullRequest(
+  store: WorkflowStore,
+  repository: string,
+  pullRequest: number,
+): boolean {
+  return !isReconciliationTerminal(store.findWorkflow(repository, pullRequest));
 }
 
 export function createReconciler(store: WorkflowStore, github: GitHubReader) {
@@ -15,6 +23,7 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
     if (isReconciliationTerminal(existing)) return;
 
     let id = existing?.id;
+    const terminal = () => !canReconcilePullRequest(store, target.repository, target.pullRequest);
     function observe(snapshot: PullRequestState): boolean {
       if (id === undefined) {
         id = `${target.repository}#${target.pullRequest}`;
@@ -50,6 +59,7 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
 
     try {
       const start = await github.readPullRequest(target);
+      if (terminal()) return;
       if (!observe(start)) {
         github.completeReconciliation(target);
         return;
@@ -60,7 +70,9 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
         github.readReviewInputs(target),
       ]);
 
+      if (terminal()) return;
       const latest = await github.readPullRequest(target);
+      if (terminal()) return;
       if (!observe(latest)) {
         const throttled = [checks, reviewInputs].some(
           (read) => read.status === "rejected" && read.reason instanceof GitHubRateLimitError,
@@ -76,6 +88,7 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
       recordChecks(checks.value);
       github.completeReconciliation(target);
     } catch (error) {
+      if (terminal()) return;
       recordChecks([]);
       throw error;
     }

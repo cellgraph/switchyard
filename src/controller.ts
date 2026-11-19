@@ -2,9 +2,10 @@ import type { PullRequestTarget } from "./github-api.ts";
 import {
   belongsToReconciliation,
   GitHubRateLimitError,
+  isSecondaryLimitPaused,
   retireInactiveGitHubRetry,
 } from "./github-app.ts";
-import { isReconciliationTerminal } from "./reconcile.ts";
+import { canReconcilePullRequest } from "./reconcile.ts";
 import type { WorkflowStore } from "./store.ts";
 import { readReconcileHint } from "./webhook.ts";
 
@@ -20,7 +21,7 @@ export function createGitHubRetryOwnerCheck(
     targets.some(
       (target) =>
         belongsToReconciliation(key, target, target.pullRequest) &&
-        !isReconciliationTerminal(store.findWorkflow(target.repository, target.pullRequest)),
+        canReconcilePullRequest(store, target.repository, target.pullRequest),
     );
 }
 
@@ -44,6 +45,17 @@ export function createController({
   const rateLimits = store.githubRateLimits();
   let nextSweep = 0;
   let running: Promise<boolean> | undefined;
+
+  function needsGitHub(selected: readonly PullRequestTarget[]): boolean {
+    return selected.some((target) =>
+      canReconcilePullRequest(store, target.repository, target.pullRequest),
+    );
+  }
+
+  function githubWorkDeferred(): boolean {
+    const secondary = rateLimits.get("secondary");
+    return isSecondaryLimitPaused(secondary) || (secondary?.retryAt ?? 0) > now();
+  }
 
   function deliveryTargets(payload: unknown, workflowId: string | null): PullRequestTarget[] {
     if (workflowId !== null) {
@@ -91,13 +103,22 @@ export function createController({
     }
 
     let success = true;
-    for (const deliveryId of store.dueDeliveryIds(now(), 25)) {
+    const deliveries = store.dueDeliveries(
+      now(),
+      25,
+      githubWorkDeferred()
+        ? ({ payload, workflowId }) => !needsGitHub(deliveryTargets(payload, workflowId))
+        : undefined,
+    );
+    for (const { deliveryId, payload, workflowId } of deliveries) {
+      const selected = deliveryTargets(payload, workflowId);
+      if (githubWorkDeferred() && needsGitHub(selected)) continue;
       try {
         let retryAt = 0;
         await store.processDelivery(
           deliveryId,
-          async (payload, workflowId) => {
-            const result = await reconcileTargets(deliveryTargets(payload, workflowId));
+          async () => {
+            const result = await reconcileTargets(selected);
             retryAt = result.retryAt;
             if (result.failures.length) throw new Error(result.failures.join(", "));
           },
@@ -108,6 +129,7 @@ export function createController({
         reportError(`Delivery ${deliveryId} failed: ${describeError(error)}`);
       }
     }
+    if (githubWorkDeferred() && needsGitHub(targets)) return false;
     if (now() >= nextSweep) {
       const { failures } = await reconcileTargets(targets);
       nextSweep = reconcileIntervalMs > 0 ? now() + reconcileIntervalMs : Infinity;

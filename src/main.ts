@@ -5,7 +5,7 @@ import { createController, createGitHubRetryOwnerCheck, describeError } from "./
 import { createGitHubReader, type PullRequestTarget } from "./github-api.ts";
 import { createGitHubAppClient, resumeGitHubAfterSecondaryLimit } from "./github-app.ts";
 import { object, positiveInteger, repositoryName } from "./github-data.ts";
-import { createReconciler } from "./reconcile.ts";
+import { canReconcilePullRequest, createReconciler } from "./reconcile.ts";
 import { WorkflowStore } from "./store.ts";
 import { createWebhookServer } from "./webhook.ts";
 
@@ -98,6 +98,8 @@ async function main(): Promise<void> {
         privateKey,
         rateLimits: store.githubRateLimits(),
         isRetryOwnerActive,
+        canReadPullRequest: (target, pullRequest) =>
+          canReconcilePullRequest(store, target.repository, pullRequest),
       }),
     );
     const recovered = store.recover();

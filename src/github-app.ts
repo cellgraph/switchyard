@@ -23,6 +23,10 @@ export type GitHubRateLimits = {
 const maxSecondaryAttempts = 5;
 const fallbackRetryDelay = 60_000;
 
+export function isSecondaryLimitPaused(state: GitHubRateLimitState | undefined): boolean {
+  return (state?.throttledAttempts ?? 0) >= maxSecondaryAttempts;
+}
+
 export class GitHubRateLimitError extends Error {
   readonly retryAt: number;
 
@@ -99,6 +103,7 @@ export function createGitHubAppClient({
   now = Date.now,
   rateLimits = new Map<RateLimitScope, GitHubRateLimitState>(),
   isRetryOwnerActive = () => true,
+  canReadPullRequest = () => true,
 }: {
   clientId: string;
   privateKey: string;
@@ -106,6 +111,7 @@ export function createGitHubAppClient({
   now?: () => number;
   rateLimits?: GitHubRateLimits;
   isRetryOwnerActive?: (key: string) => boolean;
+  canReadPullRequest?: (target: GitHubRepository, pullRequest: number) => boolean;
 }) {
   const key = createPrivateKey(privateKey);
   if (key.asymmetricKeyType !== "rsa") throw new Error("GitHub App requires an RSA private key.");
@@ -162,6 +168,8 @@ export function createGitHubAppClient({
     { path, method, body, reconcilePullRequest }: ApiRequest,
     credential: string,
   ): Promise<Response> {
+    if (reconcilePullRequest !== undefined && !canReadPullRequest(target, reconcilePullRequest))
+      throw new Error("Pull request reconciliation was stopped.");
     const scope = `installation:${target.installationId}` as const;
     const requestKey =
       method === "POST"
