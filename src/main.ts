@@ -110,6 +110,7 @@ async function main(): Promise<void> {
       store,
       reconcile: createReconciler(store, reader),
       reportError,
+      reportDeferred: onceOnly,
       isRetryOwnerActive,
     });
 

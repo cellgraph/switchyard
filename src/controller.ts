@@ -31,6 +31,7 @@ export function createController({
   reconcile,
   reportError,
   reconcileIntervalMs,
+  reportDeferred = false,
   now = Date.now,
   isRetryOwnerActive = createGitHubRetryOwnerCheck(store, targets),
 }: {
@@ -39,10 +40,12 @@ export function createController({
   reconcile: (target: PullRequestTarget) => Promise<void>;
   reportError: (message: string) => void;
   reconcileIntervalMs: number;
+  reportDeferred?: boolean;
   now?: () => number;
   isRetryOwnerActive?: (key: string) => boolean;
 }) {
   const rateLimits = store.githubRateLimits();
+  const startupDueAt = new Map(targets.map((target) => [target, 0]));
   let nextSweep = 0;
   let running: Promise<boolean> | undefined;
 
@@ -52,9 +55,11 @@ export function createController({
     );
   }
 
-  function githubWorkDeferred(): boolean {
+  function secondaryDeferral() {
     const secondary = rateLimits.get("secondary");
-    return isSecondaryLimitPaused(secondary) || (secondary?.retryAt ?? 0) > now();
+    if (secondary && (isSecondaryLimitPaused(secondary) || secondary.retryAt > now()))
+      return secondary;
+    return undefined;
   }
 
   function deliveryTargets(payload: unknown, workflowId: string | null): PullRequestTarget[] {
@@ -81,10 +86,9 @@ export function createController({
   async function pass(): Promise<boolean> {
     retireInactiveGitHubRetry(rateLimits, isRetryOwnerActive);
     const observations = new Map<PullRequestTarget, Promise<void>>();
-    async function reconcileTargets(
-      selected: PullRequestTarget[],
-    ): Promise<{ failures: string[]; retryAt: number }> {
+    async function reconcileTargets(selected: PullRequestTarget[]) {
       const failures: string[] = [];
+      const throttledTargets = new Map<PullRequestTarget, number>();
       let retryAt = 0;
       for (const target of selected) {
         try {
@@ -96,23 +100,26 @@ export function createController({
           await observation;
         } catch (error) {
           failures.push(`${target.repository}#${target.pullRequest}: ${describeError(error)}`);
-          if (error instanceof GitHubRateLimitError) retryAt = Math.max(retryAt, error.retryAt);
+          if (error instanceof GitHubRateLimitError) {
+            throttledTargets.set(target, error.retryAt);
+            retryAt = Math.max(retryAt, error.retryAt);
+          }
         }
       }
-      return { failures, retryAt };
+      return { failures, retryAt, throttledTargets };
     }
 
     let success = true;
     const deliveries = store.dueDeliveries(
       now(),
       25,
-      githubWorkDeferred()
+      secondaryDeferral()
         ? ({ payload, workflowId }) => !needsGitHub(deliveryTargets(payload, workflowId))
         : undefined,
     );
     for (const { deliveryId, payload, workflowId } of deliveries) {
       const selected = deliveryTargets(payload, workflowId);
-      if (githubWorkDeferred() && needsGitHub(selected)) continue;
+      if (secondaryDeferral() && needsGitHub(selected)) continue;
       try {
         let retryAt = 0;
         await store.processDelivery(
@@ -129,10 +136,33 @@ export function createController({
         reportError(`Delivery ${deliveryId} failed: ${describeError(error)}`);
       }
     }
-    if (githubWorkDeferred() && needsGitHub(targets)) return false;
-    if (now() >= nextSweep) {
-      const { failures } = await reconcileTargets(targets);
-      nextSweep = reconcileIntervalMs > 0 ? now() + reconcileIntervalMs : Infinity;
+    const deferred = secondaryDeferral();
+    if (deferred && needsGitHub(targets)) {
+      if (reportDeferred && success) {
+        const message = isSecondaryLimitPaused(deferred)
+          ? new GitHubRateLimitError(deferred.retryAt, undefined, true).message
+          : `GitHub reconciliation is deferred until ${new Date(deferred.retryAt).toISOString()}.`;
+        reportError(message);
+      }
+      return false;
+    }
+
+    const sweepAt = now();
+    const periodic = sweepAt >= nextSweep;
+    if (periodic || startupDueAt.size > 0) {
+      // Throttled startup targets have their own deadlines, independent of periodic polling.
+      const due = targets.filter((target) => {
+        const startupDeadline = startupDueAt.get(target);
+        return startupDeadline === undefined ? periodic : startupDeadline <= sweepAt;
+      });
+      const { failures, throttledTargets } = await reconcileTargets(due);
+      for (const target of due) {
+        if (!startupDueAt.has(target)) continue;
+        const retryAt = throttledTargets.get(target);
+        if (retryAt === undefined) startupDueAt.delete(target);
+        else startupDueAt.set(target, retryAt);
+      }
+      if (periodic) nextSweep = reconcileIntervalMs > 0 ? now() + reconcileIntervalMs : Infinity;
       for (const failure of failures) reportError(`Periodic reconciliation failed for ${failure}`);
       if (failures.length) success = false;
     }

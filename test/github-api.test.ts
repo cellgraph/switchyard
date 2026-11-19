@@ -323,6 +323,119 @@ describe("GitHub App and REST adapter", () => {
     },
   );
 
+  it.each(["primary", "secondary"] as const)(
+    "finishes a startup sweep after %s throttling with periodic polling disabled and an empty inbox",
+    async (kind) => {
+      const store = new WorkflowStore();
+      let now = Date.UTC(2026, 0, 1);
+      const firstReset = now + 60_000;
+      const lastReset = now + 120_000;
+      const other = { repository: "other/repo", installationId: 84, pullRequest: 8 };
+      const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+        if (options?.method === "POST")
+          return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+        const path = requestUrl(input).pathname;
+        if (path.endsWith("/pulls/7") && kind === "secondary" && now < lastReset)
+          return new Response(null, { status: 429, headers: { "retry-after": "120" } });
+        if (path.endsWith("/pulls/7"))
+          return Response.json({ number: 7, state: "open", head: { sha } });
+        if (path.endsWith("/pulls/8"))
+          return Response.json({ number: 8, state: "open", head: { sha } });
+        if (path.endsWith("/check-runs")) return Response.json({ check_runs: [] });
+        if (path.endsWith("/status")) return Response.json({ sha, statuses: [] });
+        return Response.json([]);
+      });
+      try {
+        const rateLimits = store.githubRateLimits();
+        if (kind === "primary") {
+          rateLimits.set("installation:42", {
+            retryAt: firstReset,
+            throttledAttempts: 0,
+            retryRequest: null,
+          });
+          rateLimits.set("installation:84", {
+            retryAt: lastReset,
+            throttledAttempts: 0,
+            retryRequest: null,
+          });
+        }
+        const client = createGitHubAppClient({
+          clientId: "fixture-client-id",
+          privateKey,
+          fetcher,
+          rateLimits,
+          now: () => now,
+        });
+        const { runPass } = createController({
+          store,
+          targets: [target, other],
+          reconcile: createReconciler(store, createGitHubReader(client)),
+          reportError: vi.fn(),
+          reconcileIntervalMs: 0,
+          now: () => now,
+        });
+        expect(await runPass()).toBe(false);
+        expect(fetcher).toHaveBeenCalledTimes(kind === "primary" ? 0 : 2);
+        expect(store.pendingDeliveries()).toEqual([]);
+        now = firstReset;
+        await runPass();
+        expect(store.findWorkflow(other.repository, other.pullRequest)).toBeNull();
+        expect(Boolean(store.findWorkflow(target.repository, target.pullRequest))).toBe(
+          kind === "primary",
+        );
+        now = lastReset;
+        expect(await runPass()).toBe(true);
+        expect(store.findWorkflow(target.repository, target.pullRequest)?.headSha).toBe(sha);
+        expect(store.findWorkflow(other.repository, other.pullRequest)?.headSha).toBe(sha);
+        expect(
+          fetcher.mock.calls.filter(([input]) => requestUrl(input).pathname.endsWith("/pulls/7")),
+        ).toHaveLength(kind === "primary" ? 2 : 3);
+        const requests = fetcher.mock.calls.length;
+        now += 120_000;
+        expect(await runPass()).toBe(true);
+        expect(fetcher).toHaveBeenCalledTimes(requests);
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  it.each(["pause", "cooldown"] as const)(
+    "explains a manual reconciliation deferred by a persisted secondary %s",
+    async (state) => {
+      const store = new WorkflowStore();
+      const now = Date.UTC(2026, 0, 1);
+      const retryAt = state === "pause" ? now - 1 : now + 120_000;
+      const reportError = vi.fn();
+      const reconcile = vi.fn();
+      try {
+        store.githubRateLimits().set("secondary", {
+          retryAt,
+          throttledAttempts: state === "pause" ? 5 : 1,
+          retryRequest: "pr:42:owner/repo:7",
+        });
+        const { runPass } = createController({
+          store,
+          targets: [target],
+          reconcile,
+          reportError,
+          reconcileIntervalMs: 0,
+          reportDeferred: true,
+          now: () => now,
+        });
+        expect(await runPass()).toBe(false);
+        expect(reconcile).not.toHaveBeenCalled();
+        expect(reportError).toHaveBeenCalledExactlyOnceWith(
+          expect.stringContaining(
+            state === "pause" ? "--resume-github" : new Date(retryAt).toISOString(),
+          ),
+        );
+      } finally {
+        store.close();
+      }
+    },
+  );
+
   it("doubles consecutive secondary delays, persists the pause, and resumes after the final deadline", async () => {
     const dir = mkdtempSync(join(tmpdir(), "switchyard-pause-"));
     const path = join(dir, "state.sqlite");
