@@ -115,6 +115,24 @@ export class WorkflowStore {
     try {
       const current = this.getWorkflow(id);
       if (!current) throw new Error(`Workflow ${id} does not exist.`);
+      if (
+        command.type === "github_pull_request" &&
+        command.state === "open" &&
+        current.closedByGitHub
+      ) {
+        const unresolved = this.#db
+          .prepare(
+            "SELECT DISTINCT status FROM operations WHERE workflow_id=? AND status IN ('pending','ambiguous')",
+          )
+          .all(id);
+        if (unresolved.some(({ status }) => status === "ambiguous")) {
+          command = { type: "escalate", reason: "An external operation has an ambiguous outcome." };
+        } else if (unresolved.length) {
+          throw new Error(
+            "Cannot resume a reopened pull request while an external operation is pending.",
+          );
+        }
+      }
       const result = transitionWorkflow(current, command);
       const w = result.workflow;
       if (JSON.stringify(w) === JSON.stringify(current)) {
@@ -322,7 +340,7 @@ export class WorkflowStore {
     }
     for (const row of affected) {
       const w = this.getWorkflow(row.workflow_id);
-      if (w && w.state !== "stopped" && w.state !== "escalated")
+      if (w && (w.state !== "stopped" || w.closedByGitHub) && w.state !== "escalated")
         this.transition(row.workflow_id, {
           type: "escalate",
           reason: "An external operation has an ambiguous outcome after restart.",

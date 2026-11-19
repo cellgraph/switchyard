@@ -12,7 +12,7 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
       return;
 
     let id = existing?.id;
-    function observe(snapshot: PullRequestState): void {
+    function observe(snapshot: PullRequestState): boolean {
       if (id === undefined) {
         id = `${target.repository}#${target.pullRequest}`;
         store.createWorkflow({
@@ -29,11 +29,12 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
           escalationReason: null,
         });
       }
-      store.transition(id, {
+      const workflow = store.transition(id, {
         type: "github_pull_request",
         state: snapshot.state,
         sha: snapshot.headSha,
       });
+      return workflow.state !== "stopped" && workflow.state !== "escalated";
     }
 
     function recordChecks(evidence: CheckEvidence[]): void {
@@ -46,8 +47,7 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
 
     try {
       const start = await github.readPullRequest(target);
-      observe(start);
-      if (start.state === "closed") return;
+      if (!observe(start)) return;
 
       const [checks, reviewInputs] = await Promise.allSettled([
         github.readChecks(target, start.headSha),
@@ -55,8 +55,7 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
       ]);
 
       const latest = await github.readPullRequest(target);
-      observe(latest);
-      if (latest.state === "closed") return;
+      if (!observe(latest)) return;
       if (latest.headSha !== start.headSha)
         throw new Error("Pull request head changed during reconciliation.");
 

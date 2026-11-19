@@ -311,6 +311,50 @@ describe("GitHub webhook intake and reconciliation", () => {
     expect(store.deliveryStatus(fixtures.review!.id)?.error).toContain("head changed");
   });
 
+  it("escalates an ambiguous operation across a close, restart, and reopen", async () => {
+    const { runPass } = controller();
+    await runPass();
+    const id = workflow()!.id;
+    store.createOperation("operation-1", id, "agent_turn", {});
+    state.state = "closed";
+    await send("closed");
+    await runPass();
+    expect(workflow()).toMatchObject({ state: "stopped", closedByGitHub: true });
+
+    store.close();
+    store = new WorkflowStore(dbPath);
+    expect(store.recover()).toEqual({ deliveries: 0, ambiguousOperations: 1 });
+    state.state = "open";
+    await createReconciler(store, github)(target);
+    expect(workflow()).toMatchObject({
+      state: "escalated",
+      escalationReason: "An external operation has an ambiguous outcome after restart.",
+    });
+    expect(workflow()?.closedByGitHub).toBeUndefined();
+  });
+
+  it("blocks reopening until a pending operation has a known outcome", async () => {
+    const { runPass } = controller();
+    await runPass();
+    const id = workflow()!.id;
+    store.createOperation("operation-1", id, "agent_turn", {});
+    state.state = "closed";
+    await send("closed");
+    await runPass();
+
+    state.state = "open";
+    const reconcile = createReconciler(store, github);
+    await expect(reconcile(target)).rejects.toThrow("external operation is pending");
+    expect(workflow()).toMatchObject({ state: "stopped", closedByGitHub: true });
+
+    store.finishOperation("operation-1", "ambiguous");
+    await reconcile(target);
+    expect(workflow()).toMatchObject({
+      state: "escalated",
+      escalationReason: "An external operation has an ambiguous outcome.",
+    });
+  });
+
   it("fails closed when a review input read fails for a previously ready head", async () => {
     const { runPass } = controller();
     await runPass();
