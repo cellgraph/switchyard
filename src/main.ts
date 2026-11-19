@@ -1,7 +1,7 @@
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
-import { createController, describeError } from "./controller.ts";
+import { createController, createGitHubRetryRetirement, describeError } from "./controller.ts";
 import { createGitHubReader, type PullRequestTarget } from "./github-api.ts";
 import { createGitHubAppClient, resumeGitHubAfterSecondaryLimit } from "./github-app.ts";
 import { object, positiveInteger, repositoryName } from "./github-data.ts";
@@ -91,8 +91,10 @@ async function main(): Promise<void> {
   let server: ReturnType<typeof createWebhookServer> | undefined;
 
   try {
+    const rateLimits = store.githubRateLimits();
+    const retireInactiveRetry = createGitHubRetryRetirement(store, config.targets, rateLimits);
     const reader = createGitHubReader(
-      createGitHubAppClient({ clientId, privateKey, rateLimits: store.githubRateLimits() }),
+      createGitHubAppClient({ clientId, privateKey, rateLimits, retireInactiveRetry }),
     );
     const recovered = store.recover();
     if (recovered.deliveries || recovered.ambiguousOperations)
@@ -102,6 +104,7 @@ async function main(): Promise<void> {
       store,
       reconcile: createReconciler(store, reader),
       reportError,
+      retireInactiveRetry,
     });
 
     if (!onceOnly && secret) {

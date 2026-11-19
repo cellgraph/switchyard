@@ -1,11 +1,29 @@
 import type { PullRequestTarget } from "./github-api.ts";
-import { GitHubRateLimitError, retireInactiveGitHubRetry } from "./github-app.ts";
+import {
+  GitHubRateLimitError,
+  retireInactiveGitHubRetry,
+  type GitHubRateLimits,
+} from "./github-app.ts";
 import { isReconciliationTerminal } from "./reconcile.ts";
 import type { WorkflowStore } from "./store.ts";
 import { readReconcileHint } from "./webhook.ts";
 
 export function describeError(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown controller error.";
+}
+
+export function createGitHubRetryRetirement(
+  store: WorkflowStore,
+  targets: readonly PullRequestTarget[],
+  rateLimits: GitHubRateLimits = store.githubRateLimits(),
+): () => void {
+  return () =>
+    retireInactiveGitHubRetry(
+      rateLimits,
+      targets,
+      (target) =>
+        !isReconciliationTerminal(store.findWorkflow(target.repository, target.pullRequest)),
+    );
 }
 
 export function createController({
@@ -15,6 +33,7 @@ export function createController({
   reportError,
   reconcileIntervalMs,
   now = Date.now,
+  retireInactiveRetry = createGitHubRetryRetirement(store, targets),
 }: {
   store: WorkflowStore;
   targets: PullRequestTarget[];
@@ -22,8 +41,8 @@ export function createController({
   reportError: (message: string) => void;
   reconcileIntervalMs: number;
   now?: () => number;
+  retireInactiveRetry?: () => void;
 }) {
-  const rateLimits = store.githubRateLimits();
   let nextSweep = 0;
   let running: Promise<boolean> | undefined;
 
@@ -49,12 +68,7 @@ export function createController({
   }
 
   async function pass(): Promise<boolean> {
-    retireInactiveGitHubRetry(
-      rateLimits,
-      targets,
-      (target) =>
-        !isReconciliationTerminal(store.findWorkflow(target.repository, target.pullRequest)),
-    );
+    retireInactiveRetry();
     const observations = new Map<PullRequestTarget, Promise<void>>();
     async function reconcileTargets(
       selected: PullRequestTarget[],

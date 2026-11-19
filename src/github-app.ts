@@ -107,17 +107,34 @@ export function createGitHubAppClient({
   fetcher = fetch,
   now = Date.now,
   rateLimits = new Map<RateLimitScope, GitHubRateLimitState>(),
+  retireInactiveRetry,
 }: {
   clientId: string;
   privateKey: string;
   fetcher?: typeof fetch;
   now?: () => number;
   rateLimits?: GitHubRateLimits;
+  retireInactiveRetry?: () => void;
 }) {
   const key = createPrivateKey(privateKey);
   if (key.asymmetricKeyType !== "rsa") throw new Error("GitHub App requires an RSA private key.");
   const tokens = new Map<string, Token>();
-  const refreshes = new Map<string, Promise<Token>>();
+  const installationReads = new Map<number, Promise<void>>();
+
+  function queueRead<T>(installationId: number, read: () => Promise<T>): Promise<T> {
+    const result = (installationReads.get(installationId) ?? Promise.resolve()).then(read);
+    // A failed read still rejects for its caller and releases the next queued read.
+    const completion = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    installationReads.set(installationId, completion);
+    void completion.then(() => {
+      if (installationReads.get(installationId) === completion)
+        installationReads.delete(installationId);
+    });
+    return result;
+  }
 
   function limitsFor(scope: RateLimitScope) {
     const secondary = rateLimits.get("secondary");
@@ -191,6 +208,7 @@ export function createGitHubAppClient({
     if (response.ok && method === undefined && reset !== undefined && reset > now())
       rememberPrimaryReset(scope, reset);
 
+    let rateLimitError: GitHubRateLimitError | undefined;
     if (response.status === 403 || response.status === 429) {
       const retryDelay = headerMilliseconds(response.headers.get("retry-after"));
       const secondaryLimited =
@@ -198,9 +216,11 @@ export function createGitHubAppClient({
         (await reportsSecondaryLimit(response));
       const observedAt = now();
       if (secondaryLimited) {
+        retireInactiveRetry?.();
         const previous = rateLimits.get("secondary");
         // Concurrent responses from before the current cooldown describe the same attempt.
-        const alreadyCounted = previous && previous.retryAt > startedAt;
+        const alreadyCounted =
+          previous && previous.throttledAttempts > 0 && previous.retryAt > startedAt;
         const throttledAttempts = alreadyCounted
           ? previous.throttledAttempts
           : Math.min((previous?.throttledAttempts ?? 0) + 1, maxSecondaryAttempts);
@@ -222,13 +242,15 @@ export function createGitHubAppClient({
       }
       if (primaryLimited || secondaryLimited) {
         const latest = limitsFor(scope);
-        throw new GitHubRateLimitError(
+        rateLimitError = new GitHubRateLimitError(
           latest.retryAt,
           response.status,
           latest.throttledAttempts >= maxSecondaryAttempts,
         );
       }
     }
+    if (!response.ok && !response.bodyUsed) await response.body?.cancel();
+    if (rateLimitError) throw rateLimitError;
     // Reads in a reconciliation only clear the count when the entire reconciliation succeeds.
     if (response.ok && limit.throttledAttempts > 0 && reconcilePullRequest === undefined)
       clearSecondaryAttempts(startedAt, (key) => key === requestKey);
@@ -242,39 +264,26 @@ export function createGitHubAppClient({
   ): Promise<Token> {
     const cached = tokens.get(cacheKey);
     if (cached && cached.expiresAt - now() > 60_000) return cached;
-    const inFlight = refreshes.get(cacheKey);
-    if (inFlight) return inFlight;
 
-    const refresh = (async () => {
-      const response = await request(
-        target,
-        {
-          path: `/app/installations/${target.installationId}/access_tokens`,
-          method: "POST",
-          reconcilePullRequest,
-          body: JSON.stringify({
-            repositories: [target.repository.split("/")[1]],
-            permissions,
-          }),
-        },
-        appJwt(),
-      );
-      if (!response.ok)
-        throw new Error(`GitHub installation token request failed (HTTP ${response.status}).`);
-      const data = object(await readJson(response));
-      const expiresAt = typeof data?.expires_at === "string" ? Date.parse(data.expires_at) : NaN;
-      if (!data || typeof data.token !== "string" || !data.token || !(expiresAt > now()))
-        throw new Error("GitHub returned an invalid installation token response.");
-      const token = { value: data.token, expiresAt };
-      tokens.set(cacheKey, token);
-      return token;
-    })();
-    refreshes.set(cacheKey, refresh);
-    try {
-      return await refresh;
-    } finally {
-      refreshes.delete(cacheKey);
-    }
+    const response = await request(
+      target,
+      {
+        path: `/app/installations/${target.installationId}/access_tokens`,
+        method: "POST",
+        reconcilePullRequest,
+        body: JSON.stringify({ repositories: [target.repository.split("/")[1]], permissions }),
+      },
+      appJwt(),
+    );
+    if (!response.ok)
+      throw new Error(`GitHub installation token request failed (HTTP ${response.status}).`);
+    const data = object(await readJson(response));
+    const expiresAt = typeof data?.expires_at === "string" ? Date.parse(data.expires_at) : NaN;
+    if (!data || typeof data.token !== "string" || !data.token || !(expiresAt > now()))
+      throw new Error("GitHub returned an invalid installation token response.");
+    const token = { value: data.token, expiresAt };
+    tokens.set(cacheKey, token);
+    return token;
   }
 
   return {
@@ -282,7 +291,7 @@ export function createGitHubAppClient({
       clearSecondaryAttempts(now(), (key) => belongsToReconciliation(key, target, pullRequest));
     },
 
-    async get(
+    get(
       target: GitHubRepository,
       suffix: string,
       reconcilePullRequest?: number,
@@ -290,19 +299,22 @@ export function createGitHubAppClient({
       const cacheKey = `${target.installationId}:${target.repository}`;
       const path = `/repos/${target.repository}${suffix}`;
       const read = { path, reconcilePullRequest };
-      let token = await tokenFor(target, cacheKey, reconcilePullRequest);
-      let response = await request(target, read, token.value);
-      if (response.status === 401) {
-        if (tokens.get(cacheKey) === token) tokens.delete(cacheKey);
-        token = await tokenFor(target, cacheKey, reconcilePullRequest);
-        response = await request(target, read, token.value);
-        if (response.status === 401 && tokens.get(cacheKey) === token) tokens.delete(cacheKey);
-      }
-      if (!response.ok) throw new Error(`GitHub API GET ${path} failed (HTTP ${response.status}).`);
-      return {
-        data: await readJson(response),
-        hasNext: /;\s*rel="next"/.test(response.headers.get("link") ?? ""),
-      };
+      return queueRead(target.installationId, async () => {
+        let token = await tokenFor(target, cacheKey, reconcilePullRequest);
+        let response = await request(target, read, token.value);
+        if (response.status === 401) {
+          tokens.delete(cacheKey);
+          token = await tokenFor(target, cacheKey, reconcilePullRequest);
+          response = await request(target, read, token.value);
+          if (response.status === 401) tokens.delete(cacheKey);
+        }
+        if (!response.ok)
+          throw new Error(`GitHub API GET ${path} failed (HTTP ${response.status}).`);
+        return {
+          data: await readJson(response),
+          hasNext: /;\s*rel="next"/.test(response.headers.get("link") ?? ""),
+        };
+      });
     },
   };
 }
