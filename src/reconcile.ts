@@ -3,6 +3,12 @@ import { GitHubRateLimitError } from "./github-app.ts";
 import type { WorkflowStore } from "./store.ts";
 import type { CheckEvidence, Workflow } from "./workflow.ts";
 
+export class PullRequestHeadChangedError extends Error {
+  constructor() {
+    super("Pull request head changed during reconciliation.");
+  }
+}
+
 function isReconciliationTerminal(workflow: Workflow | null): boolean {
   return (
     workflow?.state === "escalated" || (workflow?.state === "stopped" && !workflow.closedByGitHub)
@@ -80,8 +86,7 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
         if (!throttled) github.completeReconciliation(target);
         return;
       }
-      if (latest.headSha !== start.headSha)
-        throw new Error("Pull request head changed during reconciliation.");
+      if (latest.headSha !== start.headSha) throw new PullRequestHeadChangedError();
 
       if (reviewInputs.status === "rejected") throw reviewInputs.reason;
       if (checks.status === "rejected") throw checks.reason;

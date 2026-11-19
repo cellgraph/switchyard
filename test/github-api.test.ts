@@ -436,6 +436,87 @@ describe("GitHub App and REST adapter", () => {
     },
   );
 
+  it("retries a changed startup head after a cooldown with polling disabled and an empty inbox", async () => {
+    const store = new WorkflowStore();
+    let now = Date.UTC(2026, 0, 1);
+    const resetAt = now + 120_000;
+    let prReads = 0;
+    const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+      if (options?.method === "POST")
+        return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+      const path = requestUrl(input).pathname;
+      if (path.endsWith("/pulls/7"))
+        return Response.json({
+          number: 7,
+          state: "open",
+          head: { sha: ++prReads === 1 ? sha : otherSha },
+        });
+      const commit = /\/commits\/([a-f0-9]+)\/(check-runs|status)$/.exec(path);
+      if (commit?.[2] === "check-runs")
+        return Response.json({
+          check_runs: [
+            {
+              name: "build",
+              head_sha: commit[1],
+              status: "completed",
+              conclusion: "success",
+            },
+          ],
+        });
+      if (commit?.[2] === "status") return Response.json({ sha: commit[1], statuses: [] });
+      return Response.json([]);
+    });
+    try {
+      const rateLimits = store.githubRateLimits();
+      rateLimits.set("installation:42", {
+        retryAt: resetAt,
+        throttledAttempts: 0,
+        retryRequest: null,
+      });
+      const client = createGitHubAppClient({
+        clientId: "fixture-client-id",
+        privateKey,
+        fetcher,
+        rateLimits,
+        now: () => now,
+      });
+      const { runPass } = createController({
+        store,
+        targets: [target],
+        reconcile: createReconciler(store, createGitHubReader(client)),
+        reportError: vi.fn(),
+        reconcileIntervalMs: 0,
+        now: () => now,
+      });
+      expect(await runPass()).toBe(false);
+      expect(fetcher).not.toHaveBeenCalled();
+      now = resetAt;
+      expect(await runPass()).toBe(false);
+      expect(store.findWorkflow(target.repository, target.pullRequest)).toMatchObject({
+        headSha: otherSha,
+        checks: [],
+      });
+      expect(prReads).toBe(2);
+
+      now += 29_999;
+      await runPass();
+      expect(prReads).toBe(2);
+      now++;
+      expect(await runPass()).toBe(true);
+      expect(store.findWorkflow(target.repository, target.pullRequest)).toMatchObject({
+        headSha: otherSha,
+        checks: [{ name: "build", sha: otherSha, outcome: "passed" }],
+      });
+      expect(prReads).toBe(4);
+      expect(store.pendingDeliveries()).toEqual([]);
+      now += 60_000;
+      await runPass();
+      expect(prReads).toBe(4);
+    } finally {
+      store.close();
+    }
+  });
+
   it("doubles consecutive secondary delays, persists the pause, and resumes after the final deadline", async () => {
     const dir = mkdtempSync(join(tmpdir(), "switchyard-pause-"));
     const path = join(dir, "state.sqlite");

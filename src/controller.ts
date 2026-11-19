@@ -5,9 +5,11 @@ import {
   isSecondaryLimitPaused,
   retireInactiveGitHubRetry,
 } from "./github-app.ts";
-import { canReconcilePullRequest } from "./reconcile.ts";
+import { canReconcilePullRequest, PullRequestHeadChangedError } from "./reconcile.ts";
 import type { WorkflowStore } from "./store.ts";
 import { readReconcileHint } from "./webhook.ts";
+
+const retryDelayMs = 30_000;
 
 export function describeError(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown controller error.";
@@ -88,7 +90,7 @@ export function createController({
     const observations = new Map<PullRequestTarget, Promise<void>>();
     async function reconcileTargets(selected: PullRequestTarget[]) {
       const failures: string[] = [];
-      const throttledTargets = new Map<PullRequestTarget, number>();
+      const retryDeadlines = new Map<PullRequestTarget, number>();
       let retryAt = 0;
       for (const target of selected) {
         try {
@@ -100,13 +102,18 @@ export function createController({
           await observation;
         } catch (error) {
           failures.push(`${target.repository}#${target.pullRequest}: ${describeError(error)}`);
-          if (error instanceof GitHubRateLimitError) {
-            throttledTargets.set(target, error.retryAt);
-            retryAt = Math.max(retryAt, error.retryAt);
-          }
+          const deadline =
+            error instanceof GitHubRateLimitError
+              ? error.retryAt
+              : error instanceof PullRequestHeadChangedError
+                ? now() + retryDelayMs
+                : undefined;
+          if (deadline === undefined) continue;
+          retryDeadlines.set(target, deadline);
+          retryAt = Math.max(retryAt, deadline);
         }
       }
-      return { failures, retryAt, throttledTargets };
+      return { failures, retryAt, retryDeadlines };
     }
 
     let success = true;
@@ -129,7 +136,7 @@ export function createController({
             retryAt = result.retryAt;
             if (result.failures.length) throw new Error(result.failures.join(", "));
           },
-          () => Math.max(now() + 30_000, retryAt),
+          () => Math.max(now() + retryDelayMs, retryAt),
         );
       } catch (error) {
         success = false;
@@ -150,15 +157,15 @@ export function createController({
     const sweepAt = now();
     const periodic = sweepAt >= nextSweep;
     if (periodic || startupDueAt.size > 0) {
-      // Throttled startup targets have their own deadlines, independent of periodic polling.
+      // Startup retries have their own deadlines, independent of periodic polling.
       const due = targets.filter((target) => {
         const startupDeadline = startupDueAt.get(target);
         return startupDeadline === undefined ? periodic : startupDeadline <= sweepAt;
       });
-      const { failures, throttledTargets } = await reconcileTargets(due);
+      const { failures, retryDeadlines } = await reconcileTargets(due);
       for (const target of due) {
         if (!startupDueAt.has(target)) continue;
-        const retryAt = throttledTargets.get(target);
+        const retryAt = retryDeadlines.get(target);
         if (retryAt === undefined) startupDueAt.delete(target);
         else startupDueAt.set(target, retryAt);
       }
