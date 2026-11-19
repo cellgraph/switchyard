@@ -1,6 +1,6 @@
-# Switchyard architecture (initial proposal)
+# Switchyard architecture
 
-This document describes the smallest architecture that supports the first Codex/GitHub pull request loop while leaving a path to other agents and remote workers. The decisions here are recorded in [ADR-0001](adr/0001-local-controller-and-agent-boundary.md); unresolved assumptions are explicit so the first implementation can verify them.
+This document describes the smallest architecture that supports the first Codex/GitHub pull request loop while leaving a path to other agents and remote workers. The decisions here are recorded in [ADR-0001](adr/0001-local-controller-and-agent-boundary.md); unresolved assumptions are explicit so they can be verified in later phases.
 
 ## Components
 
@@ -16,7 +16,8 @@ GitHub App webhook ──▶ webhook inbox ──▶ SQLite workflow controller
 ```
 
 - **Controller:** owns workflow state, policy, timers/reconciliation, cycle limits, and decisions about whether to resume, wait, escalate, or mark ready for human review. It is a single local Node.js process in the first version.
-- **GitHub adapter:** verifies and records webhook deliveries, reads current PR/review/check state through GitHub App credentials, and normalizes GitHub-specific data. It is the only boundary that understands GitHub payloads and the observed Codex review comment format.
+- **Webhook receiver:** validates the signature over raw bytes and records the delivery ID and routing hint in the SQLite inbox before responding.
+- **GitHub adapter:** reads current PR, review, comment, check run, and status data through read-only GitHub App credentials. It provides the GitHub-specific inputs for the future review adapter.
 - **Worker:** checks out and manages a dedicated Git worktree and invokes Codex. It reports progress/results to the controller. In the first version it runs in process on the same macOS machine; the interface will not assume that forever.
 - **Agent adapter:** starts or resumes an implementation session and streams its turn result. Codex is the only implementation. Keep the session ID opaque and vendor-specific in storage. A future Claude Code adapter may implement the same narrow capabilities without shaping the first version around a lowest common denominator.
 - **SQLite:** stores workflow state, inbound webhook receipts, external operation records, session identifiers, cycle counts, head SHAs, review snapshots, and CI status snapshots. WAL mode and bounded transactions are appropriate for a single controller.
@@ -35,9 +36,9 @@ One workflow row has one of these states:
 | `validating`      | The agent turn ended; run the configured validation and inspect the resulting diff before push.                                                         |
 | `ready_for_human` | Latest head has an explicit clean review for the same SHA and all configured required checks pass. Human decides what happens next.                     |
 | `escalated`       | Cycle limit, ambiguous review, unsafe change, merge conflict, unavailable session, repeated infrastructure failure, or judgment call requires a person. |
-| `stopped`         | User or external lifecycle action stopped/closed the workflow. No automatic restart.                                                                    |
+| `stopped`         | An operator stopped the workflow or GitHub closed the PR. A GitHub reopen can resume a workflow stopped by the closure.                                 |
 
-State transitions are performed by controller code and recorded with the triggering event/reason. A later `synchronize` event changes the tracked head and invalidates prior review and CI evidence before returning to `awaiting_review`. If a head-change notification arrives while validation is active, preserve `validating` until the controller records that cycle's outcome, then wait for review of the new head. Persist the validation-start SHA to order review and push events safely. An agent cannot set `ready_for_human`; only controller policy can.
+State transitions are performed by controller code and recorded with the triggering event/reason. Reconciliation after a `synchronize` event reads the current GitHub head. A changed head invalidates prior review and CI evidence before returning to `awaiting_review`. If a head-change notification arrives while validation is active, preserve `validating` until the controller records that cycle's outcome, then wait for review of the new head. Persist the validation-start SHA to order review and push events safely. An agent cannot set `ready_for_human`; only controller policy can.
 
 ## Review completion and findings
 
@@ -82,13 +83,13 @@ Create one Git worktree per workflow so an agent cannot change the user's checko
 
 ## GitHub integration
 
-Use a GitHub App, not a user-wide personal token. Initial permissions should be reviewed against the exact endpoints used: repository metadata read, pull requests read, issues read for conversation comments, checks/statuses read, and contents read only if needed to resolve the base/head or fetch code. Add contents write only if implementation workflow needs to push through the App; prefer the developer's existing Git credential path for the local first milestone if that is more manageable. Webhook events should be minimized to PR lifecycle, review, review-comment, issue-comment, and check/status updates needed for reconciliation. Re-check App permissions with a live test install before relying on them.
+Phase 2 uses the Phase 1 SQLite inbox and workflow store. The receiver checks the request, stores a minimal reconciliation hint, and returns after the durable insert. A serial controller pass claims due rows and processes them independently of HTTP. Webhook and periodic triggers both use the same reconciler and can share one observation of a PR within a pass. If the PR head moves during the evidence reads, the reconciler records the newly observed head and retries without saving stale evidence.
 
-GitHub requires a publicly reachable webhook URL for live deliveries. Keep local development free of required paid services: test signature validation and workflow handling with saved/fixture deliveries, and offer polling/manual sync for local runs. A tunnel may be documented as an optional developer convenience, not a required runtime dependency. Before deployment, decide where the webhook endpoint is hosted and how it authenticates to the local worker; that is outside the initial local milestone.
+The local configuration selects the PRs to track under each App installation. See the [GitHub App setup guide](github-app.md) for the read-only permission set, subscriptions, optional webhook delivery, fixture tests, and polling/manual refresh. Phase 2 reads review inputs and collects exact-head check evidence. The review parser and required-check discovery are deferred to their planned phases.
 
 ## Branch policy and human handoff
 
-Live settings were inspected with `gh` on 2026-11-15. The repository has no rulesets (`gh api repos/cellgraph/switchyard/rulesets` returned `[]`), and the `main` branch-protection endpoint returned “Branch not protected.” No settings were changed.
+See the [GitHub App setup guide](github-app.md#offline-development-and-live-verification) for the rules observed on `main` during Phase 2.
 
 Recommend a ruleset for `main` that requires pull requests and the `Quality checks` CI status, which runs formatting, lint, type checking, and tests. Enable automatic Codex review for the repository in Codex's GitHub settings. The observed Codex integration publishes a summary comment, not a GitHub status check, so do not configure a required Codex check unless the integration later exposes an enforceable status. Do not require owner approval for every PR by default, and do not reduce any protections already present when applying this recommendation elsewhere. `ready_for_human` only means Switchyard has satisfied its automation gate; it does not approve or merge the PR.
 
