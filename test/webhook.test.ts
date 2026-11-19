@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createController } from "../src/controller.ts";
 import type { GitHubReader, PullRequestState } from "../src/github-api.ts";
+import { GitHubRateLimitError } from "../src/github-app.ts";
 import { createReconciler } from "../src/reconcile.ts";
 import { WorkflowStore } from "../src/store.ts";
 import { createWebhookServer } from "../src/webhook.ts";
@@ -274,6 +275,23 @@ describe("GitHub webhook intake and reconciliation", () => {
     expect(workflow()?.checks).toEqual([{ name: "CI", sha: headA, outcome: "pending" }]);
   });
 
+  it("persists a GitHub retry window longer than the default inbox delay", async () => {
+    const { runPass } = controller();
+    await runPass();
+    const retryAt = now + 60_000;
+    vi.mocked(github.readPullRequest).mockRejectedValueOnce(new GitHubRateLimitError(retryAt, 403));
+    await send("status");
+    const id = fixtures.status!.id;
+    expect(await runPass()).toBe(false);
+    expect(store.deliveryStatus(id)).toMatchObject({ status: "failed", attempts: 1, retryAt });
+    now += 30_000;
+    await runPass();
+    expect(store.deliveryStatus(id)).toMatchObject({ status: "failed", attempts: 1, retryAt });
+    now = retryAt;
+    await runPass();
+    expect(store.deliveryStatus(id)).toMatchObject({ status: "processed", attempts: 2 });
+  });
+
   it("polls for missed opens, synchronizations, closures and reopens without replaying an operator stop", async () => {
     const { runPass } = controller(5_000);
     await runPass();
@@ -377,8 +395,9 @@ describe("GitHub webhook intake and reconciliation", () => {
     expect(workflow()).toMatchObject({ state: "awaiting_review", headSha: headA, checks: [] });
   });
 
-  it("upgrades an existing Phase 1 database with outstanding deliveries", () => {
-    store.receiveDelivery(fixtures.opened!.id, target);
+  it("upgrades and reconciles pending and interrupted Phase 1 deliveries", async () => {
+    await controller().runPass();
+    const workflowId = workflow()!.id;
     store.close();
     const db = new DatabaseSync(dbPath);
     db.exec(`
@@ -388,12 +407,56 @@ describe("GitHub webhook intake and reconciliation", () => {
       ALTER TABLE workflows DROP COLUMN closed_by_github;
       DELETE FROM schema_migrations WHERE version = 4;
     `);
+    const insert = db.prepare(
+      "INSERT INTO deliveries (delivery_id, workflow_id, payload, status, received_at) VALUES (?, ?, ?, ?, ?)",
+    );
+    insert.run(
+      "legacy-review",
+      workflowId,
+      '{"action":"review"}',
+      "processing",
+      new Date(now).toISOString(),
+    );
+    insert.run(
+      "legacy-unlinked",
+      null,
+      '{"action":"opened"}',
+      "pending",
+      new Date(now).toISOString(),
+    );
     db.close();
     store = new WorkflowStore(dbPath);
-    expect(store.dueDeliveryIds(now, 25)).toEqual([fixtures.opened!.id]);
-    expect(store.deliveryStatus(fixtures.opened!.id)).toMatchObject({
-      status: "pending",
-      attempts: 0,
+    expect(store.recover()).toEqual({ deliveries: 1, ambiguousOperations: 0 });
+    expect(store.dueDeliveryIds(now, 25)).toEqual(["legacy-review", "legacy-unlinked"]);
+    state.headSha = headB;
+    expect(await controller().runPass()).toBe(true);
+    expect(workflow()).toMatchObject({
+      headSha: headB,
+      state: "awaiting_review",
+      review: null,
     });
+    for (const id of ["legacy-review", "legacy-unlinked"])
+      expect(store.deliveryStatus(id)).toMatchObject({
+        status: "processed",
+        attempts: 1,
+        error: null,
+      });
+  });
+
+  it("uses the linked workflow to route a Phase 1 payload after the startup sweep", async () => {
+    const reconcile = vi.fn(createReconciler(store, github));
+    const { runPass } = createController({
+      store,
+      targets: [target, { ...target, pullRequest: 8 }],
+      reconcile,
+      reportError,
+      reconcileIntervalMs: 0,
+      now: () => now,
+    });
+    await runPass();
+    reconcile.mockClear();
+    store.receiveDelivery("legacy-review", { action: "review" }, workflow()!.id);
+    expect(await runPass()).toBe(true);
+    expect(reconcile.mock.calls).toEqual([[target]]);
   });
 });

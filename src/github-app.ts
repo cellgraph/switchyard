@@ -9,6 +9,19 @@ const permissions = {
 
 export type GitHubRepository = { repository: string; installationId: number };
 
+export class GitHubRateLimitError extends Error {
+  readonly retryAt: number;
+
+  constructor(retryAt: number, status?: number) {
+    super(
+      status === undefined
+        ? "GitHub API rate limit is active."
+        : `GitHub API rate limit reached (HTTP ${status}).`,
+    );
+    this.retryAt = retryAt;
+  }
+}
+
 type Token = { value: string; expiresAt: number };
 type ApiRequest = {
   path: string;
@@ -31,7 +44,8 @@ export function createGitHubAppClient({
   if (key.asymmetricKeyType !== "rsa") throw new Error("GitHub App requires an RSA private key.");
   const tokens = new Map<string, Token>();
   const refreshes = new Map<string, Promise<Token>>();
-  let rateLimitedUntil = 0;
+  const primaryReset = new Map<number, number>();
+  let secondaryReset = 0;
 
   function appJwt(): string {
     const seconds = Math.floor(now() / 1000);
@@ -42,10 +56,13 @@ export function createGitHubAppClient({
   }
 
   async function request(
+    installationId: number,
     { path, method, body }: ApiRequest,
     credential: string,
   ): Promise<Response> {
-    if (now() < rateLimitedUntil) throw new Error("GitHub API rate limit is active.");
+    const activeReset = () => Math.max(primaryReset.get(installationId) ?? 0, secondaryReset);
+    const retryAt = activeReset();
+    if (now() < retryAt) throw new GitHubRateLimitError(retryAt);
     const headers = {
       accept: "application/vnd.github+json",
       authorization: `Bearer ${credential}`,
@@ -65,19 +82,27 @@ export function createGitHubAppClient({
       throw new Error("GitHub API request failed or timed out.");
     }
     if (response.status === 403 || response.status === 429) {
-      const retryAfter = response.headers.get("retry-after");
-      const reset = response.headers.get("x-ratelimit-reset");
-      if (retryAfter && /^\d+$/.test(retryAfter)) {
-        rateLimitedUntil = now() + Number(retryAfter) * 1000;
-      } else if (
-        response.headers.get("x-ratelimit-remaining") === "0" &&
-        reset &&
-        /^\d+$/.test(reset)
-      ) {
-        rateLimitedUntil = Number(reset) * 1000;
-      } else if (response.status === 429) {
-        rateLimitedUntil = now() + 60_000;
+      const retryDelay = headerMilliseconds(response.headers.get("retry-after"));
+      const primaryLimited = response.headers.get("x-ratelimit-remaining") === "0";
+      const secondaryLimited =
+        (!primaryLimited && (response.status === 429 || retryDelay !== undefined)) ||
+        (await reportsSecondaryLimit(response));
+      const observedAt = now();
+      if (primaryLimited) {
+        const reset = headerMilliseconds(response.headers.get("x-ratelimit-reset"));
+        primaryReset.set(
+          installationId,
+          Math.max(
+            primaryReset.get(installationId) ?? 0,
+            reset !== undefined && reset > observedAt ? reset : observedAt + 60_000,
+            observedAt + (retryDelay ?? 0),
+          ),
+        );
       }
+      if (secondaryLimited)
+        secondaryReset = Math.max(secondaryReset, observedAt + (retryDelay ?? 60_000));
+      if (primaryLimited || secondaryLimited)
+        throw new GitHubRateLimitError(activeReset(), response.status);
     }
     return response;
   }
@@ -90,6 +115,7 @@ export function createGitHubAppClient({
 
     const refresh = (async () => {
       const response = await request(
+        target.installationId,
         {
           path: `/app/installations/${target.installationId}/access_tokens`,
           method: "POST",
@@ -126,11 +152,11 @@ export function createGitHubAppClient({
       const cacheKey = `${target.installationId}:${target.repository}`;
       const path = `/repos/${target.repository}${suffix}`;
       let token = await tokenFor(target, cacheKey);
-      let response = await request({ path }, token.value);
+      let response = await request(target.installationId, { path }, token.value);
       if (response.status === 401) {
         if (tokens.get(cacheKey) === token) tokens.delete(cacheKey);
         token = await tokenFor(target, cacheKey);
-        response = await request({ path }, token.value);
+        response = await request(target.installationId, { path }, token.value);
         if (response.status === 401 && tokens.get(cacheKey) === token) tokens.delete(cacheKey);
       }
       if (!response.ok) throw new Error(`GitHub API GET ${path} failed (HTTP ${response.status}).`);
@@ -140,6 +166,21 @@ export function createGitHubAppClient({
       };
     },
   };
+}
+
+function headerMilliseconds(value: string | null): number | undefined {
+  if (!value || !/^\d+$/.test(value)) return undefined;
+  const milliseconds = Number(value) * 1000;
+  return Number.isSafeInteger(milliseconds) ? milliseconds : undefined;
+}
+
+async function reportsSecondaryLimit(response: Response): Promise<boolean> {
+  try {
+    const message = object(await response.json())?.message;
+    return typeof message === "string" && /\bsecondary rate limit\b/i.test(message);
+  } catch {
+    return false;
+  }
 }
 
 async function readJson(response: Response): Promise<unknown> {

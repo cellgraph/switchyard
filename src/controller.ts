@@ -1,4 +1,5 @@
 import type { PullRequestTarget } from "./github-api.ts";
+import { GitHubRateLimitError } from "./github-app.ts";
 import type { WorkflowStore } from "./store.ts";
 import { readReconcileHint } from "./webhook.ts";
 
@@ -24,10 +25,34 @@ export function createController({
   let nextSweep = 0;
   let running: Promise<boolean> | undefined;
 
+  function deliveryTargets(payload: unknown, workflowId: string | null): PullRequestTarget[] {
+    if (workflowId !== null) {
+      const identity = store.getWorkflow(workflowId)?.identity;
+      if (!identity) return [];
+      return targets.filter(
+        (target) =>
+          target.repository === identity.repository.toLowerCase() &&
+          target.pullRequest === identity.pullRequest,
+      );
+    }
+    const hint = readReconcileHint(payload);
+    if (hint === undefined) return targets;
+    if (hint === null) return [];
+    return targets.filter(
+      (target) =>
+        target.repository === hint.repository &&
+        target.installationId === hint.installationId &&
+        (hint.pullRequest === null || hint.pullRequest === target.pullRequest),
+    );
+  }
+
   async function pass(): Promise<boolean> {
     const observations = new Map<PullRequestTarget, Promise<void>>();
-    async function reconcileTargets(selected: PullRequestTarget[]): Promise<string[]> {
+    async function reconcileTargets(
+      selected: PullRequestTarget[],
+    ): Promise<{ failures: string[]; retryAt: number }> {
       const failures: string[] = [];
+      let retryAt = 0;
       for (const target of selected) {
         try {
           let observation = observations.get(target);
@@ -38,29 +63,24 @@ export function createController({
           await observation;
         } catch (error) {
           failures.push(`${target.repository}#${target.pullRequest}: ${describeError(error)}`);
+          if (error instanceof GitHubRateLimitError) retryAt = Math.max(retryAt, error.retryAt);
         }
       }
-      return failures;
+      return { failures, retryAt };
     }
 
     let success = true;
     for (const deliveryId of store.dueDeliveryIds(now(), 25)) {
       try {
+        let retryAt = 0;
         await store.processDelivery(
           deliveryId,
-          async (payload) => {
-            const hint = readReconcileHint(payload);
-            if (!hint) return;
-            const matches = targets.filter(
-              (target) =>
-                target.repository === hint.repository &&
-                target.installationId === hint.installationId &&
-                (hint.pullRequest === null || hint.pullRequest === target.pullRequest),
-            );
-            const failures = await reconcileTargets(matches);
-            if (failures.length) throw new Error(failures.join(", "));
+          async (payload, workflowId) => {
+            const result = await reconcileTargets(deliveryTargets(payload, workflowId));
+            retryAt = result.retryAt;
+            if (result.failures.length) throw new Error(result.failures.join(", "));
           },
-          () => now() + 30_000,
+          () => Math.max(now() + 30_000, retryAt),
         );
       } catch (error) {
         success = false;
@@ -68,7 +88,7 @@ export function createController({
       }
     }
     if (now() >= nextSweep) {
-      const failures = await reconcileTargets(targets);
+      const { failures } = await reconcileTargets(targets);
       nextSweep = reconcileIntervalMs > 0 ? now() + reconcileIntervalMs : Infinity;
       for (const failure of failures) reportError(`Periodic reconciliation failed for ${failure}`);
       if (failures.length) success = false;

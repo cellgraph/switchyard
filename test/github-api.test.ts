@@ -139,6 +139,93 @@ describe("GitHub App and REST adapter", () => {
     expect(exchanges).toBe(2);
   });
 
+  it("scopes a primary rate-limit reset to the affected installation", async () => {
+    let now = Date.UTC(2026, 0, 1);
+    const reset = now + 120_000;
+    const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+      if (options?.method === "POST")
+        return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+      if (requestUrl(input).pathname.startsWith("/repos/owner/") && now < reset)
+        return Response.json(
+          { message: "API rate limit exceeded" },
+          {
+            status: 403,
+            headers: {
+              "x-ratelimit-remaining": "0",
+              "x-ratelimit-reset": String(reset / 1000),
+              "retry-after": "10",
+            },
+          },
+        );
+      return Response.json([]);
+    });
+    const client = createGitHubAppClient({
+      clientId: "fixture-client-id",
+      privateKey,
+      fetcher,
+      now: () => now,
+    });
+    await expect(client.get(target, "/pulls/7")).rejects.toMatchObject({ retryAt: reset });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+
+    await expect(
+      client.get({ ...target, repository: "owner/another" }, "/pulls/7"),
+    ).rejects.toMatchObject({ retryAt: reset });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    await expect(
+      client.get({ ...target, repository: "other/repo", installationId: 84 }, "/pulls/7"),
+    ).resolves.toMatchObject({ data: [] });
+    expect(fetcher).toHaveBeenCalledTimes(4);
+
+    now = reset;
+    await expect(client.get(target, "/pulls/7")).resolves.toMatchObject({ data: [] });
+    expect(fetcher).toHaveBeenCalledTimes(5);
+  });
+
+  it("backs off a secondary 403 for one minute while ordinary permission errors stay local", async () => {
+    let now = Date.UTC(2026, 0, 1);
+    const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+      if (options?.method === "POST")
+        return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+      const path = requestUrl(input).pathname;
+      if (path.endsWith("/pulls/8"))
+        return Response.json(
+          { message: "Resource not accessible by integration" },
+          { status: 403 },
+        );
+      if (path.endsWith("/pulls/9"))
+        return Response.json(
+          { message: "You have exceeded a secondary rate limit. Sensitive detail." },
+          {
+            status: 403,
+            headers: { "x-ratelimit-remaining": "100" },
+          },
+        );
+      return Response.json([]);
+    });
+    const client = createGitHubAppClient({
+      clientId: "fixture-client-id",
+      privateKey,
+      fetcher,
+      now: () => now,
+    });
+    const other = { ...target, repository: "other/repo", installationId: 84 };
+    await expect(client.get(target, "/pulls/8")).rejects.toThrow(
+      /^GitHub API GET .* failed \(HTTP 403\)\.$/,
+    );
+    await expect(client.get(target, "/pulls/9")).rejects.toMatchObject({
+      message: "GitHub API rate limit reached (HTTP 403).",
+      retryAt: now + 60_000,
+    });
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    now += 59_999;
+    await expect(client.get(other, "/pulls/7")).rejects.toThrow("rate limit is active");
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    now++;
+    await expect(client.get(other, "/pulls/7")).resolves.toMatchObject({ data: [] });
+    expect(fetcher).toHaveBeenCalledTimes(5);
+  });
+
   it("paginates GitHub resources and normalizes conservative exact-head check evidence", async () => {
     const pagesSeen: string[] = [];
     const fetcher = vi.fn<typeof fetch>(async (input, options) => {

@@ -234,17 +234,17 @@ export class WorkflowStore {
 
   async processDelivery(
     deliveryId: string,
-    processor: (payload: unknown) => void | Promise<void>,
+    processor: (payload: unknown, workflowId: string | null) => void | Promise<void>,
     retryAt?: () => number,
   ): Promise<boolean> {
     const row = this.#db
       .prepare(
-        "SELECT payload FROM deliveries WHERE delivery_id=? AND status IN ('pending','failed')",
+        "SELECT payload, workflow_id FROM deliveries WHERE delivery_id=? AND status IN ('pending','failed')",
       )
-      .get(deliveryId) as { payload: string } | undefined;
+      .get(deliveryId) as { payload: string; workflow_id: string | null } | undefined;
     if (!row || !this.claimDelivery(deliveryId)) return false;
     try {
-      await processor(JSON.parse(row.payload) as unknown);
+      await processor(JSON.parse(row.payload) as unknown, row.workflow_id);
       this.completeDelivery(deliveryId);
       return true;
     } catch (error) {

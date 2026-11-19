@@ -45,7 +45,7 @@ npm start -- /path/to/switchyard.json
 
 The receiver binds to `127.0.0.1`. A local tunnel or reverse proxy is optional for live delivery. With the webhook secret unset, the controller runs in polling mode. The startup sweep includes every configured PR, even if its opening delivery was missed. Set `reconcileIntervalMs` to `0` to disable subsequent periodic sweeps. For a manual refresh, stop the long-running controller and run `npm start -- --once /path/to/switchyard.json` to process a batch of due deliveries and refresh the configured PRs. Use a single controller per SQLite file.
 
-The inbox stores delivery IDs and routing hints without raw webhook bodies or comment text. A valid delivery gets HTTP `202` once SQLite records its receipt. The controller logs delivery failures with the ID and retries them after 30 seconds. Restart requeues interrupted processing and preserves scheduled retries. You can inspect recent delivery attempts with a read-only SQLite query.
+The inbox stores delivery IDs and routing hints without raw webhook bodies or comment text. A valid delivery gets HTTP `202` once SQLite records its receipt. The controller logs delivery failures with the ID and retries them after 30 seconds or a later GitHub backoff deadline. Primary API backoff applies to the affected installation. Secondary API backoff pauses requests across the client. Restart requeues interrupted processing and preserves scheduled retries. You can inspect recent delivery attempts with a read-only SQLite query.
 
 ```sh
 sqlite3 -readonly switchyard.sqlite \

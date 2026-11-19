@@ -71,9 +71,10 @@ function validHint(value: unknown): value is ReconcileHint {
   );
 }
 
-export function readReconcileHint(payload: unknown): ReconcileHint | null {
+export function readReconcileHint(payload: unknown): ReconcileHint | null | undefined {
   if (payload === null || validHint(payload)) return payload;
-  throw new Error("The stored delivery does not contain a valid GitHub reconciliation hint.");
+  // Phase 1 accepted opaque payloads that did not encode GitHub routing.
+  return undefined;
 }
 
 function header(request: IncomingMessage, name: string): string | undefined {
