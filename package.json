@@ -14,7 +14,8 @@
     "format:check": "prettier --check .",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run --passWithNoTests",
+    "start": "node src/main.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

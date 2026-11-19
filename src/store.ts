@@ -5,7 +5,7 @@ import {
   type ReviewEvidence,
   type Workflow,
   type WorkflowCommand,
-} from "./workflow.js";
+} from "./workflow.ts";
 
 export type DeliveryStatus = "pending" | "processing" | "processed" | "failed";
 export type OperationStatus = "pending" | "completed" | "failed" | "ambiguous";
@@ -50,6 +50,10 @@ const migrations = [
   );`,
   "ALTER TABLE workflows ADD COLUMN cycle_awaiting_review INTEGER NOT NULL DEFAULT 0;",
   "ALTER TABLE workflows ADD COLUMN validation_head_sha TEXT;",
+  `ALTER TABLE workflows ADD COLUMN closed_by_github INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE deliveries ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE deliveries ADD COLUMN retry_at INTEGER;
+  CREATE INDEX deliveries_retry ON deliveries(status, retry_at);`,
 ];
 
 export class WorkflowStore {
@@ -69,8 +73,8 @@ export class WorkflowStore {
     const now = new Date().toISOString();
     this.#db
       .prepare(
-        `INSERT INTO workflows (id, repository, pull_request, state, head_sha, required_checks, review, checks, fix_cycles, cycle_awaiting_review, validation_head_sha, escalation_reason, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO workflows (id, repository, pull_request, state, head_sha, required_checks, review, checks, fix_cycles, cycle_awaiting_review, validation_head_sha, escalation_reason, closed_by_github, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         workflow.id,
@@ -85,6 +89,7 @@ export class WorkflowStore {
         workflow.cycleAwaitingReview ? 1 : 0,
         workflow.validationHeadSha,
         workflow.escalationReason,
+        workflow.closedByGitHub ? 1 : 0,
         now,
         now,
       );
@@ -93,6 +98,15 @@ export class WorkflowStore {
   getWorkflow(id: string): Workflow | null {
     const row = this.#db.prepare("SELECT * FROM workflows WHERE id = ?").get(id) as
       Record<string, unknown> | undefined;
+    return row ? decodeWorkflow(row) : null;
+  }
+
+  findWorkflow(repository: string, pullRequest: number): Workflow | null {
+    const row = this.#db
+      .prepare(
+        "SELECT * FROM workflows WHERE repository = ? COLLATE NOCASE AND pull_request = ? ORDER BY id LIMIT 1",
+      )
+      .get(repository, pullRequest);
     return row ? decodeWorkflow(row) : null;
   }
 
@@ -110,7 +124,7 @@ export class WorkflowStore {
       const now = new Date().toISOString();
       this.#db
         .prepare(
-          `UPDATE workflows SET state=?, head_sha=?, required_checks=?, review=?, checks=?, fix_cycles=?, cycle_awaiting_review=?, validation_head_sha=?, escalation_reason=?, updated_at=? WHERE id=?`,
+          `UPDATE workflows SET state=?, head_sha=?, required_checks=?, review=?, checks=?, fix_cycles=?, cycle_awaiting_review=?, validation_head_sha=?, escalation_reason=?, closed_by_github=?, updated_at=? WHERE id=?`,
         )
         .run(
           w.state,
@@ -122,6 +136,7 @@ export class WorkflowStore {
           w.cycleAwaitingReview ? 1 : 0,
           w.validationHeadSha,
           w.escalationReason,
+          w.closedByGitHub ? 1 : 0,
           now,
           id,
         );
@@ -174,9 +189,35 @@ export class WorkflowStore {
     }));
   }
 
+  dueDeliveryIds(now: number, limit: number): string[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT delivery_id FROM deliveries
+         WHERE status = 'pending' OR (status = 'failed' AND (retry_at IS NULL OR retry_at <= ?))
+         ORDER BY COALESCE(retry_at, unixepoch(received_at) * 1000), rowid LIMIT ?`,
+      )
+      .all(now, limit) as Array<{ delivery_id: string }>;
+    return rows.map((row) => row.delivery_id);
+  }
+
+  deliveryStatus(deliveryId: string): {
+    status: DeliveryStatus;
+    attempts: number;
+    error: string | null;
+    retryAt: number | null;
+  } | null {
+    const row = this.#db
+      .prepare(
+        "SELECT status, attempts, error, retry_at AS retryAt FROM deliveries WHERE delivery_id = ?",
+      )
+      .get(deliveryId);
+    return (row as ReturnType<WorkflowStore["deliveryStatus"]>) ?? null;
+  }
+
   async processDelivery(
     deliveryId: string,
     processor: (payload: unknown) => void | Promise<void>,
+    retryAt?: () => number,
   ): Promise<boolean> {
     const row = this.#db
       .prepare(
@@ -189,7 +230,7 @@ export class WorkflowStore {
       this.completeDelivery(deliveryId);
       return true;
     } catch (error) {
-      this.failDelivery(deliveryId, String(error));
+      this.failDelivery(deliveryId, String(error), retryAt?.() ?? null);
       throw error;
     }
   }
@@ -198,7 +239,7 @@ export class WorkflowStore {
     return (
       this.#db
         .prepare(
-          "UPDATE deliveries SET status='processing', error=NULL WHERE delivery_id=? AND status IN ('pending','failed')",
+          "UPDATE deliveries SET status='processing', attempts=attempts+1 WHERE delivery_id=? AND status IN ('pending','failed')",
         )
         .run(deliveryId).changes === 1
     );
@@ -207,18 +248,18 @@ export class WorkflowStore {
   completeDelivery(deliveryId: string): void {
     const changed = this.#db
       .prepare(
-        "UPDATE deliveries SET status='processed', processed_at=?, error=NULL WHERE delivery_id=? AND status='processing'",
+        "UPDATE deliveries SET status='processed', processed_at=?, error=NULL, retry_at=NULL WHERE delivery_id=? AND status='processing'",
       )
       .run(new Date().toISOString(), deliveryId);
     if (changed.changes !== 1) throw new Error(`Delivery ${deliveryId} is not processing.`);
   }
 
-  failDelivery(deliveryId: string, error: string): void {
+  failDelivery(deliveryId: string, error: string, retryAt: number | null = null): void {
     const changed = this.#db
       .prepare(
-        "UPDATE deliveries SET status='failed', error=? WHERE delivery_id=? AND status='processing'",
+        "UPDATE deliveries SET status='failed', error=?, retry_at=? WHERE delivery_id=? AND status='processing'",
       )
-      .run(error, deliveryId);
+      .run(error, retryAt, deliveryId);
     if (changed.changes !== 1) throw new Error(`Delivery ${deliveryId} is not processing.`);
   }
 
@@ -346,5 +387,6 @@ function decodeWorkflow(row: Record<string, unknown>): Workflow {
     cycleAwaitingReview: Number(row.cycle_awaiting_review) === 1,
     validationHeadSha: row.validation_head_sha === null ? null : String(row.validation_head_sha),
     escalationReason: row.escalation_reason === null ? null : String(row.escalation_reason),
+    ...(row.closed_by_github === 1 ? { closedByGitHub: true } : {}),
   };
 }

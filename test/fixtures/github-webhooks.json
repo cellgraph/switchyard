@@ -1,0 +1,215 @@
+{
+  "opened": {
+    "id": "fa217d36-a510-11ee-9eb4-000000000001",
+    "event": "pull_request",
+    "payload": {
+      "repository": {
+        "full_name": "Owner/Repo"
+      },
+      "installation": {
+        "id": 42
+      },
+      "action": "opened",
+      "number": 7,
+      "pull_request": {
+        "state": "open",
+        "head": {
+          "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    }
+  },
+  "synchronize": {
+    "id": "fa217d36-a510-11ee-9eb4-000000000002",
+    "event": "pull_request",
+    "payload": {
+      "repository": {
+        "full_name": "Owner/Repo"
+      },
+      "installation": {
+        "id": 42
+      },
+      "action": "synchronize",
+      "number": 7,
+      "before": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "after": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "pull_request": {
+        "state": "open",
+        "head": {
+          "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      }
+    }
+  },
+  "closed": {
+    "id": "fa217d36-a510-11ee-9eb4-000000000003",
+    "event": "pull_request",
+    "payload": {
+      "repository": {
+        "full_name": "Owner/Repo"
+      },
+      "installation": {
+        "id": 42
+      },
+      "action": "closed",
+      "number": 7,
+      "pull_request": {
+        "state": "closed",
+        "head": {
+          "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      }
+    }
+  },
+  "reopened": {
+    "id": "fa217d36-a510-11ee-9eb4-000000000004",
+    "event": "pull_request",
+    "payload": {
+      "repository": {
+        "full_name": "Owner/Repo"
+      },
+      "installation": {
+        "id": 42
+      },
+      "action": "reopened",
+      "number": 7,
+      "pull_request": {
+        "state": "open",
+        "head": {
+          "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      }
+    }
+  },
+  "review": {
+    "id": "fa217d36-a510-11ee-9eb4-000000000005",
+    "event": "pull_request_review",
+    "payload": {
+      "repository": {
+        "full_name": "Owner/Repo"
+      },
+      "installation": {
+        "id": 42
+      },
+      "action": "submitted",
+      "pull_request": {
+        "number": 7
+      },
+      "review": {
+        "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "state": "approved"
+      }
+    }
+  },
+  "reviewComment": {
+    "id": "fa217d36-a510-11ee-9eb4-000000000006",
+    "event": "pull_request_review_comment",
+    "payload": {
+      "repository": {
+        "full_name": "Owner/Repo"
+      },
+      "installation": {
+        "id": 42
+      },
+      "action": "edited",
+      "pull_request": {
+        "number": 7
+      },
+      "comment": {
+        "body": "untrusted inline text",
+        "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  },
+  "issueComment": {
+    "id": "fa217d36-a510-11ee-9eb4-000000000007",
+    "event": "issue_comment",
+    "payload": {
+      "repository": {
+        "full_name": "Owner/Repo"
+      },
+      "installation": {
+        "id": 42
+      },
+      "action": "edited",
+      "issue": {
+        "number": 7,
+        "pull_request": {
+          "url": "https://api.github.com/repos/owner/repo/pulls/7"
+        }
+      },
+      "comment": {
+        "body": "untrusted PR conversation text"
+      }
+    }
+  },
+  "ordinaryIssue": {
+    "id": "fa217d36-a510-11ee-9eb4-000000000008",
+    "event": "issue_comment",
+    "payload": {
+      "repository": {
+        "full_name": "Owner/Repo"
+      },
+      "installation": {
+        "id": 42
+      },
+      "action": "edited",
+      "issue": {
+        "number": 7
+      },
+      "comment": {
+        "body": "untrusted issue conversation text"
+      }
+    }
+  },
+  "check": {
+    "id": "fa217d36-a510-11ee-9eb4-000000000009",
+    "event": "check_run",
+    "payload": {
+      "repository": {
+        "full_name": "Owner/Repo"
+      },
+      "installation": {
+        "id": 42
+      },
+      "action": "completed",
+      "check_run": {
+        "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pull_requests": [],
+        "conclusion": "success"
+      }
+    }
+  },
+  "suite": {
+    "id": "fa217d36-a510-11ee-9eb4-00000000000a",
+    "event": "check_suite",
+    "payload": {
+      "repository": {
+        "full_name": "Owner/Repo"
+      },
+      "installation": {
+        "id": 42
+      },
+      "action": "completed",
+      "check_suite": {
+        "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pull_requests": []
+      }
+    }
+  },
+  "status": {
+    "id": "fa217d36-a510-11ee-9eb4-00000000000b",
+    "event": "status",
+    "payload": {
+      "repository": {
+        "full_name": "Owner/Repo"
+      },
+      "installation": {
+        "id": 42
+      },
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "state": "success",
+      "context": "legacy"
+    }
+  }
+}
