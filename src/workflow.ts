@@ -66,10 +66,12 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
   const from = current.state;
   const reason = transitionReason(command, current.headSha);
 
-  const mayReconcileClosure =
+  const mayChangeGitHubClosure =
     current.closedByGitHub === true &&
-    (command.type === "github_pull_request" || command.type === "escalate");
-  if ((current.state === "stopped" && !mayReconcileClosure) || current.state === "escalated") {
+    (command.type === "github_pull_request" ||
+      command.type === "escalate" ||
+      command.type === "stop");
+  if ((current.state === "stopped" && !mayChangeGitHubClosure) || current.state === "escalated") {
     throw new InvalidTransitionError(
       `Cannot transition a ${current.state} workflow without a future explicit recovery action.`,
     );
@@ -224,6 +226,7 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
       if (!command.reason.trim()) throw new InvalidTransitionError("Stopping requires a reason.");
       next.state = "stopped";
       next.escalationReason = command.reason;
+      delete next.closedByGitHub;
       break;
   }
   if (next.state === "ready_for_human" && !isReady(next))

@@ -329,6 +329,28 @@ describe("GitHub webhook intake and reconciliation", () => {
     expect(store.deliveryStatus(fixtures.review!.id)?.error).toContain("head changed");
   });
 
+  it("honors an operator stop issued while GitHub has closed the PR", async () => {
+    const { runPass } = controller();
+    await runPass();
+    const id = workflow()!.id;
+    state.state = "closed";
+    await send("closed");
+    await runPass();
+    expect(workflow()).toMatchObject({ state: "stopped", closedByGitHub: true });
+
+    store.transition(id, { type: "stop", reason: "Operator stop while closed" });
+    store.close();
+    store = new WorkflowStore(dbPath);
+    store.recover();
+    state.state = "open";
+    await createReconciler(store, github)(target);
+    expect(workflow()).toMatchObject({
+      state: "stopped",
+      escalationReason: "Operator stop while closed",
+    });
+    expect(workflow()?.closedByGitHub).toBeUndefined();
+  });
+
   it("escalates an ambiguous operation across a close, restart, and reopen", async () => {
     const { runPass } = controller();
     await runPass();
