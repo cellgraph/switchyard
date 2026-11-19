@@ -1,15 +1,18 @@
 import type { GitHubReader, PullRequestState, PullRequestTarget } from "./github-api.ts";
+import { GitHubRateLimitError } from "./github-app.ts";
 import type { WorkflowStore } from "./store.ts";
-import type { CheckEvidence } from "./workflow.ts";
+import type { CheckEvidence, Workflow } from "./workflow.ts";
+
+export function isReconciliationTerminal(workflow: Workflow | null): boolean {
+  return (
+    workflow?.state === "escalated" || (workflow?.state === "stopped" && !workflow.closedByGitHub)
+  );
+}
 
 export function createReconciler(store: WorkflowStore, github: GitHubReader) {
   return async (target: PullRequestTarget): Promise<void> => {
     const existing = store.findWorkflow(target.repository, target.pullRequest);
-    if (
-      existing?.state === "escalated" ||
-      (existing?.state === "stopped" && !existing.closedByGitHub)
-    )
-      return;
+    if (isReconciliationTerminal(existing)) return;
 
     let id = existing?.id;
     function observe(snapshot: PullRequestState): boolean {
@@ -58,7 +61,13 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
       ]);
 
       const latest = await github.readPullRequest(target);
-      if (!observe(latest)) return;
+      if (!observe(latest)) {
+        const throttled = [checks, reviewInputs].some(
+          (read) => read.status === "rejected" && read.reason instanceof GitHubRateLimitError,
+        );
+        if (!throttled) github.completeReconciliation(target);
+        return;
+      }
       if (latest.headSha !== start.headSha)
         throw new Error("Pull request head changed during reconciliation.");
 

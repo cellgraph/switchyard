@@ -1,5 +1,6 @@
 import type { PullRequestTarget } from "./github-api.ts";
-import { GitHubRateLimitError } from "./github-app.ts";
+import { GitHubRateLimitError, retireInactiveGitHubRetry } from "./github-app.ts";
+import { isReconciliationTerminal } from "./reconcile.ts";
 import type { WorkflowStore } from "./store.ts";
 import { readReconcileHint } from "./webhook.ts";
 
@@ -22,6 +23,13 @@ export function createController({
   reconcileIntervalMs: number;
   now?: () => number;
 }) {
+  retireInactiveGitHubRetry(
+    store.githubRateLimits(),
+    targets.filter(
+      (target) =>
+        !isReconciliationTerminal(store.findWorkflow(target.repository, target.pullRequest)),
+    ),
+  );
   let nextSweep = 0;
   let running: Promise<boolean> | undefined;
 

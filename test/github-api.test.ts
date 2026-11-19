@@ -678,6 +678,145 @@ describe("GitHub App and REST adapter", () => {
     }
   });
 
+  it("clears the retry count when a PR closes on the final read", async () => {
+    const store = new WorkflowStore();
+    const now = Date.UTC(2026, 0, 1);
+    let prReads = 0;
+    const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+      if (options?.method === "POST")
+        return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+      const path = requestUrl(input).pathname;
+      if (path.endsWith("/pulls/7"))
+        return Response.json({
+          number: 7,
+          state: ++prReads === 1 ? "open" : "closed",
+          head: { sha },
+        });
+      if (path.endsWith("/pulls/8")) return new Response(null, { status: 429 });
+      if (path.endsWith("/check-runs")) return Response.json({ check_runs: [] });
+      if (path.endsWith("/status")) return Response.json({ sha, statuses: [] });
+      return Response.json([]);
+    });
+    try {
+      const rateLimits = store.githubRateLimits();
+      rateLimits.set("secondary", {
+        retryAt: now,
+        throttledAttempts: 4,
+        retryRequest: "pr:42:owner/repo:7",
+      });
+      const client = createGitHubAppClient({
+        clientId: "fixture-client-id",
+        privateKey,
+        fetcher,
+        rateLimits,
+        now: () => now,
+      });
+      const reconcile = createReconciler(store, createGitHubReader(client));
+      await reconcile(target);
+      expect(prReads).toBe(2);
+      expect(store.findWorkflow(target.repository, target.pullRequest)).toMatchObject({
+        state: "stopped",
+        closedByGitHub: true,
+      });
+      expect(rateLimits.get("secondary")?.throttledAttempts).toBe(0);
+      await expect(reconcile({ ...target, pullRequest: 8 })).rejects.toMatchObject({
+        retryAt: now + 60_000,
+      });
+      expect(rateLimits.get("secondary")?.throttledAttempts).toBe(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("retires an inactive target's count at startup while honoring its cooldown", async () => {
+    const store = new WorkflowStore();
+    let now = Date.UTC(2026, 0, 1);
+    const retryAt = now + 120_000;
+    const remaining = { repository: "other/repo", installationId: 84, pullRequest: 8 };
+    let throttle = false;
+    const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+      if (options?.method === "POST")
+        return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+      const path = requestUrl(input).pathname;
+      if (path.endsWith("/pulls/8"))
+        return throttle
+          ? new Response(null, { status: 429 })
+          : Response.json({ number: 8, state: "open", head: { sha } });
+      if (path.endsWith("/check-runs")) return Response.json({ check_runs: [] });
+      if (path.endsWith("/status")) return Response.json({ sha, statuses: [] });
+      return Response.json([]);
+    });
+    try {
+      const rateLimits = store.githubRateLimits();
+      rateLimits.set("secondary", {
+        retryAt,
+        throttledAttempts: 4,
+        retryRequest: "pr:42:owner/repo:7",
+      });
+      const client = createGitHubAppClient({
+        clientId: "fixture-client-id",
+        privateKey,
+        fetcher,
+        rateLimits,
+        now: () => now,
+      });
+      const { runPass } = createController({
+        store,
+        targets: [remaining],
+        reconcile: createReconciler(store, createGitHubReader(client)),
+        reportError: vi.fn(),
+        reconcileIntervalMs: 60_000,
+        now: () => now,
+      });
+      expect(rateLimits.get("secondary")).toEqual({
+        retryAt,
+        throttledAttempts: 0,
+        retryRequest: null,
+      });
+      expect(await runPass()).toBe(false);
+      expect(fetcher).not.toHaveBeenCalled();
+      now = retryAt;
+      expect(await runPass()).toBe(true);
+      now += 60_000;
+      throttle = true;
+      expect(await runPass()).toBe(false);
+      expect(rateLimits.get("secondary")).toMatchObject({
+        retryAt: now + 60_000,
+        throttledAttempts: 1,
+        retryRequest: "pr:84:other/repo:8",
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it.each([
+    ["pr:42:owner/repo:7", 4],
+    ["token:42:owner/repo", 4],
+    ["checks:42:owner/repo:7", 4],
+    ["pr:84:other/repo:8", 5],
+  ] as const)(
+    "preserves tracked retries and operator pauses at startup (%s)",
+    (retryRequest, throttledAttempts) => {
+      const store = new WorkflowStore();
+      try {
+        const rateLimits = store.githubRateLimits();
+        const state = { retryAt: 100_000, throttledAttempts, retryRequest };
+        rateLimits.set("secondary", state);
+        createController({
+          store,
+          targets: [target],
+          reconcile: vi.fn(),
+          reportError: vi.fn(),
+          reconcileIntervalMs: 0,
+        });
+        expect(rateLimits.get("secondary")).toEqual(state);
+      } finally {
+        store.close();
+      }
+    },
+  );
+
   it("keeps token throttles across successful exchanges for another repository on the same installation", async () => {
     let now = Date.UTC(2026, 0, 1);
     const other = { ...target, repository: "owner/another" };

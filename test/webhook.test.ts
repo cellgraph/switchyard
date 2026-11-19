@@ -505,6 +505,34 @@ describe("GitHub webhook intake and reconciliation", () => {
     expect(reconcile.mock.calls).toEqual([[target]]);
   });
 
+  it("retires retry counts for operator-stopped workflows on startup", async () => {
+    await controller().runPass();
+    store.transition(workflow()!.id, { type: "stop", reason: "Operator stopped tracking this PR" });
+    const rateLimits = store.githubRateLimits();
+    const retryAt = now + 120_000;
+    rateLimits.set("secondary", {
+      retryAt,
+      throttledAttempts: 4,
+      retryRequest: "pr:42:owner/repo:7",
+    });
+    controller();
+    expect(rateLimits.get("secondary")).toEqual({
+      retryAt,
+      throttledAttempts: 0,
+      retryRequest: null,
+    });
+  });
+
+  it("records a late closure without clearing a rate limit hit earlier in the pass", async () => {
+    vi.mocked(github.readPullRequest)
+      .mockResolvedValueOnce({ state: "open", headSha: headA })
+      .mockResolvedValueOnce({ state: "closed", headSha: headA });
+    vi.mocked(github.readChecks).mockRejectedValueOnce(new GitHubRateLimitError(now + 60_000));
+    await createReconciler(store, github)(target);
+    expect(workflow()).toMatchObject({ state: "stopped", closedByGitHub: true });
+    expect(github.completeReconciliation).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["42:GET:/repos/owner/repo/commits/old/status?page=1", 4, 0],
     ["42:POST:/app/installations/42/access_tokens", 3, 0],

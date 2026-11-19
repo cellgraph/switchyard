@@ -60,6 +60,38 @@ function tokenRetryKey(target: GitHubRepository): string {
   return `token:${target.installationId}:${target.repository}`;
 }
 
+function belongsToReconciliation(
+  key: string,
+  target: GitHubRepository,
+  pullRequest: number,
+): boolean {
+  // Existing databases may contain check-scoped or individual review-page retry keys.
+  const legacyChecksKey = `checks:${target.installationId}:${target.repository}:${pullRequest}`;
+  const legacyPull = `${target.installationId}:GET:/repos/${target.repository}/pulls/${pullRequest}`;
+  const legacyIssue = `${target.installationId}:GET:/repos/${target.repository}/issues/${pullRequest}/comments?`;
+  return (
+    key === pullRequestRetryKey(target, pullRequest) ||
+    key === tokenRetryKey(target) ||
+    key === legacyChecksKey ||
+    key === legacyPull ||
+    key.startsWith(`${legacyPull}/`) ||
+    key.startsWith(legacyIssue)
+  );
+}
+
+export function retireInactiveGitHubRetry(
+  rateLimits: GitHubRateLimits,
+  targets: ReadonlyArray<GitHubRepository & { pullRequest: number }>,
+): void {
+  const state = rateLimits.get("secondary");
+  if (!state || state.throttledAttempts === 0 || state.throttledAttempts >= maxSecondaryAttempts)
+    return;
+  const key = state.retryRequest;
+  if (key && targets.some((target) => belongsToReconciliation(key, target, target.pullRequest)))
+    return;
+  rateLimits.set("secondary", { ...state, throttledAttempts: 0, retryRequest: null });
+}
+
 export function createGitHubAppClient({
   clientId,
   privateKey,
@@ -230,22 +262,7 @@ export function createGitHubAppClient({
 
   return {
     completeReconciliation(target: GitHubRepository, pullRequest: number): void {
-      const prKey = pullRequestRetryKey(target, pullRequest);
-      const tokenKey = tokenRetryKey(target);
-      // Existing databases may contain check-scoped or individual review-page retry keys.
-      const legacyChecksKey = `checks:${target.installationId}:${target.repository}:${pullRequest}`;
-      const legacyPull = `${target.installationId}:GET:/repos/${target.repository}/pulls/${pullRequest}`;
-      const legacyIssue = `${target.installationId}:GET:/repos/${target.repository}/issues/${pullRequest}/comments?`;
-      clearSecondaryAttempts(
-        now(),
-        (key) =>
-          key === prKey ||
-          key === tokenKey ||
-          key === legacyChecksKey ||
-          key === legacyPull ||
-          key.startsWith(`${legacyPull}/`) ||
-          key.startsWith(legacyIssue),
-      );
+      clearSecondaryAttempts(now(), (key) => belongsToReconciliation(key, target, pullRequest));
     },
 
     async get(
