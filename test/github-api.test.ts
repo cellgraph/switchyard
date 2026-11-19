@@ -146,48 +146,56 @@ describe("GitHub App and REST adapter", () => {
     expect(exchanges).toBe(2);
   });
 
-  it("scopes a primary rate-limit reset to the affected installation", async () => {
-    let now = Date.UTC(2026, 0, 1);
-    const reset = now + 120_000;
-    const fetcher = vi.fn<typeof fetch>(async (input, options) => {
-      if (options?.method === "POST")
-        return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
-      if (requestUrl(input).pathname.startsWith("/repos/owner/") && now < reset)
-        return Response.json(
-          { message: "API rate limit exceeded" },
-          {
-            status: 403,
-            headers: {
-              "x-ratelimit-remaining": "0",
-              "x-ratelimit-reset": String(reset / 1000),
-              "retry-after": "10",
+  it.each([403, 200] as const)(
+    "scopes a primary rate-limit reset from HTTP %i to its installation",
+    async (status) => {
+      let now = Date.UTC(2026, 0, 1);
+      const reset = now + 120_000;
+      const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+        if (options?.method === "POST")
+          return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+        if (requestUrl(input).pathname.startsWith("/repos/owner/") && now < reset)
+          return Response.json(
+            status === 200 ? { number: 7 } : { message: "API rate limit exceeded" },
+            {
+              status,
+              headers: {
+                "x-ratelimit-remaining": "0",
+                "x-ratelimit-reset": String(reset / 1000),
+                ...(status === 403 ? { "retry-after": "10" } : {}),
+              },
             },
-          },
-        );
-      return Response.json([]);
-    });
-    const client = createGitHubAppClient({
-      clientId: "fixture-client-id",
-      privateKey,
-      fetcher,
-      now: () => now,
-    });
-    await expect(client.get(target, "/pulls/7")).rejects.toMatchObject({ retryAt: reset });
-    expect(fetcher).toHaveBeenCalledTimes(2);
+          );
+        return Response.json([]);
+      });
+      const client = createGitHubAppClient({
+        clientId: "fixture-client-id",
+        privateKey,
+        fetcher,
+        now: () => now,
+      });
+      const response = client.get(target, "/pulls/7");
+      if (status === 200) await expect(response).resolves.toMatchObject({ data: { number: 7 } });
+      else await expect(response).rejects.toMatchObject({ retryAt: reset });
+      expect(fetcher).toHaveBeenCalledTimes(2);
 
-    await expect(
-      client.get({ ...target, repository: "owner/another" }, "/pulls/7"),
-    ).rejects.toMatchObject({ retryAt: reset });
-    expect(fetcher).toHaveBeenCalledTimes(2);
-    await expect(
-      client.get({ ...target, repository: "other/repo", installationId: 84 }, "/pulls/7"),
-    ).resolves.toMatchObject({ data: [] });
-    expect(fetcher).toHaveBeenCalledTimes(4);
+      await expect(client.get(target, "/pulls/7/reviews")).rejects.toMatchObject({
+        retryAt: reset,
+      });
+      await expect(
+        client.get({ ...target, repository: "owner/another" }, "/pulls/7"),
+      ).rejects.toMatchObject({ retryAt: reset });
+      expect(fetcher).toHaveBeenCalledTimes(2);
+      await expect(
+        client.get({ ...target, repository: "other/repo", installationId: 84 }, "/pulls/7"),
+      ).resolves.toMatchObject({ data: [] });
+      expect(fetcher).toHaveBeenCalledTimes(4);
 
-    now = reset;
-    await expect(client.get(target, "/pulls/7")).resolves.toMatchObject({ data: [] });
-    expect(fetcher).toHaveBeenCalledTimes(5);
-  });
+      now = reset;
+      await expect(client.get(target, "/pulls/7")).resolves.toMatchObject({ data: [] });
+      expect(fetcher).toHaveBeenCalledTimes(5);
+    },
+  );
 
   it("backs off a secondary 403 for one minute while ordinary permission errors stay local", async () => {
     let now = Date.UTC(2026, 0, 1);
@@ -768,12 +776,12 @@ describe("GitHub App and REST adapter", () => {
         reconcileIntervalMs: 60_000,
         now: () => now,
       });
+      expect(await runPass()).toBe(false);
       expect(rateLimits.get("secondary")).toEqual({
         retryAt,
         throttledAttempts: 0,
         retryRequest: null,
       });
-      expect(await runPass()).toBe(false);
       expect(fetcher).not.toHaveBeenCalled();
       now = retryAt;
       expect(await runPass()).toBe(true);
@@ -797,19 +805,20 @@ describe("GitHub App and REST adapter", () => {
     ["pr:84:other/repo:8", 5],
   ] as const)(
     "preserves tracked retries and operator pauses at startup (%s)",
-    (retryRequest, throttledAttempts) => {
+    async (retryRequest, throttledAttempts) => {
       const store = new WorkflowStore();
       try {
         const rateLimits = store.githubRateLimits();
         const state = { retryAt: 100_000, throttledAttempts, retryRequest };
         rateLimits.set("secondary", state);
-        createController({
+        const { runPass } = createController({
           store,
           targets: [target],
           reconcile: vi.fn(),
           reportError: vi.fn(),
           reconcileIntervalMs: 0,
         });
+        await runPass();
         expect(rateLimits.get("secondary")).toEqual(state);
       } finally {
         store.close();

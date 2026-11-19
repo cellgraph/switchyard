@@ -505,17 +505,21 @@ describe("GitHub webhook intake and reconciliation", () => {
     expect(reconcile.mock.calls).toEqual([[target]]);
   });
 
-  it("retires retry counts for operator-stopped workflows on startup", async () => {
-    await controller().runPass();
-    store.transition(workflow()!.id, { type: "stop", reason: "Operator stopped tracking this PR" });
+  it("retires retry counts when an operator stops a workflow between passes", async () => {
+    const { runPass } = controller();
+    await runPass();
     const rateLimits = store.githubRateLimits();
     const retryAt = now + 120_000;
-    rateLimits.set("secondary", {
+    const previous = {
       retryAt,
       throttledAttempts: 4,
       retryRequest: "pr:42:owner/repo:7",
-    });
-    controller();
+    };
+    rateLimits.set("secondary", previous);
+    await runPass();
+    expect(rateLimits.get("secondary")).toEqual(previous);
+    store.transition(workflow()!.id, { type: "stop", reason: "Operator stopped tracking this PR" });
+    await runPass();
     expect(rateLimits.get("secondary")).toEqual({
       retryAt,
       throttledAttempts: 0,

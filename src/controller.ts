@@ -23,13 +23,7 @@ export function createController({
   reconcileIntervalMs: number;
   now?: () => number;
 }) {
-  retireInactiveGitHubRetry(
-    store.githubRateLimits(),
-    targets.filter(
-      (target) =>
-        !isReconciliationTerminal(store.findWorkflow(target.repository, target.pullRequest)),
-    ),
-  );
+  const rateLimits = store.githubRateLimits();
   let nextSweep = 0;
   let running: Promise<boolean> | undefined;
 
@@ -55,6 +49,12 @@ export function createController({
   }
 
   async function pass(): Promise<boolean> {
+    retireInactiveGitHubRetry(
+      rateLimits,
+      targets,
+      (target) =>
+        !isReconciliationTerminal(store.findWorkflow(target.repository, target.pullRequest)),
+    );
     const observations = new Map<PullRequestTarget, Promise<void>>();
     async function reconcileTargets(
       selected: PullRequestTarget[],

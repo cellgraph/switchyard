@@ -13,7 +13,8 @@ export type GitHubRateLimitState = {
   throttledAttempts: number;
   retryRequest: string | null;
 };
-type RateLimitScope = "secondary" | `installation:${number}`;
+type InstallationScope = `installation:${number}`;
+type RateLimitScope = "secondary" | InstallationScope;
 export type GitHubRateLimits = {
   get(scope: RateLimitScope): GitHubRateLimitState | undefined;
   set(scope: RateLimitScope, state: GitHubRateLimitState): void;
@@ -79,15 +80,23 @@ function belongsToReconciliation(
   );
 }
 
+type ReconciliationTarget = GitHubRepository & { pullRequest: number };
+
 export function retireInactiveGitHubRetry(
   rateLimits: GitHubRateLimits,
-  targets: ReadonlyArray<GitHubRepository & { pullRequest: number }>,
+  targets: readonly ReconciliationTarget[],
+  isActive: (target: ReconciliationTarget) => boolean,
 ): void {
   const state = rateLimits.get("secondary");
   if (!state || state.throttledAttempts === 0 || state.throttledAttempts >= maxSecondaryAttempts)
     return;
   const key = state.retryRequest;
-  if (key && targets.some((target) => belongsToReconciliation(key, target, target.pullRequest)))
+  if (
+    key &&
+    targets.some(
+      (target) => belongsToReconciliation(key, target, target.pullRequest) && isActive(target),
+    )
+  )
     return;
   rateLimits.set("secondary", { ...state, throttledAttempts: 0, retryRequest: null });
 }
@@ -116,6 +125,11 @@ export function createGitHubAppClient({
       retryAt: Math.max(rateLimits.get(scope)?.retryAt ?? 0, secondary?.retryAt ?? 0),
       throttledAttempts: secondary?.throttledAttempts ?? 0,
     };
+  }
+
+  function rememberPrimaryReset(scope: InstallationScope, retryAt: number): void {
+    if (retryAt > (rateLimits.get(scope)?.retryAt ?? 0))
+      rateLimits.set(scope, { retryAt, throttledAttempts: 0, retryRequest: null });
   }
 
   function clearSecondaryAttempts(
@@ -170,9 +184,15 @@ export function createGitHubAppClient({
     } catch {
       throw new Error("GitHub API request failed or timed out.");
     }
+    const primaryLimited = response.headers.get("x-ratelimit-remaining") === "0";
+    const reset = primaryLimited
+      ? headerMilliseconds(response.headers.get("x-ratelimit-reset"))
+      : undefined;
+    if (response.ok && method === undefined && reset !== undefined && reset > now())
+      rememberPrimaryReset(scope, reset);
+
     if (response.status === 403 || response.status === 429) {
       const retryDelay = headerMilliseconds(response.headers.get("retry-after"));
-      const primaryLimited = response.headers.get("x-ratelimit-remaining") === "0";
       const secondaryLimited =
         (!primaryLimited && (response.status === 429 || retryDelay !== undefined)) ||
         (await reportsSecondaryLimit(response));
@@ -192,16 +212,13 @@ export function createGitHubAppClient({
         });
       }
       if (primaryLimited) {
-        const reset = headerMilliseconds(response.headers.get("x-ratelimit-reset"));
-        rateLimits.set(scope, {
-          retryAt: Math.max(
-            rateLimits.get(scope)?.retryAt ?? 0,
+        rememberPrimaryReset(
+          scope,
+          Math.max(
             reset !== undefined && reset > observedAt ? reset : observedAt + fallbackRetryDelay,
             observedAt + (retryDelay ?? 0),
           ),
-          throttledAttempts: 0,
-          retryRequest: null,
-        });
+        );
       }
       if (primaryLimited || secondaryLimited) {
         const latest = limitsFor(scope);
