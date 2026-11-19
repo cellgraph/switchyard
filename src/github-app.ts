@@ -49,7 +49,12 @@ type ApiRequest = {
   path: string;
   method?: "POST";
   body?: string;
+  checkPullRequest?: number;
 };
+
+function checkRetryKey(target: GitHubRepository, pullRequest: number): string {
+  return `checks:${target.installationId}:${target.repository}:${pullRequest}`;
+}
 
 export function createGitHubAppClient({
   clientId,
@@ -77,6 +82,12 @@ export function createGitHubAppClient({
     };
   }
 
+  function clearSecondaryAttempts(requestKey: string, startedAt: number): void {
+    const latest = rateLimits.get("secondary");
+    if (latest?.retryRequest === requestKey && latest.retryAt <= startedAt)
+      rateLimits.set("secondary", { retryAt: 0, throttledAttempts: 0, retryRequest: null });
+  }
+
   function appJwt(): string {
     const seconds = Math.floor(now() / 1000);
     const encode = (data: object) => Buffer.from(JSON.stringify(data)).toString("base64url");
@@ -86,12 +97,17 @@ export function createGitHubAppClient({
   }
 
   async function request(
-    installationId: number,
-    { path, method, body }: ApiRequest,
+    target: GitHubRepository,
+    { path, method, body, checkPullRequest }: ApiRequest,
     credential: string,
   ): Promise<Response> {
-    const scope = `installation:${installationId}` as const;
-    const requestKey = `${installationId}:${method ?? "GET"}:${path}`;
+    const scope = `installation:${target.installationId}` as const;
+    const requestKey =
+      checkPullRequest !== undefined
+        ? checkRetryKey(target, checkPullRequest)
+        : method === "POST"
+          ? `token:${target.installationId}:${target.repository}`
+          : `${target.installationId}:GET:${path}`;
     const startedAt = now();
     const limit = limitsFor(scope);
     const paused = limit.throttledAttempts >= maxSecondaryAttempts;
@@ -157,12 +173,9 @@ export function createGitHubAppClient({
         );
       }
     }
-    if (response.ok && limit.throttledAttempts > 0) {
-      const latest = rateLimits.get("secondary");
-      // Only a successful retry clears the count. Another endpoint may still be healthy.
-      if (latest?.retryRequest === requestKey && latest.retryAt <= startedAt)
-        rateLimits.set("secondary", { retryAt: 0, throttledAttempts: 0, retryRequest: null });
-    }
+    // A successful check page cannot clear the count while another page may still be throttled.
+    if (response.ok && limit.throttledAttempts > 0 && checkPullRequest === undefined)
+      clearSecondaryAttempts(requestKey, startedAt);
     return response;
   }
 
@@ -174,7 +187,7 @@ export function createGitHubAppClient({
 
     const refresh = (async () => {
       const response = await request(
-        target.installationId,
+        target,
         {
           path: `/app/installations/${target.installationId}/access_tokens`,
           method: "POST",
@@ -204,18 +217,24 @@ export function createGitHubAppClient({
   }
 
   return {
+    completeCheckRead(target: GitHubRepository, pullRequest: number): void {
+      clearSecondaryAttempts(checkRetryKey(target, pullRequest), now());
+    },
+
     async get(
       target: GitHubRepository,
       suffix: string,
+      checkPullRequest?: number,
     ): Promise<{ data: unknown; hasNext: boolean }> {
       const cacheKey = `${target.installationId}:${target.repository}`;
       const path = `/repos/${target.repository}${suffix}`;
+      const read = { path, ...(checkPullRequest === undefined ? {} : { checkPullRequest }) };
       let token = await tokenFor(target, cacheKey);
-      let response = await request(target.installationId, { path }, token.value);
+      let response = await request(target, read, token.value);
       if (response.status === 401) {
         if (tokens.get(cacheKey) === token) tokens.delete(cacheKey);
         token = await tokenFor(target, cacheKey);
-        response = await request(target.installationId, { path }, token.value);
+        response = await request(target, read, token.value);
         if (response.status === 401 && tokens.get(cacheKey) === token) tokens.delete(cacheKey);
       }
       if (!response.ok) throw new Error(`GitHub API GET ${path} failed (HTTP ${response.status}).`);

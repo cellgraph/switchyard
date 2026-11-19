@@ -1,4 +1,4 @@
-import type { GitHubAppClient, GitHubRepository } from "./github-app.ts";
+import { GitHubRateLimitError, type GitHubAppClient, type GitHubRepository } from "./github-app.ts";
 import { commitSha, object } from "./github-data.ts";
 import type { CheckEvidence, CheckOutcome } from "./workflow.ts";
 
@@ -20,6 +20,7 @@ export function createGitHubReader(client: GitHubAppClient): GitHubReader {
     target: PullRequestTarget,
     path: string,
     select: (data: unknown) => unknown = (data) => data,
+    checkPullRequest?: number,
   ): Promise<unknown[]> {
     const results: unknown[] = [];
     const separator = path.includes("?") ? "&" : "?";
@@ -27,6 +28,7 @@ export function createGitHubReader(client: GitHubAppClient): GitHubReader {
       const { data, hasNext } = await client.get(
         target,
         `${path}${separator}per_page=100&page=${page}`,
+        checkPullRequest,
       );
       const items = select(data);
       if (!Array.isArray(items)) throw new Error(`Invalid GitHub response for ${path}.`);
@@ -52,28 +54,34 @@ export function createGitHubReader(client: GitHubAppClient): GitHubReader {
     },
 
     async readReviewInputs(target) {
-      const [reviews, reviewComments, issueComments] = await Promise.all([
+      const [reviews, reviewComments, issueComments] = await readAll(
         list(target, `/pulls/${target.pullRequest}/reviews`),
         list(target, `/pulls/${target.pullRequest}/comments`),
         list(target, `/issues/${target.pullRequest}/comments`),
-      ]);
+      );
       return { reviews, reviewComments, issueComments };
     },
 
     async readChecks(target, headSha) {
-      const [runs, statuses] = await Promise.all([
+      const [runs, statuses] = await readAll(
         list(
           target,
           `/commits/${headSha}/check-runs?filter=latest`,
           (data) => object(data)?.check_runs,
+          target.pullRequest,
         ),
-        list(target, `/commits/${headSha}/status`, (data) => {
-          const combined = object(data);
-          if (commitSha(combined?.sha) !== headSha)
-            throw new Error("GitHub returned commit statuses for a different SHA.");
-          return combined?.statuses;
-        }),
-      ]);
+        list(
+          target,
+          `/commits/${headSha}/status`,
+          (data) => {
+            const combined = object(data);
+            if (commitSha(combined?.sha) !== headSha)
+              throw new Error("GitHub returned commit statuses for a different SHA.");
+            return combined?.statuses;
+          },
+          target.pullRequest,
+        ),
+      );
 
       const checks = new Map<string, CheckEvidence>();
       function add(name: unknown, outcome: CheckOutcome): void {
@@ -94,9 +102,31 @@ export function createGitHubReader(client: GitHubAppClient): GitHubReader {
         if (!status) throw new Error("GitHub returned an invalid commit status.");
         add(status.context, statusOutcome(status.state));
       }
+      client.completeCheckRead(target, target.pullRequest);
       return [...checks.values()].sort((left, right) => left.name.localeCompare(right.name, "en"));
     },
   };
+}
+
+async function readAll<T extends unknown[]>(
+  ...reads: { [K in keyof T]: Promise<T[K]> }
+): Promise<T> {
+  // Sibling reads can still record a GitHub backoff after another read has failed.
+  const results = await Promise.allSettled(reads);
+  let longestBackoff: GitHubRateLimitError | undefined;
+  for (const result of results) {
+    if (
+      result.status === "rejected" &&
+      result.reason instanceof GitHubRateLimitError &&
+      (!longestBackoff || result.reason.retryAt > longestBackoff.retryAt)
+    )
+      longestBackoff = result.reason;
+  }
+  if (longestBackoff) throw longestBackoff;
+  return results.map((result) => {
+    if (result.status === "rejected") throw result.reason;
+    return result.value;
+  }) as T;
 }
 
 function checkRunOutcome(status: string, conclusion: unknown): CheckOutcome {

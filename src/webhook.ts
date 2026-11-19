@@ -72,8 +72,11 @@ function validHint(value: unknown): value is ReconcileHint {
 }
 
 export function readReconcileHint(payload: unknown): ReconcileHint | null | undefined {
-  if (payload === null || validHint(payload)) return payload;
-  // Phase 1 accepted opaque payloads that did not encode GitHub routing.
+  const receipt = object(payload);
+  if (receipt?.githubWebhookVersion === 1 && (receipt.hint === null || validHint(receipt.hint)))
+    return receipt.hint;
+  if (validHint(payload)) return payload;
+  // An unversioned null can be an opaque Phase 1 receipt and needs fallback routing.
   return undefined;
 }
 
@@ -141,7 +144,10 @@ export function createWebhookServer({
         throw new InvalidDelivery(400);
       }
       if (!payload) throw new InvalidDelivery(400);
-      store.receiveDelivery(deliveryId.toLowerCase(), normalize(event, payload));
+      store.receiveDelivery(deliveryId.toLowerCase(), {
+        githubWebhookVersion: 1,
+        hint: normalize(event, payload),
+      });
       response.writeHead(202).end();
     } catch (error) {
       const status = error instanceof InvalidDelivery ? error.status : 503;

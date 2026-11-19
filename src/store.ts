@@ -59,6 +59,11 @@ const migrations = [
     scope TEXT PRIMARY KEY NOT NULL, retry_at INTEGER NOT NULL, throttled_attempts INTEGER NOT NULL,
     retry_request TEXT
   );`,
+  // Earlier keys lack a PR or repository scope. Preserve their cooldown and any explicit pause.
+  `UPDATE github_rate_limits SET throttled_attempts = 0, retry_request = NULL
+   WHERE scope = 'secondary' AND throttled_attempts BETWEEN 1 AND 4
+   AND (retry_request GLOB '*:GET:/repos/*/commits/*'
+     OR retry_request GLOB '*:POST:/app/installations/*/access_tokens');`,
 ];
 
 export class WorkflowStore {

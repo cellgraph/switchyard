@@ -150,7 +150,7 @@ describe("GitHub webhook intake and reconciliation", () => {
     expect(workflow()?.headSha).toBe(headA);
     expect(github.readPullRequest).not.toHaveBeenCalled();
     expect(store.pendingDeliveries()).toEqual([
-      { deliveryId: id, workflowId: null, payload: target },
+      { deliveryId: id, workflowId: null, payload: { githubWebhookVersion: 1, hint: target } },
     ]);
     await runPass();
     expect(workflow()?.headSha).toBe(headB);
@@ -456,21 +456,33 @@ describe("GitHub webhook intake and reconciliation", () => {
       "pending",
       new Date(now).toISOString(),
     );
+    insert.run("legacy-null", null, "null", "pending", new Date(now).toISOString());
     db.close();
     store = new WorkflowStore(dbPath);
     expect(store.recover()).toEqual({ deliveries: 1, ambiguousOperations: 0 });
-    expect(store.dueDeliveryIds(now, 25)).toEqual(["legacy-review", "legacy-unlinked"]);
+    const legacyIds = ["legacy-review", "legacy-unlinked", "legacy-null"];
+    expect(store.dueDeliveryIds(now, 25)).toEqual(legacyIds);
     state.headSha = headB;
-    expect(await controller().runPass()).toBe(true);
+    const { runPass } = controller();
+    vi.mocked(github.readPullRequest).mockRejectedValueOnce(
+      new Error("GitHub unavailable at startup"),
+    );
+    expect(await runPass()).toBe(false);
+    expect(store.deliveryStatus("legacy-null")).toMatchObject({
+      status: "failed",
+      retryAt: now + 30_000,
+    });
+    now += 30_000;
+    expect(await runPass()).toBe(true);
     expect(workflow()).toMatchObject({
       headSha: headB,
       state: "awaiting_review",
       review: null,
     });
-    for (const id of ["legacy-review", "legacy-unlinked"])
+    for (const id of legacyIds)
       expect(store.deliveryStatus(id)).toMatchObject({
         status: "processed",
-        attempts: 1,
+        attempts: 2,
         error: null,
       });
   });
@@ -491,4 +503,27 @@ describe("GitHub webhook intake and reconciliation", () => {
     expect(await runPass()).toBe(true);
     expect(reconcile.mock.calls).toEqual([[target]]);
   });
+
+  it.each([
+    ["42:GET:/repos/owner/repo/commits/old/status?page=1", 4, 0],
+    ["42:POST:/app/installations/42/access_tokens", 3, 0],
+    ["42:POST:/app/installations/42/access_tokens", 5, 5],
+    ["42:GET:/repos/owner/repo/pulls/7/reviews?page=1", 4, 4],
+  ] as const)(
+    "upgrades the old retry key %s with %i attempts without shortening its cooldown",
+    (retryRequest, throttledAttempts, expectedAttempts) => {
+      const retryAt = now + 120_000;
+      store.githubRateLimits().set("secondary", { retryAt, throttledAttempts, retryRequest });
+      store.close();
+      const db = new DatabaseSync(dbPath);
+      db.exec("DELETE FROM schema_migrations WHERE version = 6;");
+      db.close();
+      store = new WorkflowStore(dbPath);
+      expect(store.githubRateLimits().get("secondary")).toEqual({
+        retryAt,
+        throttledAttempts: expectedAttempts,
+        retryRequest: expectedAttempts === 0 ? null : retryRequest,
+      });
+    },
+  );
 });
