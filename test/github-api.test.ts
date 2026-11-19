@@ -1,7 +1,12 @@
 import { generateKeyPairSync, verify } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { createController } from "../src/controller.ts";
 import { createGitHubReader } from "../src/github-api.ts";
-import { createGitHubAppClient } from "../src/github-app.ts";
+import { createGitHubAppClient, resumeGitHubAfterSecondaryLimit } from "../src/github-app.ts";
+import { WorkflowStore } from "../src/store.ts";
 
 const { privateKey, publicKey } = generateKeyPairSync("rsa", {
   modulusLength: 2048,
@@ -224,6 +229,181 @@ describe("GitHub App and REST adapter", () => {
     now++;
     await expect(client.get(other, "/pulls/7")).resolves.toMatchObject({ data: [] });
     expect(fetcher).toHaveBeenCalledTimes(5);
+  });
+
+  it.each(["primary", "secondary"] as const)(
+    "restores %s backoff before the startup sweep after restart",
+    async (kind) => {
+      const dir = mkdtempSync(join(tmpdir(), "switchyard-backoff-"));
+      const path = join(dir, "state.sqlite");
+      let store = new WorkflowStore(path);
+      let now = Date.UTC(2026, 0, 1);
+      const retryAt = now + 120_000;
+      const fetcher = vi.fn<typeof fetch>(async (_input, options) => {
+        if (options?.method === "POST")
+          return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+        if (now >= retryAt) return Response.json({ number: 7, state: "open", head: { sha } });
+        return Response.json(
+          {
+            message:
+              kind === "secondary"
+                ? "You have exceeded a secondary rate limit"
+                : "API rate limit exceeded",
+          },
+          {
+            status: 403,
+            headers:
+              kind === "primary"
+                ? { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(retryAt / 1000) }
+                : { "retry-after": "120", "x-ratelimit-remaining": "100" },
+          },
+        );
+      });
+      function controller() {
+        const client = createGitHubAppClient({
+          clientId: "fixture-client-id",
+          privateKey,
+          fetcher,
+          now: () => now,
+          rateLimits: store.githubRateLimits(),
+        });
+        const reader = createGitHubReader(client);
+        return createController({
+          store,
+          targets: [target],
+          reconcile: async (target) => {
+            await reader.readPullRequest(target);
+          },
+          reportError: vi.fn(),
+          reconcileIntervalMs: 0,
+          now: () => now,
+        });
+      }
+
+      try {
+        store.receiveDelivery("fixture-delivery", target);
+        expect(await controller().runPass()).toBe(false);
+        expect(fetcher).toHaveBeenCalledTimes(2);
+        expect(store.deliveryStatus("fixture-delivery")).toMatchObject({
+          status: "failed",
+          attempts: 1,
+          retryAt,
+        });
+
+        store.close();
+        store = new WorkflowStore(path);
+        store.recover();
+        now += 10_000;
+        const restarted = controller();
+        expect(await restarted.runPass()).toBe(false);
+        expect(fetcher).toHaveBeenCalledTimes(2);
+        expect(store.deliveryStatus("fixture-delivery")?.attempts).toBe(1);
+
+        now = retryAt;
+        expect(await restarted.runPass()).toBe(true);
+        expect(fetcher).toHaveBeenCalledTimes(4);
+        expect(store.deliveryStatus("fixture-delivery")).toMatchObject({
+          status: "processed",
+          attempts: 2,
+        });
+      } finally {
+        store.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("doubles consecutive secondary delays, persists the pause, and resumes after the final deadline", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "switchyard-pause-"));
+    const path = join(dir, "state.sqlite");
+    let store = new WorkflowStore(path);
+    let now = Date.UTC(2026, 0, 1);
+    let limited = true;
+    const fetcher = vi.fn<typeof fetch>(async (_input, options) => {
+      // Token refreshes can succeed even while every PR read is throttled.
+      if (options?.method === "POST")
+        return Response.json({ token: "fixture-token", expires_at: new Date(now + 65_000) });
+      if (limited)
+        return Response.json(
+          { message: "You have exceeded a secondary rate limit" },
+          { status: 403 },
+        );
+      return Response.json([]);
+    });
+    function client() {
+      return createGitHubAppClient({
+        clientId: "fixture-client-id",
+        privateKey,
+        fetcher,
+        now: () => now,
+        rateLimits: store.githubRateLimits(),
+      });
+    }
+    try {
+      const app = client();
+      for (const minutes of [1, 2, 4, 8, 16]) {
+        const retryAt = now + minutes * 60_000;
+        const request = app.get(target, "/pulls/7");
+        await expect(request).rejects.toMatchObject({ retryAt });
+        if (minutes === 16)
+          await expect(request).rejects.toThrow("paused after repeated secondary rate limits");
+        now = retryAt;
+      }
+      expect(fetcher).toHaveBeenCalledTimes(10);
+      const finalDeadline = now;
+
+      store.close();
+      store = new WorkflowStore(path);
+      const restarted = client();
+      await expect(restarted.get(target, "/pulls/7")).rejects.toThrow(
+        "paused after repeated secondary rate limits",
+      );
+      expect(fetcher).toHaveBeenCalledTimes(10);
+      expect(resumeGitHubAfterSecondaryLimit(store.githubRateLimits())).toBe(true);
+      expect(store.githubRateLimits().get("secondary")).toEqual({
+        retryAt: finalDeadline,
+        throttledAttempts: 0,
+        retryRequest: null,
+      });
+      limited = false;
+      await expect(restarted.get(target, "/pulls/7")).resolves.toMatchObject({ data: [] });
+      expect(fetcher).toHaveBeenCalledTimes(12);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("counts in-flight secondary throttles once and clears the sequence after a successful read", async () => {
+    let now = Date.UTC(2026, 0, 1);
+    let limited = true;
+    const fetcher = vi.fn<typeof fetch>(async (_input, options) => {
+      if (options?.method === "POST")
+        return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+      if (limited) return new Response(null, { status: 429 });
+      return Response.json([]);
+    });
+    const client = createGitHubAppClient({
+      clientId: "fixture-client-id",
+      privateKey,
+      fetcher,
+      now: () => now,
+    });
+    await Promise.all(
+      ["/pulls/7", "/pulls/8"].map((path) =>
+        expect(client.get(target, path)).rejects.toMatchObject({ retryAt: now + 60_000 }),
+      ),
+    );
+    now += 60_000;
+    limited = false;
+    await client.get(target, "/pulls/9");
+    limited = true;
+    await expect(client.get(target, "/pulls/7")).rejects.toMatchObject({ retryAt: now + 120_000 });
+    now += 120_000;
+    limited = false;
+    await client.get(target, "/pulls/7");
+    limited = true;
+    await expect(client.get(target, "/pulls/7")).rejects.toMatchObject({ retryAt: now + 60_000 });
   });
 
   it("paginates GitHub resources and normalizes conservative exact-head check evidence", async () => {

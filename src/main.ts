@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { createController, describeError } from "./controller.ts";
 import { createGitHubReader, type PullRequestTarget } from "./github-api.ts";
-import { createGitHubAppClient } from "./github-app.ts";
+import { createGitHubAppClient, resumeGitHubAfterSecondaryLimit } from "./github-app.ts";
 import { object, positiveInteger, repositoryName } from "./github-data.ts";
 import { createReconciler } from "./reconcile.ts";
 import { WorkflowStore } from "./store.ts";
@@ -51,22 +51,37 @@ function loadConfig(path: string): { targets: PullRequestTarget[]; reconcileInte
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+  const dbPath = process.env.SWITCHYARD_DB_PATH ?? "switchyard.sqlite";
+  process.umask(0o077);
+  if (args.length === 1 && args[0] === "--resume-github") {
+    const store = new WorkflowStore(dbPath);
+    try {
+      const resumed = resumeGitHubAfterSecondaryLimit(store.githubRateLimits());
+      console.info(
+        resumed
+          ? "GitHub retry pause cleared. The last recorded retry deadline still applies."
+          : "GitHub retries are already enabled.",
+      );
+    } finally {
+      store.close();
+    }
+    return;
+  }
   const onceOnly = args[0] === "--once";
   const configPath = args[onceOnly ? 1 : 0];
   if (!configPath || args.length !== (onceOnly ? 2 : 1))
-    throw new Error("Usage: npm start -- [--once] path/to/config.json");
+    throw new Error(
+      "Usage: npm start -- [--once] path/to/config.json or npm start -- --resume-github",
+    );
 
   const config = loadConfig(configPath);
   const clientId = process.env.GITHUB_APP_CLIENT_ID;
   const keyPath = process.env.GITHUB_APP_PRIVATE_KEY_PATH;
   if (!clientId || !keyPath)
     throw new Error("Set GITHUB_APP_CLIENT_ID and GITHUB_APP_PRIVATE_KEY_PATH.");
-  const reader = createGitHubReader(
-    createGitHubAppClient({ clientId, privateKey: readFileSync(keyPath, "utf8") }),
-  );
+  const privateKey = readFileSync(keyPath, "utf8");
 
-  process.umask(0o077);
-  const store = new WorkflowStore(process.env.SWITCHYARD_DB_PATH ?? "switchyard.sqlite");
+  const store = new WorkflowStore(dbPath);
   const secret = process.env.GITHUB_WEBHOOK_SECRET;
   const reportError = (message: string) => console.error(message);
   const abort = new AbortController();
@@ -76,6 +91,9 @@ async function main(): Promise<void> {
   let server: ReturnType<typeof createWebhookServer> | undefined;
 
   try {
+    const reader = createGitHubReader(
+      createGitHubAppClient({ clientId, privateKey, rateLimits: store.githubRateLimits() }),
+    );
     const recovered = store.recover();
     if (recovered.deliveries || recovered.ambiguousOperations)
       console.info(`Recovered SQLite state ${JSON.stringify(recovered)}`);

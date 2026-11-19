@@ -388,10 +388,19 @@ describe("GitHub webhook intake and reconciliation", () => {
     expect(workflow()).toMatchObject({ state: "stopped", closedByGitHub: true });
 
     store.finishOperation("operation-1", "ambiguous");
+    state.headSha = headB;
     await reconcile(target);
     expect(workflow()).toMatchObject({
       state: "escalated",
+      headSha: headB,
+      review: null,
+      checks: [],
       escalationReason: "An external operation has an ambiguous outcome.",
+    });
+    expect(store.transitions(id).at(-1)).toMatchObject({
+      from: "stopped",
+      to: "escalated",
+      headSha: headB,
     });
   });
 
@@ -423,11 +432,12 @@ describe("GitHub webhook intake and reconciliation", () => {
     store.close();
     const db = new DatabaseSync(dbPath);
     db.exec(`
+      DROP TABLE github_rate_limits;
       DROP INDEX deliveries_retry;
       ALTER TABLE deliveries DROP COLUMN retry_at;
       ALTER TABLE deliveries DROP COLUMN attempts;
       ALTER TABLE workflows DROP COLUMN closed_by_github;
-      DELETE FROM schema_migrations WHERE version = 4;
+      DELETE FROM schema_migrations WHERE version >= 4;
     `);
     const insert = db.prepare(
       "INSERT INTO deliveries (delivery_id, workflow_id, payload, status, received_at) VALUES (?, ?, ?, ?, ?)",

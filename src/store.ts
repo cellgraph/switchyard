@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import type { GitHubRateLimits, GitHubRateLimitState } from "./github-app.ts";
 import {
   transitionWorkflow,
   type CheckEvidence,
@@ -54,6 +55,10 @@ const migrations = [
   ALTER TABLE deliveries ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE deliveries ADD COLUMN retry_at INTEGER;
   CREATE INDEX deliveries_retry ON deliveries(status, retry_at);`,
+  `CREATE TABLE github_rate_limits (
+    scope TEXT PRIMARY KEY NOT NULL, retry_at INTEGER NOT NULL, throttled_attempts INTEGER NOT NULL,
+    retry_request TEXT
+  );`,
 ];
 
 export class WorkflowStore {
@@ -67,6 +72,24 @@ export class WorkflowStore {
 
   close(): void {
     this.#db.close();
+  }
+
+  githubRateLimits(): GitHubRateLimits {
+    const select = this.#db.prepare(
+      `SELECT retry_at AS retryAt, throttled_attempts AS throttledAttempts, retry_request AS retryRequest
+       FROM github_rate_limits WHERE scope = ?`,
+    );
+    const upsert = this.#db.prepare(
+      `INSERT INTO github_rate_limits (scope, retry_at, throttled_attempts, retry_request) VALUES (?, ?, ?, ?)
+       ON CONFLICT(scope) DO UPDATE SET retry_at=excluded.retry_at,
+       throttled_attempts=excluded.throttled_attempts, retry_request=excluded.retry_request`,
+    );
+    return {
+      get: (scope) => select.get(scope) as GitHubRateLimitState | undefined,
+      set: (scope, state) => {
+        upsert.run(scope, state.retryAt, state.throttledAttempts, state.retryRequest);
+      },
+    };
   }
 
   createWorkflow(workflow: Workflow): void {
@@ -126,7 +149,11 @@ export class WorkflowStore {
           )
           .all(id);
         if (unresolved.some(({ status }) => status === "ambiguous")) {
-          command = { type: "escalate", reason: "An external operation has an ambiguous outcome." };
+          command = {
+            type: "escalate",
+            reason: "An external operation has an ambiguous outcome.",
+            observedHeadSha: command.sha,
+          };
         } else if (unresolved.length) {
           throw new Error(
             "Cannot resume a reopened pull request while an external operation is pending.",
