@@ -47,7 +47,10 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
 
     try {
       const start = await github.readPullRequest(target);
-      if (!observe(start)) return;
+      if (!observe(start)) {
+        github.completeReconciliation(target);
+        return;
+      }
 
       const [checks, reviewInputs] = await Promise.allSettled([
         github.readChecks(target, start.headSha),
@@ -62,6 +65,7 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
       if (reviewInputs.status === "rejected") throw reviewInputs.reason;
       if (checks.status === "rejected") throw checks.reason;
       recordChecks(checks.value);
+      github.completeReconciliation(target);
     } catch (error) {
       recordChecks([]);
       throw error;

@@ -49,11 +49,15 @@ type ApiRequest = {
   path: string;
   method?: "POST";
   body?: string;
-  checkPullRequest?: number;
+  reconcilePullRequest?: number | undefined;
 };
 
-function checkRetryKey(target: GitHubRepository, pullRequest: number): string {
-  return `checks:${target.installationId}:${target.repository}:${pullRequest}`;
+function pullRequestRetryKey(target: GitHubRepository, pullRequest: number): string {
+  return `pr:${target.installationId}:${target.repository}:${pullRequest}`;
+}
+
+function tokenRetryKey(target: GitHubRepository): string {
+  return `token:${target.installationId}:${target.repository}`;
 }
 
 export function createGitHubAppClient({
@@ -82,9 +86,12 @@ export function createGitHubAppClient({
     };
   }
 
-  function clearSecondaryAttempts(requestKey: string, startedAt: number): void {
+  function clearSecondaryAttempts(
+    startedAt: number,
+    belongsToRetry: (key: string) => boolean,
+  ): void {
     const latest = rateLimits.get("secondary");
-    if (latest?.retryRequest === requestKey && latest.retryAt <= startedAt)
+    if (latest?.retryRequest && latest.retryAt <= startedAt && belongsToRetry(latest.retryRequest))
       rateLimits.set("secondary", { retryAt: 0, throttledAttempts: 0, retryRequest: null });
   }
 
@@ -98,15 +105,15 @@ export function createGitHubAppClient({
 
   async function request(
     target: GitHubRepository,
-    { path, method, body, checkPullRequest }: ApiRequest,
+    { path, method, body, reconcilePullRequest }: ApiRequest,
     credential: string,
   ): Promise<Response> {
     const scope = `installation:${target.installationId}` as const;
     const requestKey =
-      checkPullRequest !== undefined
-        ? checkRetryKey(target, checkPullRequest)
-        : method === "POST"
-          ? `token:${target.installationId}:${target.repository}`
+      method === "POST"
+        ? tokenRetryKey(target)
+        : reconcilePullRequest !== undefined
+          ? pullRequestRetryKey(target, reconcilePullRequest)
           : `${target.installationId}:GET:${path}`;
     const startedAt = now();
     const limit = limitsFor(scope);
@@ -173,13 +180,17 @@ export function createGitHubAppClient({
         );
       }
     }
-    // A successful check page cannot clear the count while another page may still be throttled.
-    if (response.ok && limit.throttledAttempts > 0 && checkPullRequest === undefined)
-      clearSecondaryAttempts(requestKey, startedAt);
+    // Reads in a reconciliation only clear the count when the entire reconciliation succeeds.
+    if (response.ok && limit.throttledAttempts > 0 && reconcilePullRequest === undefined)
+      clearSecondaryAttempts(startedAt, (key) => key === requestKey);
     return response;
   }
 
-  async function tokenFor(target: GitHubRepository, cacheKey: string): Promise<Token> {
+  async function tokenFor(
+    target: GitHubRepository,
+    cacheKey: string,
+    reconcilePullRequest: number | undefined,
+  ): Promise<Token> {
     const cached = tokens.get(cacheKey);
     if (cached && cached.expiresAt - now() > 60_000) return cached;
     const inFlight = refreshes.get(cacheKey);
@@ -191,6 +202,7 @@ export function createGitHubAppClient({
         {
           path: `/app/installations/${target.installationId}/access_tokens`,
           method: "POST",
+          reconcilePullRequest,
           body: JSON.stringify({
             repositories: [target.repository.split("/")[1]],
             permissions,
@@ -217,23 +229,38 @@ export function createGitHubAppClient({
   }
 
   return {
-    completeCheckRead(target: GitHubRepository, pullRequest: number): void {
-      clearSecondaryAttempts(checkRetryKey(target, pullRequest), now());
+    completeReconciliation(target: GitHubRepository, pullRequest: number): void {
+      const prKey = pullRequestRetryKey(target, pullRequest);
+      const tokenKey = tokenRetryKey(target);
+      // Existing databases may contain check-scoped or individual review-page retry keys.
+      const legacyChecksKey = `checks:${target.installationId}:${target.repository}:${pullRequest}`;
+      const legacyPull = `${target.installationId}:GET:/repos/${target.repository}/pulls/${pullRequest}`;
+      const legacyIssue = `${target.installationId}:GET:/repos/${target.repository}/issues/${pullRequest}/comments?`;
+      clearSecondaryAttempts(
+        now(),
+        (key) =>
+          key === prKey ||
+          key === tokenKey ||
+          key === legacyChecksKey ||
+          key === legacyPull ||
+          key.startsWith(`${legacyPull}/`) ||
+          key.startsWith(legacyIssue),
+      );
     },
 
     async get(
       target: GitHubRepository,
       suffix: string,
-      checkPullRequest?: number,
+      reconcilePullRequest?: number,
     ): Promise<{ data: unknown; hasNext: boolean }> {
       const cacheKey = `${target.installationId}:${target.repository}`;
       const path = `/repos/${target.repository}${suffix}`;
-      const read = { path, ...(checkPullRequest === undefined ? {} : { checkPullRequest }) };
-      let token = await tokenFor(target, cacheKey);
+      const read = { path, reconcilePullRequest };
+      let token = await tokenFor(target, cacheKey, reconcilePullRequest);
       let response = await request(target, read, token.value);
       if (response.status === 401) {
         if (tokens.get(cacheKey) === token) tokens.delete(cacheKey);
-        token = await tokenFor(target, cacheKey);
+        token = await tokenFor(target, cacheKey, reconcilePullRequest);
         response = await request(target, read, token.value);
         if (response.status === 401 && tokens.get(cacheKey) === token) tokens.delete(cacheKey);
       }

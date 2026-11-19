@@ -56,6 +56,7 @@ beforeEach(async () => {
   checkOutcome = "passed";
   reportError = vi.fn();
   github = {
+    completeReconciliation: vi.fn(),
     readPullRequest: vi.fn(async () => ({ ...state })),
     readChecks: vi.fn(async (_target, sha) => [{ name: "CI", sha, outcome: checkOutcome }]),
     readReviewInputs: vi.fn(async () => ({

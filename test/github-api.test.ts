@@ -483,7 +483,7 @@ describe("GitHub App and REST adapter", () => {
 
   it("rejects legacy statuses resolved to a different SHA", async () => {
     const api = createGitHubReader({
-      completeCheckRead: vi.fn(),
+      completeReconciliation: vi.fn(),
       async get(_target, suffix) {
         return {
           data: suffix.includes("check-runs")
@@ -564,19 +564,93 @@ describe("GitHub App and REST adapter", () => {
     },
   );
 
-  it("clears obsolete check throttles when checks succeed for the same PR's new head", async () => {
+  it.each(["check head", "comment page"] as const)(
+    "clears a throttle for an obsolete %s after the same PR reconciles successfully",
+    async (resource) => {
+      const store = new WorkflowStore();
+      let now = Date.UTC(2026, 0, 1);
+      let headSha = sha;
+      let throttle = true;
+      const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+        if (options?.method === "POST")
+          return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+        const url = requestUrl(input);
+        const prNumber = /\/pulls\/(\d+)$/.exec(url.pathname)?.[1];
+        if (prNumber)
+          return Response.json({ number: Number(prNumber), state: "open", head: { sha: headSha } });
+        if (url.pathname.endsWith("/status")) return Response.json({ sha: headSha, statuses: [] });
+        if (url.pathname.endsWith("/check-runs"))
+          return resource === "check head" && throttle
+            ? new Response(null, { status: 429 })
+            : Response.json({ check_runs: [] });
+        if (
+          url.pathname.endsWith("/issues/7/comments") &&
+          resource === "comment page" &&
+          throttle
+        ) {
+          if (url.searchParams.get("page") === "2") return new Response(null, { status: 429 });
+          return Response.json([], {
+            headers: {
+              link: '<https://api.github.com/repos/owner/repo/issues/7/comments?page=2>; rel="next"',
+            },
+          });
+        }
+        return Response.json([]);
+      });
+      try {
+        const rateLimits = store.githubRateLimits();
+        const client = createGitHubAppClient({
+          clientId: "fixture-client-id",
+          privateKey,
+          fetcher,
+          rateLimits,
+          now: () => now,
+        });
+        const reconcile = createReconciler(store, createGitHubReader(client));
+        for (const digit of ["b", "c", "d", "e", "f"]) {
+          const retryAt = now + 60_000;
+          await expect(reconcile(target)).rejects.toMatchObject({ retryAt });
+          if (digit === "b") {
+            // Existing databases can have a narrower retry key from an earlier controller.
+            const retryRequest =
+              resource === "check head"
+                ? "checks:42:owner/repo:7"
+                : "42:GET:/repos/owner/repo/issues/7/comments?per_page=100&page=2";
+            rateLimits.set("secondary", { retryAt, throttledAttempts: 1, retryRequest });
+          }
+          now = retryAt;
+          if (resource === "check head") headSha = digit.repeat(40);
+          throttle = false;
+          await reconcile({ ...target, pullRequest: 8 });
+          expect(rateLimits.get("secondary")?.throttledAttempts).toBe(1);
+          await reconcile(target);
+          expect(rateLimits.get("secondary")?.throttledAttempts).toBe(0);
+          throttle = true;
+        }
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  it("doubles the retry delay when alternating reads still throttle the same reconciliation", async () => {
     const store = new WorkflowStore();
     let now = Date.UTC(2026, 0, 1);
-    let throttledHead = sha;
+    let resource = "check-runs";
     const fetcher = vi.fn<typeof fetch>(async (input, options) => {
       if (options?.method === "POST")
         return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
-      const [, head, resource] = /\/commits\/([a-f0-9]+)\/(check-runs|status)$/.exec(
-        requestUrl(input).pathname,
-      )!;
-      if (resource === "status") return Response.json({ sha: head, statuses: [] });
-      if (head === throttledHead) return new Response(null, { status: 429 });
-      return Response.json({ check_runs: [] });
+      const path = requestUrl(input).pathname;
+      if (path.endsWith("/pulls/7"))
+        return Response.json({ number: 7, state: "open", head: { sha } });
+      if (path.endsWith("/" + resource)) {
+        // Let the healthy group finish first to exercise a late secondary throttle.
+        await setImmediate();
+        return new Response(null, { status: 429 });
+      }
+      if (path.endsWith("/check-runs")) return Response.json({ check_runs: [] });
+      if (path.endsWith("/status")) return Response.json({ sha, statuses: [] });
+      return Response.json([]);
     });
     try {
       const rateLimits = store.githubRateLimits();
@@ -587,18 +661,18 @@ describe("GitHub App and REST adapter", () => {
         rateLimits,
         now: () => now,
       });
-      const api = createGitHubReader(client);
-      for (const digit of ["b", "c", "d", "e", "f"]) {
-        const newHead = digit.repeat(40);
-        const retryAt = now + 60_000;
-        await expect(api.readChecks(target, throttledHead)).rejects.toMatchObject({ retryAt });
+      const reconcile = createReconciler(store, createGitHubReader(client));
+      for (const minutes of [1, 2, 4, 8, 16]) {
+        const retryAt = now + minutes * 60_000;
+        await expect(reconcile(target)).rejects.toMatchObject({ retryAt });
+        resource = resource === "check-runs" ? "reviews" : "check-runs";
         now = retryAt;
-        await expect(api.readChecks({ ...target, pullRequest: 8 }, newHead)).resolves.toEqual([]);
-        expect(rateLimits.get("secondary")?.throttledAttempts).toBe(1);
-        await expect(api.readChecks(target, newHead)).resolves.toEqual([]);
-        expect(rateLimits.get("secondary")?.throttledAttempts).toBe(0);
-        throttledHead = newHead;
       }
+      const requests = fetcher.mock.calls.length;
+      await expect(reconcile(target)).rejects.toThrow(
+        "paused after repeated secondary rate limits",
+      );
+      expect(fetcher).toHaveBeenCalledTimes(requests);
     } finally {
       store.close();
     }

@@ -6,6 +6,7 @@ export type PullRequestTarget = GitHubRepository & { pullRequest: number };
 export type PullRequestState = { headSha: string; state: "open" | "closed" };
 
 export interface GitHubReader {
+  completeReconciliation(target: PullRequestTarget): void;
   readPullRequest(target: PullRequestTarget): Promise<PullRequestState>;
   readReviewInputs(target: PullRequestTarget): Promise<{
     reviews: unknown[];
@@ -20,7 +21,6 @@ export function createGitHubReader(client: GitHubAppClient): GitHubReader {
     target: PullRequestTarget,
     path: string,
     select: (data: unknown) => unknown = (data) => data,
-    checkPullRequest?: number,
   ): Promise<unknown[]> {
     const results: unknown[] = [];
     const separator = path.includes("?") ? "&" : "?";
@@ -28,7 +28,7 @@ export function createGitHubReader(client: GitHubAppClient): GitHubReader {
       const { data, hasNext } = await client.get(
         target,
         `${path}${separator}per_page=100&page=${page}`,
-        checkPullRequest,
+        target.pullRequest,
       );
       const items = select(data);
       if (!Array.isArray(items)) throw new Error(`Invalid GitHub response for ${path}.`);
@@ -39,8 +39,12 @@ export function createGitHubReader(client: GitHubAppClient): GitHubReader {
   }
 
   return {
+    completeReconciliation(target) {
+      client.completeReconciliation(target, target.pullRequest);
+    },
+
     async readPullRequest(target) {
-      const { data } = await client.get(target, `/pulls/${target.pullRequest}`);
+      const { data } = await client.get(target, `/pulls/${target.pullRequest}`, target.pullRequest);
       const pullRequest = object(data);
       const headSha = commitSha(object(pullRequest?.head)?.sha);
       const state = pullRequest?.state;
@@ -68,19 +72,13 @@ export function createGitHubReader(client: GitHubAppClient): GitHubReader {
           target,
           `/commits/${headSha}/check-runs?filter=latest`,
           (data) => object(data)?.check_runs,
-          target.pullRequest,
         ),
-        list(
-          target,
-          `/commits/${headSha}/status`,
-          (data) => {
-            const combined = object(data);
-            if (commitSha(combined?.sha) !== headSha)
-              throw new Error("GitHub returned commit statuses for a different SHA.");
-            return combined?.statuses;
-          },
-          target.pullRequest,
-        ),
+        list(target, `/commits/${headSha}/status`, (data) => {
+          const combined = object(data);
+          if (commitSha(combined?.sha) !== headSha)
+            throw new Error("GitHub returned commit statuses for a different SHA.");
+          return combined?.statuses;
+        }),
       );
 
       const checks = new Map<string, CheckEvidence>();
@@ -102,7 +100,6 @@ export function createGitHubReader(client: GitHubAppClient): GitHubReader {
         if (!status) throw new Error("GitHub returned an invalid commit status.");
         add(status.context, statusOutcome(status.state));
       }
-      client.completeCheckRead(target, target.pullRequest);
       return [...checks.values()].sort((left, right) => left.name.localeCompare(right.name, "en"));
     },
   };
