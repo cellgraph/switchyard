@@ -37,7 +37,7 @@ One workflow row has one of these states:
 | `escalated`       | Cycle limit, ambiguous review, unsafe change, merge conflict, unavailable session, repeated infrastructure failure, or judgment call requires a person. |
 | `stopped`         | User or external lifecycle action stopped/closed the workflow. No automatic restart.                                                                    |
 
-State transitions are performed by controller code and recorded with the triggering event/reason. A later `synchronize` event changes the tracked head and invalidates prior review and CI evidence before returning to `awaiting_review`. An agent cannot set `ready_for_human`; only controller policy can.
+State transitions are performed by controller code and recorded with the triggering event/reason. A later `synchronize` event changes the tracked head and invalidates prior review and CI evidence before returning to `awaiting_review`. If a head-change notification arrives while validation is active, preserve `validating` until the controller records that cycle's outcome, then wait for review of the new head. Persist the validation-start SHA to order review and push events safely. An agent cannot set `ready_for_human`; only controller policy can.
 
 ## Review completion and findings
 
@@ -60,6 +60,8 @@ If the structured state marker is absent, malformed, or unknown, the adapter may
 GitHub check runs and legacy commit statuses are separate APIs. Read both for the current commit, and decide which checks are required from repository configuration rather than hardcoding “all green” or treating no checks as success. A required check that is missing, pending, failing, or associated with a different SHA prevents readiness. Verify how required checks/rulesets are configured during setup. Avoid creating a Switchyard check run in the first milestone; observing required status checks is sufficient.
 
 ## Persistence and recovery
+
+Phase 1 implements the controller-owned state model and local SQLite store in `src/workflow.ts` and `src/store.ts`; see [the state model and recovery notes](state-model.md). Schema migrations are versioned from the initial schema. State plus transition history and evidence snapshots are written in one transaction. Delivery IDs are unique, and operations persist intent before an external side effect. Startup recovery requeues interrupted inbox processing and marks pending operations ambiguous, escalating affected workflows instead of replaying them.
 
 Minimum durable records are:
 
