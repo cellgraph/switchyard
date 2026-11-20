@@ -19,6 +19,10 @@ export type GitHubRateLimits = {
   get(scope: RateLimitScope): GitHubRateLimitState | undefined;
   set(scope: RateLimitScope, state: GitHubRateLimitState): void;
 };
+export type GitHubRetryDeadlines = {
+  get(key: string): number | undefined;
+  set(key: string, retryAt: number): void;
+};
 
 const maxSecondaryAttempts = 5;
 const fallbackRetryDelay = 60_000;
@@ -81,11 +85,11 @@ type ApiRequest = {
   reconcilePullRequest?: number | undefined;
 };
 
-function pullRequestRetryKey(target: GitHubRepository, pullRequest: number): string {
-  return `pr:${target.installationId}:${target.repository}:${pullRequest}`;
+export function pullRequestRetryKey(target: GitHubRepository, pullRequest: number): string {
+  return `${target.installationId}:${target.repository}:${pullRequest}`;
 }
 
-function tokenRetryKey(target: GitHubRepository): string {
+export function tokenRetryKey(target: GitHubRepository): string {
   return `token:${target.installationId}:${target.repository}`;
 }
 
@@ -99,7 +103,7 @@ export function belongsToReconciliation(
   const legacyPull = `${target.installationId}:GET:/repos/${target.repository}/pulls/${pullRequest}`;
   const legacyIssue = `${target.installationId}:GET:/repos/${target.repository}/issues/${pullRequest}/comments?`;
   return (
-    key === pullRequestRetryKey(target, pullRequest) ||
+    key === `pr:${pullRequestRetryKey(target, pullRequest)}` ||
     key === tokenRetryKey(target) ||
     key === legacyChecksKey ||
     key === legacyPull ||
@@ -126,6 +130,7 @@ export function createGitHubAppClient({
   fetcher = fetch,
   now = Date.now,
   rateLimits = new Map<RateLimitScope, GitHubRateLimitState>(),
+  retryDeadlines = new Map<string, number>(),
   isRetryOwnerActive = () => true,
   canReadPullRequest = () => true,
 }: {
@@ -134,6 +139,7 @@ export function createGitHubAppClient({
   fetcher?: typeof fetch;
   now?: () => number;
   rateLimits?: GitHubRateLimits;
+  retryDeadlines?: GitHubRetryDeadlines;
   isRetryOwnerActive?: (key: string) => boolean;
   canReadPullRequest?: (target: GitHubRepository, pullRequest: number) => boolean;
 }) {
@@ -187,6 +193,12 @@ export function createGitHubAppClient({
     return `${unsigned}.${sign("RSA-SHA256", Buffer.from(unsigned), key).toString("base64url")}`;
   }
 
+  function checkRetryDeadline(key: string): void {
+    const retryAt = retryDeadlines.get(key);
+    if (retryAt !== undefined && retryAt > now())
+      throw new GitHubTransientError("GitHub request is deferred by Retry-After.", { retryAt });
+  }
+
   async function request(
     target: GitHubRepository,
     { path, method, body, reconcilePullRequest }: ApiRequest,
@@ -195,12 +207,17 @@ export function createGitHubAppClient({
     if (reconcilePullRequest !== undefined && !canReadPullRequest(target, reconcilePullRequest))
       throw new Error("Pull request reconciliation was stopped.");
     const scope = `installation:${target.installationId}` as const;
+    const pullRequestKey =
+      reconcilePullRequest === undefined
+        ? undefined
+        : pullRequestRetryKey(target, reconcilePullRequest);
     const requestKey =
       method === "POST"
         ? tokenRetryKey(target)
-        : reconcilePullRequest !== undefined
-          ? pullRequestRetryKey(target, reconcilePullRequest)
+        : pullRequestKey !== undefined
+          ? `pr:${pullRequestKey}`
           : `${target.installationId}:GET:${path}`;
+    const deadlineKey = method === "POST" ? requestKey : pullRequestKey;
     const startedAt = now();
     const limit = limitsFor(scope);
     const paused = limit.throttledAttempts >= maxSecondaryAttempts;
@@ -278,11 +295,17 @@ export function createGitHubAppClient({
       }
     }
     if (transientStatuses.has(response.status)) {
-      const retryAfter = response.headers.get("retry-after");
+      const retryAt = retryAfterDeadline(response.headers.get("retry-after"), now());
+      if (
+        deadlineKey !== undefined &&
+        retryAt !== undefined &&
+        retryAt > (retryDeadlines.get(deadlineKey) ?? 0)
+      )
+        retryDeadlines.set(deadlineKey, retryAt);
       const operation =
         method === "POST" ? "GitHub installation token request" : `GitHub API GET ${path}`;
       responseError = new GitHubTransientError(`${operation} failed (HTTP ${response.status}).`, {
-        retryAt: retryAfterDeadline(retryAfter, now()),
+        retryAt,
       });
     }
     if (!response.ok && !response.bodyUsed) {
@@ -311,6 +334,7 @@ export function createGitHubAppClient({
     const cached = tokens.get(cacheKey);
     if (cached && cached.expiresAt - now() > 60_000) return cached;
 
+    checkRetryDeadline(tokenRetryKey(target));
     const response = await request(
       target,
       {
@@ -346,6 +370,8 @@ export function createGitHubAppClient({
       const path = `/repos/${target.repository}${suffix}`;
       const read = { path, reconcilePullRequest };
       return queueRead(target.installationId, async () => {
+        if (reconcilePullRequest !== undefined)
+          checkRetryDeadline(pullRequestRetryKey(target, reconcilePullRequest));
         let token = await tokenFor(target, cacheKey, reconcilePullRequest);
         let response = await request(target, read, token.value);
         if (response.status === 401) {

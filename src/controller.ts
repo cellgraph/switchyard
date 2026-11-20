@@ -4,17 +4,15 @@ import {
   GitHubRateLimitError,
   GitHubTransientError,
   isSecondaryLimitPaused,
+  pullRequestRetryKey,
   retireInactiveGitHubRetry,
+  tokenRetryKey,
 } from "./github-app.ts";
 import { canReconcilePullRequest, PullRequestHeadChangedError } from "./reconcile.ts";
 import type { WorkflowStore } from "./store.ts";
 import { readReconcileHint } from "./webhook.ts";
 
 const retryDelayMs = 30_000;
-
-function retryKey(target: PullRequestTarget): string {
-  return `${target.installationId}:${target.repository}:${target.pullRequest}`;
-}
 
 export function describeError(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown controller error.";
@@ -53,11 +51,6 @@ export function createController({
 }) {
   const rateLimits = store.githubRateLimits();
   const retryStore = store.reconciliationRetries();
-  const retryDueAt = new Map<PullRequestTarget, number>();
-  for (const target of targets) {
-    const deadline = retryStore.get(retryKey(target));
-    if (deadline !== undefined) retryDueAt.set(target, deadline);
-  }
   const pendingSweep = new Set<PullRequestTarget>();
   let nextSweep = 0;
   let running: Promise<boolean> | undefined;
@@ -70,24 +63,17 @@ export function createController({
     return selected.some(isActive);
   }
 
-  function updateRetryDeadline(target: PullRequestTarget, deadline?: number): void {
-    const previous = retryDueAt.get(target);
-    if (deadline === undefined) {
-      if (previous === undefined) return;
-      retryStore.delete(retryKey(target));
-      retryDueAt.delete(target);
-    } else if (previous === undefined || deadline > previous) {
-      retryStore.set(retryKey(target), deadline);
-      retryDueAt.set(target, deadline);
-    }
+  function retryDeadline(target: PullRequestTarget): number {
+    return Math.max(
+      retryStore.get(pullRequestRetryKey(target, target.pullRequest)) ?? 0,
+      retryStore.get(tokenRetryKey(target)) ?? 0,
+    );
   }
 
   function deliveryDeferred(selected: PullRequestTarget[]): boolean {
     const at = now();
     const secondary = secondaryDeferral();
-    return selected.some(
-      (target) => (secondary || (retryDueAt.get(target) ?? 0) > at) && isActive(target),
-    );
+    return selected.some((target) => isActive(target) && (secondary || retryDeadline(target) > at));
   }
 
   function secondaryDeferral() {
@@ -123,10 +109,20 @@ export function createController({
     const observations = new Map<PullRequestTarget, Promise<void>>();
     async function reconcileTargets(selected: PullRequestTarget[]) {
       const failures: string[] = [];
+      const completed: PullRequestTarget[] = [];
+      let deferred = false;
       let retryAt = 0;
       for (const target of selected) {
+        const key = pullRequestRetryKey(target, target.pullRequest);
         if (!isActive(target)) {
-          updateRetryDeadline(target);
+          retryStore.delete(key);
+          completed.push(target);
+          continue;
+        }
+        const scheduled = retryDeadline(target);
+        if (scheduled > now()) {
+          deferred = true;
+          retryAt = Math.max(retryAt, scheduled);
           continue;
         }
         let deadline: number | undefined;
@@ -144,10 +140,16 @@ export function createController({
             deadline = Math.max(now() + retryDelayMs, error.retryAt ?? 0);
           else if (error instanceof PullRequestHeadChangedError) deadline = now() + retryDelayMs;
         }
-        updateRetryDeadline(target, deadline);
-        if (deadline !== undefined) retryAt = Math.max(retryAt, deadline);
+        const recorded = retryStore.get(key) ?? 0;
+        if (deadline !== undefined) {
+          if (deadline > recorded) retryStore.set(key, deadline);
+        } else if (recorded <= now()) {
+          if (recorded > 0) retryStore.delete(key);
+          completed.push(target);
+        }
+        retryAt = Math.max(retryAt, retryDeadline(target));
       }
-      return { failures, retryAt };
+      return { completed, deferred, failures, retryAt };
     }
 
     let success = true;
@@ -169,6 +171,7 @@ export function createController({
             const result = await reconcileTargets(selected);
             retryAt = result.retryAt;
             if (result.failures.length) throw new Error(result.failures.join(", "));
+            if (result.deferred) throw new Error("GitHub reconciliation was deferred.");
           },
           () => Math.max(now() + retryDelayMs, retryAt),
         );
@@ -192,21 +195,14 @@ export function createController({
     const periodic = sweepAt >= nextSweep;
     if (periodic) for (const target of targets) pendingSweep.add(target);
     if (pendingSweep.size > 0) {
-      const due = targets.filter(
-        (target) =>
-          pendingSweep.has(target) &&
-          ((retryDueAt.get(target) ?? 0) <= sweepAt || !isActive(target)),
-      );
-      const { failures } = await reconcileTargets(due);
-      for (const target of due) {
-        if (!retryDueAt.has(target)) pendingSweep.delete(target);
-      }
+      const { completed, failures } = await reconcileTargets([...pendingSweep]);
+      for (const target of completed) pendingSweep.delete(target);
       for (const failure of failures) reportError(`Periodic reconciliation failed for ${failure}`);
       if (failures.length) success = false;
     }
     if (periodic) nextSweep = reconcileIntervalMs > 0 ? now() + reconcileIntervalMs : Infinity;
     if (reportDeferred && success && pendingSweep.size > 0) {
-      const deadline = Math.max(...[...pendingSweep].map((target) => retryDueAt.get(target) ?? 0));
+      const deadline = Math.max(...[...pendingSweep].map(retryDeadline));
       reportError(`GitHub reconciliation is deferred until ${new Date(deadline).toISOString()}.`);
     }
     return success && pendingSweep.size === 0;

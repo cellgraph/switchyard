@@ -97,6 +97,7 @@ async function main(): Promise<void> {
         clientId,
         privateKey,
         rateLimits: store.githubRateLimits(),
+        retryDeadlines: store.reconciliationRetries(),
         isRetryOwnerActive,
         canReadPullRequest: (target, pullRequest) =>
           canReconcilePullRequest(store, target.repository, pullRequest),
