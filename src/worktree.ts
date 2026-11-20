@@ -4,7 +4,8 @@ import { lstatSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 
 export type WorktreeTarget = { workflowId: string; branch: string; expectedHead: string };
-export type Worktree = { path: string; repository: string; branch: string; workflowId: string };
+type WorktreeLocation = { path: string; repository: string; branch: string; workflowId: string };
+export type Worktree = WorktreeLocation & { checkoutIdentity: string };
 type RegisteredWorktree = { path: string; branch?: string; unavailable: boolean };
 
 const semanticBranch = /^(feat|fix|docs|refactor|test|chore)\/.+$/;
@@ -76,8 +77,7 @@ function registeredWorktrees(repository: string): RegisteredWorktree[] {
   });
 }
 
-function checkOperations(path: string): void {
-  const gitDir = gitPath(path, "--git-dir");
+function checkOperations(gitDir: string): void {
   const operation = operations.find((name) =>
     lstatSync(join(gitDir, name), { throwIfNoEntry: false }),
   );
@@ -85,6 +85,10 @@ function checkOperations(path: string): void {
 }
 
 function changedPaths(path: string): string[] {
+  // Git status can hide working tree edits to entries marked assume-unchanged.
+  const entries = git(path, "ls-files", "-v", "-z");
+  if (/(?:^|\0)[a-z] /.test(entries))
+    throw new Error("Workflow worktree has assume-unchanged index entries.");
   const status = git(
     path,
     "status",
@@ -121,13 +125,13 @@ export function createWorktreeManager({
   const repositoryStat = statSync(repository, { bigint: true });
   if (inside(repository, root)) throw new Error("Worktree root overlaps Git metadata.");
 
-  function locate({ workflowId, branch }: WorktreeTarget): Worktree {
+  function locate({ workflowId, branch }: WorktreeTarget): WorktreeLocation {
     if (!semanticBranch.test(branch)) throw new Error("A semantic workflow branch is required.");
     git(source, "check-ref-format", `refs/heads/${branch}`);
     return { path: join(root, worktreeName(workflowId)), repository, branch, workflowId };
   }
 
-  function registrations(worktree: Worktree): RegisteredWorktree[] {
+  function registrations(worktree: WorktreeLocation): RegisteredWorktree[] {
     const currentRepository = realpathSync(gitPath(source, "--git-common-dir"));
     const currentStat = statSync(currentRepository, { bigint: true });
     if (
@@ -150,7 +154,10 @@ export function createWorktreeManager({
     return registered;
   }
 
-  function inspect(worktree: Worktree) {
+  function inspect(
+    worktree: WorktreeLocation,
+    { expectedCheckout, expectedHead }: { expectedCheckout?: string; expectedHead?: string } = {},
+  ) {
     if (
       worktree.repository !== repository ||
       worktree.path !== join(root, worktreeName(worktree.workflowId))
@@ -171,18 +178,35 @@ export function createWorktreeManager({
       git(worktree.path, "symbolic-ref", "HEAD") !== `refs/heads/${worktree.branch}\n`
     )
       throw new Error("Workflow worktree is on a different branch.");
-    checkOperations(worktree.path);
+    const gitDir = realpathSync(gitPath(worktree.path, "--git-dir"));
+    const { dev, ino, birthtimeNs } = statSync(gitDir, { bigint: true });
+    // Git may reuse a worktree administration path after a checkout is removed.
+    const checkoutIdentity = JSON.stringify([
+      gitDir,
+      String(dev),
+      String(ino),
+      String(birthtimeNs),
+    ]);
+    if (expectedCheckout !== undefined && checkoutIdentity !== expectedCheckout)
+      throw new Error("Workflow worktree is a different linked checkout.");
+    checkOperations(gitDir);
+    const head = git(worktree.path, "rev-parse", "--verify", "HEAD^{commit}").trim();
+    if (expectedHead !== undefined && head !== expectedHead)
+      throw new Error("Workflow worktree is at a different commit.");
     return {
-      head: git(worktree.path, "rev-parse", "--verify", "HEAD^{commit}").trim(),
+      checkoutIdentity,
+      head,
       changedPaths: changedPaths(worktree.path),
     };
   }
 
   function validate(worktree: Worktree, expectedHead: string) {
     if (!commitSha.test(expectedHead)) throw new Error("Expected a full Git commit SHA.");
-    const state = inspect(worktree);
-    if (state.head !== expectedHead) throw new Error("Workflow worktree is at a different commit.");
-    return state;
+    const { head, changedPaths } = inspect(worktree, {
+      expectedCheckout: worktree.checkoutIdentity,
+      expectedHead,
+    });
+    return { head, changedPaths };
   }
 
   return {
@@ -196,7 +220,7 @@ export function createWorktreeManager({
           throw new Error("Workflow worktree path already exists without a matching registration.");
         if (registered.some(({ branch }) => branch === worktree.branch))
           throw new Error("Workflow branch is already checked out.");
-        checkOperations(source);
+        checkOperations(gitPath(source, "--git-dir"));
         const ref = `refs/heads/${worktree.branch}`;
         const existing = git(source, "for-each-ref", "--format=%(refname)%09%(objectname)", ref)
           .split("\n")
@@ -222,16 +246,18 @@ export function createWorktreeManager({
           );
         }
       }
-      const state = validate(worktree, target.expectedHead);
-      if (create && state.changedPaths.length)
+      const { checkoutIdentity, changedPaths } = inspect(worktree, {
+        expectedHead: target.expectedHead,
+      });
+      if (create && changedPaths.length)
         throw new Error("A new agent session requires a clean workflow worktree.");
-      return worktree;
+      return { ...worktree, checkoutIdentity };
     },
 
     validate,
 
     observe(worktree: Worktree, beforeHead: string) {
-      const state = inspect(worktree);
+      const state = inspect(worktree, { expectedCheckout: worktree.checkoutIdentity });
       const committed =
         state.head === beforeHead
           ? []
@@ -241,6 +267,7 @@ export function createWorktreeManager({
               "--name-only",
               "--no-ext-diff",
               "--no-renames",
+              "--ignore-submodules=none",
               "-z",
               beforeHead,
               state.head,

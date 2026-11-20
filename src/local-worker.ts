@@ -32,6 +32,8 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
         previous.worktree.branch !== worktree.branch)
     )
       throw new Error("Session belongs to a different worktree.");
+    if (previous && previous.worktree.checkoutIdentity !== worktree.checkoutIdentity)
+      throw new Error("Session belongs to a different linked checkout.");
 
     const workspace = { workingDirectory: worktree.path };
     const session = previous

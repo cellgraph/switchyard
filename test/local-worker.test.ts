@@ -161,6 +161,76 @@ describe("isolated worktrees and the local worker", () => {
     expect(git(primary, "branch", "--show-current")).toBe("main");
   });
 
+  it("rejects a replacement checkout when resuming or using an existing session handle", async () => {
+    const reference = { provider: "fixture", id: "opaque" };
+    const runTurn = vi.fn<AgentSession["runTurn"]>();
+    const agent = {
+      startSession: vi.fn(() => ({ reference, runTurn })),
+      resumeSession: vi.fn(() => ({ reference, runTurn })),
+    };
+    const worker = createLocalWorker(worktrees, agent);
+    const original = worker.startSession(target);
+    const saved = original.reference!;
+    const moved = join(root, "moved-checkout");
+    writeFileSync(join(path, "original-only.txt"), "keep these edits");
+    git(primary, "worktree", "move", path, moved);
+    git(moved, "switch", "--detach");
+    git(primary, "worktree", "add", "--", path, target.branch);
+
+    const replacement = worktrees.open(target, true);
+    expect(replacement).toMatchObject({
+      path: saved.worktree.path,
+      branch: saved.worktree.branch,
+      repository: saved.worktree.repository,
+    });
+    expect(replacement.checkoutIdentity).not.toBe(saved.worktree.checkoutIdentity);
+    expect(() => worker.resumeSession(target, saved)).toThrow("different linked checkout");
+    await expect(original.runTurn(target.expectedHead, { prompt: "edit" })).rejects.toThrow(
+      "different linked checkout",
+    );
+    expect(agent.resumeSession).not.toHaveBeenCalled();
+    expect(runTurn).not.toHaveBeenCalled();
+    expect(readFileSync(join(moved, "original-only.txt"), "utf8")).toBe("keep these edits");
+  });
+
+  it("refuses clean-start and change evidence when the index can hide tracked edits", () => {
+    const worktree = worktrees.open(target, true);
+    git(path, "config", "core.ignoreStat", "true");
+    git(path, "update-index", "--assume-unchanged", "tracked.txt");
+    writeFileSync(join(path, "tracked.txt"), "hidden modification");
+    expect(git(path, "status", "--porcelain")).toBe("");
+
+    expect(() => worktrees.open(target, true)).toThrow("assume-unchanged");
+    expect(() => worktrees.validate(worktree, target.expectedHead)).toThrow("assume-unchanged");
+    expect(() => worktrees.observe(worktree, target.expectedHead)).toThrow("assume-unchanged");
+    expect(git(path, "ls-files", "-v", "tracked.txt")).toBe("h tracked.txt");
+    expect(readFileSync(join(path, "tracked.txt"), "utf8")).toBe("hidden modification");
+  });
+
+  it("reports committed gitlink changes despite repository submodule ignore settings", () => {
+    const worktree = worktrees.open(target, true);
+    git(path, "config", "diff.ignoreSubmodules", "all");
+    mkdirSync(join(path, "module"));
+    git(path, "update-index", "--add", "--cacheinfo", `160000,${target.expectedHead},module`);
+    git(
+      path,
+      "-c",
+      "user.name=Fixture",
+      "-c",
+      "user.email=fixture@example.invalid",
+      "commit",
+      "-m",
+      "add gitlink",
+    );
+    const head = git(path, "rev-parse", "HEAD");
+    expect(git(path, "status", "--porcelain", "--ignore-submodules=none")).toBe("");
+    expect(git(path, "diff", "--name-only", target.expectedHead, head)).toBe("");
+    expect(worktrees.observe(worktree, target.expectedHead)).toEqual({
+      head,
+      changedPaths: ["module"],
+    });
+  });
+
   it("refuses unregistered directories and branch, commit, and repository mismatches", () => {
     fixtureRepository(path);
     expect(() => worktrees.open(target, true)).toThrow("path already exists");
