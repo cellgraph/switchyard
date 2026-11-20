@@ -1,5 +1,5 @@
 import type { GitHubReader, PullRequestState, PullRequestTarget } from "./github-api.ts";
-import { GitHubRateLimitError } from "./github-app.ts";
+import { GitHubRateLimitError, githubRetryError } from "./github-app.ts";
 import type { WorkflowStore } from "./store.ts";
 import type { CheckEvidence, Workflow } from "./workflow.ts";
 
@@ -79,13 +79,16 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
       if (terminal()) return;
       const latest = await github.readPullRequest(target);
       if (terminal()) return;
+      const readErrors = [checks, reviewInputs].flatMap((read) =>
+        read.status === "rejected" ? [read.reason as unknown] : [],
+      );
       if (!observe(latest)) {
-        const throttled = [checks, reviewInputs].some(
-          (read) => read.status === "rejected" && read.reason instanceof GitHubRateLimitError,
-        );
+        const throttled = readErrors.some((error) => error instanceof GitHubRateLimitError);
         if (!throttled) github.completeReconciliation(target);
         return;
       }
+      const retry = githubRetryError(readErrors);
+      if (retry) throw retry;
       if (latest.headSha !== start.headSha) throw new PullRequestHeadChangedError();
 
       if (reviewInputs.status === "rejected") throw reviewInputs.reason;

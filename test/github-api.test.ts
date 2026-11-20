@@ -578,6 +578,107 @@ describe("GitHub App and REST adapter", () => {
     }
   });
 
+  it.each(["503", "network failure", "body failure", "evidence retry deadline", "404"] as const)(
+    "handles a startup %s after a persisted cooldown with polling disabled and no deliveries",
+    async (failure) => {
+      const store = new WorkflowStore();
+      let now = Date.UTC(2026, 0, 1);
+      const resetAt = now + 120_000;
+      const retryAt = resetAt + (failure === "evidence retry deadline" ? 90_000 : 30_000);
+      const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+        if (options?.method === "POST")
+          return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+        const path = requestUrl(input).pathname;
+        if (path.endsWith("/pulls/7")) {
+          if (now === resetAt) {
+            if (failure === "503" || failure === "404")
+              return new Response(null, { status: Number(failure) });
+            if (failure === "network failure") throw new TypeError("Fixture connection failure");
+            if (failure === "body failure")
+              return new Response(
+                new ReadableStream({
+                  start(stream) {
+                    stream.error(new Error("Fixture read failure"));
+                  },
+                }),
+              );
+          }
+          return Response.json({ number: 7, state: "open", head: { sha } });
+        }
+        if (path.endsWith("/check-runs")) {
+          if (failure === "evidence retry deadline" && now === resetAt)
+            return new Response(null, {
+              status: 503,
+              headers: { "retry-after": new Date(retryAt).toUTCString() },
+            });
+          return Response.json({
+            check_runs: [
+              {
+                name: "build",
+                head_sha: sha,
+                status: "completed",
+                conclusion: "success",
+              },
+            ],
+          });
+        }
+        if (path.endsWith("/status")) return Response.json({ sha, statuses: [] });
+        if (path.endsWith("/reviews") && failure === "evidence retry deadline" && now === resetAt)
+          return Response.json(
+            { message: "Resource not accessible by integration" },
+            { status: 403 },
+          );
+        return Response.json([]);
+      });
+      try {
+        const rateLimits = store.githubRateLimits();
+        rateLimits.set("installation:42", {
+          retryAt: resetAt,
+          throttledAttempts: 0,
+          retryRequest: null,
+        });
+        const client = createGitHubAppClient({
+          clientId: "fixture-client-id",
+          privateKey,
+          fetcher,
+          rateLimits,
+          now: () => now,
+        });
+        const { runPass } = createController({
+          store,
+          targets: [target],
+          reconcile: createReconciler(store, createGitHubReader(client)),
+          reportError: vi.fn(),
+          reconcileIntervalMs: 0,
+          now: () => now,
+        });
+        expect(await runPass()).toBe(false);
+        expect(fetcher).not.toHaveBeenCalled();
+        now = resetAt;
+        expect(await runPass()).toBe(false);
+        const requests = fetcher.mock.calls.length;
+        expect(requests).toBeGreaterThan(0);
+        now = retryAt - 1;
+        await runPass();
+        expect(fetcher).toHaveBeenCalledTimes(requests);
+        now = retryAt;
+        expect(await runPass()).toBe(true);
+        if (failure === "404") {
+          expect(fetcher).toHaveBeenCalledTimes(requests);
+          expect(store.findWorkflow(target.repository, target.pullRequest)).toBeNull();
+        } else {
+          expect(store.findWorkflow(target.repository, target.pullRequest)).toMatchObject({
+            headSha: sha,
+            checks: [{ name: "build", sha, outcome: "passed" }],
+          });
+        }
+        expect(store.pendingDeliveries()).toEqual([]);
+      } finally {
+        store.close();
+      }
+    },
+  );
+
   it("blocks queued reads after a secondary throttle and clears the sequence after a successful read", async () => {
     let now = Date.UTC(2026, 0, 1);
     let limited = true;

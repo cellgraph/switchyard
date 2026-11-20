@@ -1,4 +1,4 @@
-import { GitHubRateLimitError, type GitHubAppClient, type GitHubRepository } from "./github-app.ts";
+import { githubRetryError, type GitHubAppClient, type GitHubRepository } from "./github-app.ts";
 import { commitSha, object } from "./github-data.ts";
 import type { CheckEvidence, CheckOutcome } from "./workflow.ts";
 
@@ -110,16 +110,10 @@ async function readAll<T extends unknown[]>(
 ): Promise<T> {
   // Sibling reads can still record a GitHub backoff after another read has failed.
   const results = await Promise.allSettled(reads);
-  let longestBackoff: GitHubRateLimitError | undefined;
-  for (const result of results) {
-    if (
-      result.status === "rejected" &&
-      result.reason instanceof GitHubRateLimitError &&
-      (!longestBackoff || result.reason.retryAt > longestBackoff.retryAt)
-    )
-      longestBackoff = result.reason;
-  }
-  if (longestBackoff) throw longestBackoff;
+  const retry = githubRetryError(
+    results.flatMap((result) => (result.status === "rejected" ? [result.reason as unknown] : [])),
+  );
+  if (retry) throw retry;
   return results.map((result) => {
     if (result.status === "rejected") throw result.reason;
     return result.value;

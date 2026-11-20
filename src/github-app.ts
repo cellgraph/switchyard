@@ -22,6 +22,7 @@ export type GitHubRateLimits = {
 
 const maxSecondaryAttempts = 5;
 const fallbackRetryDelay = 60_000;
+const transientStatuses = new Set([408, 500, 502, 503, 504]);
 
 export function isSecondaryLimitPaused(state: GitHubRateLimitState | undefined): boolean {
   return (state?.throttledAttempts ?? 0) >= maxSecondaryAttempts;
@@ -40,6 +41,29 @@ export class GitHubRateLimitError extends Error {
     );
     this.retryAt = retryAt;
   }
+}
+
+export class GitHubTransientError extends Error {
+  readonly retryAt: number | undefined;
+
+  constructor(message: string, options?: ErrorOptions & { retryAt?: number | undefined }) {
+    super(message, options);
+    this.retryAt = options?.retryAt;
+  }
+}
+
+export function githubRetryError(
+  errors: readonly unknown[],
+): GitHubRateLimitError | GitHubTransientError | undefined {
+  let selected: GitHubRateLimitError | GitHubTransientError | undefined;
+  for (const error of errors) {
+    if (
+      (error instanceof GitHubRateLimitError || error instanceof GitHubTransientError) &&
+      (!selected || (error.retryAt ?? 0) > (selected.retryAt ?? 0))
+    )
+      selected = error;
+  }
+  return selected;
 }
 
 export function resumeGitHubAfterSecondaryLimit(rateLimits: GitHubRateLimits): boolean {
@@ -197,8 +221,8 @@ export function createGitHubAppClient({
         redirect: "error",
         signal: AbortSignal.timeout(10_000),
       });
-    } catch {
-      throw new Error("GitHub API request failed or timed out.");
+    } catch (cause) {
+      throw new GitHubTransientError("GitHub API request failed or timed out.", { cause });
     }
     const primaryLimited = response.headers.get("x-ratelimit-remaining") === "0";
     const reset = primaryLimited
@@ -207,7 +231,7 @@ export function createGitHubAppClient({
     if (response.ok && method === undefined && reset !== undefined && reset > now())
       rememberPrimaryReset(scope, reset);
 
-    let rateLimitError: GitHubRateLimitError | undefined;
+    let responseError: GitHubRateLimitError | GitHubTransientError | undefined;
     if (response.status === 403 || response.status === 429) {
       const retryDelay = headerMilliseconds(response.headers.get("retry-after"));
       const secondaryLimited =
@@ -246,12 +270,20 @@ export function createGitHubAppClient({
       }
       if (primaryLimited || secondaryLimited) {
         const latest = limitsFor(scope);
-        rateLimitError = new GitHubRateLimitError(
+        responseError = new GitHubRateLimitError(
           latest.retryAt,
           response.status,
           latest.throttledAttempts >= maxSecondaryAttempts,
         );
       }
+    }
+    if (transientStatuses.has(response.status)) {
+      const retryAfter = response.headers.get("retry-after");
+      const operation =
+        method === "POST" ? "GitHub installation token request" : `GitHub API GET ${path}`;
+      responseError = new GitHubTransientError(`${operation} failed (HTTP ${response.status}).`, {
+        retryAt: retryAfterDeadline(retryAfter, now()),
+      });
     }
     if (!response.ok && !response.bodyUsed) {
       try {
@@ -260,11 +292,11 @@ export function createGitHubAppClient({
         const cleanupError = new Error("GitHub API response body could not be canceled.", {
           cause,
         });
-        if (!rateLimitError) throw cleanupError;
-        rateLimitError.cause = cleanupError;
+        if (!responseError) throw cleanupError;
+        responseError.cause = cleanupError;
       }
     }
-    if (rateLimitError) throw rateLimitError;
+    if (responseError) throw responseError;
     // Reads in a reconciliation only clear the count when the entire reconciliation succeeds.
     if (response.ok && limit.throttledAttempts > 0 && reconcilePullRequest === undefined)
       clearSecondaryAttempts(startedAt, (key) => key === requestKey);
@@ -339,6 +371,13 @@ function headerMilliseconds(value: string | null): number | undefined {
   return Number.isSafeInteger(milliseconds) ? milliseconds : undefined;
 }
 
+function retryAfterDeadline(value: string | null, now: number): number | undefined {
+  if (!value) return undefined;
+  const delay = headerMilliseconds(value);
+  const deadline = delay === undefined ? Date.parse(value) : now + delay;
+  return Number.isSafeInteger(deadline) && deadline > now ? deadline : undefined;
+}
+
 async function reportsSecondaryLimit(response: Response): Promise<boolean> {
   try {
     const message = object(await response.json())?.message;
@@ -351,8 +390,10 @@ async function reportsSecondaryLimit(response: Response): Promise<boolean> {
 async function readJson(response: Response): Promise<unknown> {
   try {
     return await response.json();
-  } catch {
-    throw new Error("GitHub API response could not be read as JSON.");
+  } catch (cause) {
+    if (cause instanceof SyntaxError)
+      throw new Error("GitHub API response could not be read as JSON.", { cause });
+    throw new GitHubTransientError("GitHub API response body could not be read.", { cause });
   }
 }
 

@@ -2,6 +2,7 @@ import type { PullRequestTarget } from "./github-api.ts";
 import {
   belongsToReconciliation,
   GitHubRateLimitError,
+  GitHubTransientError,
   isSecondaryLimitPaused,
   retireInactiveGitHubRetry,
 } from "./github-app.ts";
@@ -102,12 +103,11 @@ export function createController({
           await observation;
         } catch (error) {
           failures.push(`${target.repository}#${target.pullRequest}: ${describeError(error)}`);
-          const deadline =
-            error instanceof GitHubRateLimitError
-              ? error.retryAt
-              : error instanceof PullRequestHeadChangedError
-                ? now() + retryDelayMs
-                : undefined;
+          let deadline: number | undefined;
+          if (error instanceof GitHubRateLimitError) deadline = error.retryAt;
+          else if (error instanceof GitHubTransientError)
+            deadline = Math.max(now() + retryDelayMs, error.retryAt ?? 0);
+          else if (error instanceof PullRequestHeadChangedError) deadline = now() + retryDelayMs;
           if (deadline === undefined) continue;
           retryDeadlines.set(target, deadline);
           retryAt = Math.max(retryAt, deadline);
