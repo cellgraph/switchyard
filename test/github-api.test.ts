@@ -1046,6 +1046,118 @@ describe("GitHub App and REST adapter", () => {
     }
   });
 
+  it.each(["check-runs", "status"] as const)(
+    "honors a shared commit %s Retry-After across PRs and restarts",
+    async (endpoint) => {
+      const dir = mkdtempSync(join(tmpdir(), "switchyard-commit-retry-"));
+      const dbPath = join(dir, "state.sqlite");
+      let store = new WorkflowStore(dbPath);
+      let now = Date.UTC(2026, 0, 1);
+      const retryAt = now + 120_000;
+      const sibling = { ...target, pullRequest: 8 };
+      const differentHead = { ...target, pullRequest: 9 };
+      const differentRepo = { ...target, repository: "owner/another", pullRequest: 10 };
+      const sharedPath = `/repos/owner/repo/commits/${sha}/${endpoint}`;
+      const sharedPages: string[] = [];
+      const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+        if (options?.method === "POST")
+          return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+        const { pathname, searchParams } = requestUrl(input);
+        const number = Number(pathname.match(/\/pulls\/(\d+)$/)?.[1]);
+        if (number)
+          return Response.json({
+            number,
+            state: "open",
+            head: { sha: number === 9 ? otherSha : sha },
+          });
+        const commit = pathname.split("/").at(-2);
+        let headers: HeadersInit = {};
+        if (pathname === sharedPath) {
+          const page = searchParams.get("page")!;
+          sharedPages.push(page);
+          if (page === "1") headers = { link: '<https://unused.example/page=2>; rel="next"' };
+          else if (now < retryAt)
+            return new Response(null, { status: 503, headers: { "retry-after": "120" } });
+        }
+        if (pathname.endsWith("/check-runs"))
+          return Response.json(
+            {
+              check_runs:
+                pathname === sharedPath && searchParams.get("page") === "1"
+                  ? []
+                  : [
+                      {
+                        name: "build",
+                        head_sha: commit,
+                        status: "completed",
+                        conclusion: "success",
+                      },
+                    ],
+            },
+            { headers },
+          );
+        if (pathname.endsWith("/status"))
+          return Response.json({ sha: commit, statuses: [] }, { headers });
+        return Response.json([]);
+      });
+      function controller(targets: (typeof target)[]) {
+        const client = createGitHubAppClient({
+          clientId: "fixture-client-id",
+          privateKey,
+          fetcher,
+          now: () => now,
+          retryDeadlines: store.reconciliationRetries(),
+        });
+        return createController({
+          store,
+          targets,
+          reconcile: createReconciler(store, createGitHubReader(client)),
+          reportError: vi.fn(),
+          reconcileIntervalMs: 0,
+          now: () => now,
+        });
+      }
+      try {
+        expect(await controller([target, sibling, differentHead, differentRepo]).runPass()).toBe(
+          false,
+        );
+        expect(sharedPages).toEqual(["1", "2"]);
+        for (const affected of [target, sibling])
+          expect(store.findWorkflow(affected.repository, affected.pullRequest)?.checks).toEqual([]);
+        for (const unaffected of [differentHead, differentRepo])
+          expect(store.findWorkflow(unaffected.repository, unaffected.pullRequest)?.checks).toEqual(
+            [
+              {
+                name: "build",
+                sha: unaffected === differentHead ? otherSha : sha,
+                outcome: "passed",
+              },
+            ],
+          );
+
+        // A newly tracked PR has no existing per-PR deadline to carry over from the first sweep.
+        store.close();
+        store = new WorkflowStore(dbPath);
+        const late = { ...target, pullRequest: 11 };
+        const { runPass } = controller([late]);
+        now = retryAt - 30_000;
+        expect(await runPass()).toBe(false);
+        now = retryAt - 1;
+        expect(await runPass()).toBe(false);
+        expect(sharedPages).toEqual(["1", "2"]);
+        now = retryAt;
+        expect(await runPass()).toBe(true);
+        expect(sharedPages).toEqual(["1", "2", "1", "2"]);
+        expect(store.findWorkflow(late.repository, late.pullRequest)?.checks).toEqual([
+          { name: "build", sha, outcome: "passed" },
+        ]);
+      } finally {
+        store.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("paginates GitHub resources and normalizes conservative exact-head check evidence", async () => {
     const pagesSeen: string[] = [];
     const fetcher = vi.fn<typeof fetch>(async (input, options) => {

@@ -142,7 +142,7 @@ export function createController({
         }
         const recorded = retryStore.get(key) ?? 0;
         if (deadline !== undefined) {
-          if (deadline > recorded) retryStore.set(key, deadline);
+          if (deadline > recorded) retryStore.extend([key], deadline);
         } else if (recorded <= now()) {
           if (recorded > 0) retryStore.delete(key);
           completed.push(target);

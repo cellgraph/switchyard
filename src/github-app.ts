@@ -21,7 +21,7 @@ export type GitHubRateLimits = {
 };
 export type GitHubRetryDeadlines = {
   get(key: string): number | undefined;
-  set(key: string, retryAt: number): void;
+  extend(keys: readonly string[], retryAt: number): void;
 };
 
 const maxSecondaryAttempts = 5;
@@ -83,6 +83,7 @@ type ApiRequest = {
   method?: "POST";
   body?: string;
   reconcilePullRequest?: number | undefined;
+  commitRetryKey?: string | undefined;
 };
 
 export function pullRequestRetryKey(target: GitHubRepository, pullRequest: number): string {
@@ -124,13 +125,23 @@ export function retireInactiveGitHubRetry(
   rateLimits.set("secondary", { ...state, throttledAttempts: 0, retryRequest: null });
 }
 
+function memoryRetryDeadlines(): GitHubRetryDeadlines {
+  const deadlines = new Map<string, number>();
+  return {
+    get: (key) => deadlines.get(key),
+    extend(keys, retryAt) {
+      for (const key of keys) deadlines.set(key, Math.max(deadlines.get(key) ?? 0, retryAt));
+    },
+  };
+}
+
 export function createGitHubAppClient({
   clientId,
   privateKey,
   fetcher = fetch,
   now = Date.now,
   rateLimits = new Map<RateLimitScope, GitHubRateLimitState>(),
-  retryDeadlines = new Map<string, number>(),
+  retryDeadlines = memoryRetryDeadlines(),
   isRetryOwnerActive = () => true,
   canReadPullRequest = () => true,
 }: {
@@ -193,15 +204,18 @@ export function createGitHubAppClient({
     return `${unsigned}.${sign("RSA-SHA256", Buffer.from(unsigned), key).toString("base64url")}`;
   }
 
-  function checkRetryDeadline(key: string): void {
-    const retryAt = retryDeadlines.get(key);
-    if (retryAt !== undefined && retryAt > now())
+  function checkRetryDeadline(...keys: (string | undefined)[]): void {
+    let retryAt = 0;
+    for (const key of keys) {
+      if (key !== undefined) retryAt = Math.max(retryAt, retryDeadlines.get(key) ?? 0);
+    }
+    if (retryAt > now())
       throw new GitHubTransientError("GitHub request is deferred by Retry-After.", { retryAt });
   }
 
   async function request(
     target: GitHubRepository,
-    { path, method, body, reconcilePullRequest }: ApiRequest,
+    { path, method, body, reconcilePullRequest, commitRetryKey }: ApiRequest,
     credential: string,
   ): Promise<Response> {
     if (reconcilePullRequest !== undefined && !canReadPullRequest(target, reconcilePullRequest))
@@ -296,12 +310,10 @@ export function createGitHubAppClient({
     }
     if (transientStatuses.has(response.status)) {
       const retryAt = retryAfterDeadline(response.headers.get("retry-after"), now());
-      if (
-        deadlineKey !== undefined &&
-        retryAt !== undefined &&
-        retryAt > (retryDeadlines.get(deadlineKey) ?? 0)
-      )
-        retryDeadlines.set(deadlineKey, retryAt);
+      if (retryAt !== undefined) {
+        const keys = [deadlineKey, commitRetryKey].filter((key) => key !== undefined);
+        if (keys.length > 0) retryDeadlines.extend(keys, retryAt);
+      }
       const operation =
         method === "POST" ? "GitHub installation token request" : `GitHub API GET ${path}`;
       responseError = new GitHubTransientError(`${operation} failed (HTTP ${response.status}).`, {
@@ -368,10 +380,17 @@ export function createGitHubAppClient({
     ): Promise<{ data: unknown; hasNext: boolean }> {
       const cacheKey = `${target.installationId}:${target.repository}`;
       const path = `/repos/${target.repository}${suffix}`;
-      const read = { path, reconcilePullRequest };
+      const prRetryKey =
+        reconcilePullRequest === undefined
+          ? undefined
+          : pullRequestRetryKey(target, reconcilePullRequest);
+      // PRs at one commit share these endpoints, including all pages of an endpoint.
+      const commitRetryKey = suffix.startsWith("/commits/")
+        ? `commit:${target.installationId}:${path.split("?", 1)[0]}`
+        : undefined;
+      const read = { path, reconcilePullRequest, commitRetryKey };
       return queueRead(target.installationId, async () => {
-        if (reconcilePullRequest !== undefined)
-          checkRetryDeadline(pullRequestRetryKey(target, reconcilePullRequest));
+        checkRetryDeadline(prRetryKey, commitRetryKey);
         let token = await tokenFor(target, cacheKey, reconcilePullRequest);
         let response = await request(target, read, token.value);
         if (response.status === 401) {

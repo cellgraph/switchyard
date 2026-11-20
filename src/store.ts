@@ -105,13 +105,15 @@ export class WorkflowStore {
       "SELECT retry_at FROM reconciliation_retries WHERE retry_key = ?",
     );
     const upsert = this.#db.prepare(
-      `INSERT INTO reconciliation_retries (retry_key, retry_at) VALUES (?, ?)
-       ON CONFLICT(retry_key) DO UPDATE SET retry_at=excluded.retry_at`,
+      `INSERT INTO reconciliation_retries (retry_key, retry_at)
+       SELECT value, ? FROM json_each(?) WHERE type = 'text'
+       ON CONFLICT(retry_key) DO UPDATE SET retry_at=MAX(reconciliation_retries.retry_at, excluded.retry_at)`,
     );
     const remove = this.#db.prepare("DELETE FROM reconciliation_retries WHERE retry_key = ?");
     return {
       get: (key: string) => (select.get(key) as { retry_at: number } | undefined)?.retry_at,
-      set: (key: string, retryAt: number) => upsert.run(key, retryAt),
+      extend: (keys: readonly string[], retryAt: number) =>
+        upsert.run(retryAt, JSON.stringify(keys)),
       delete: (key: string) => remove.run(key),
     };
   }
