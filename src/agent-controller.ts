@@ -75,6 +75,9 @@ export function createAgentController(store: WorkflowStore, worker: AgentOperati
           prompt,
           previous,
           ...(signal === undefined ? {} : { signal }),
+          authorizeLaunch: () => operations.authorizeLaunch(operationId),
+          recordExpectedWorktree: (expectedWorktree) =>
+            operations.progress(operationId, { expectedWorktree }),
           recordWorkspace: (worktree) => operations.progress(operationId, { worktree }),
           recordSession: (reference) => operations.progress(operationId, { reference }),
         });

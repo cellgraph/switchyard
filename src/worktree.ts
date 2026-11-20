@@ -11,7 +11,12 @@ import {
 import { isAbsolute, join, relative, sep } from "node:path";
 
 export type WorktreeTarget = { workflowId: string; branch: string; expectedHead: string };
-type WorktreeLocation = { path: string; repository: string; branch: string; workflowId: string };
+export type WorktreeLocation = {
+  path: string;
+  repository: string;
+  branch: string;
+  workflowId: string;
+};
 export type Worktree = WorktreeLocation & { checkoutIdentity: string };
 type RegisteredWorktree = { path: string; branch?: string; unavailable: boolean };
 
@@ -91,7 +96,7 @@ function checkOperations(gitDir: string): void {
   if (operation) throw new Error(`Worktree has an active Git operation or lock (${operation}).`);
 }
 
-function changedPaths(path: string): string[] {
+function checkoutStatus(path: string) {
   // Git status can omit changes to files with either of these index flags.
   const entries = git(path, "ls-files", "-v", "-z");
   if (/(?:^|\0)[Ss] /.test(entries))
@@ -107,7 +112,7 @@ function changedPaths(path: string): string[] {
     "--untracked-files=all",
     "--ignore-submodules=none",
   );
-  return status
+  const changedPaths = status
     .split("\0")
     .filter(Boolean)
     .map((entry) => {
@@ -116,6 +121,7 @@ function changedPaths(path: string): string[] {
         throw new Error("Workflow worktree has unresolved conflicts.");
       return entry.slice(3);
     });
+  return { status, changedPaths };
 }
 
 export function createWorktreeManager({
@@ -209,7 +215,7 @@ export function createWorktreeManager({
     return {
       checkoutIdentity,
       head,
-      changedPaths: changedPaths(worktree.path),
+      ...checkoutStatus(worktree.path),
     };
   }
 
@@ -223,6 +229,8 @@ export function createWorktreeManager({
   }
 
   return {
+    locate,
+
     open(target: WorktreeTarget, create: boolean | "new"): Worktree {
       const worktree = locate(target);
       if (!commitSha.test(target.expectedHead)) throw new Error("Expected a full Git commit SHA.");
@@ -273,8 +281,14 @@ export function createWorktreeManager({
     validate,
 
     checkpoint(worktree: Worktree, expectedHead: string): string {
-      validate(worktree, expectedHead);
-      const hash = createHash("sha256").update(git(worktree.path, "ls-files", "--stage", "-z"));
+      const { status } = inspect(worktree, {
+        expectedCheckout: worktree.checkoutIdentity,
+        expectedHead,
+      });
+      // Porcelain distinguishes intent-to-add from staged addition even when index blobs match.
+      const hash = createHash("sha256").update(
+        JSON.stringify([status, git(worktree.path, "ls-files", "--stage", "-z")]),
+      );
       // Include ignored files and raw bytes, since Git status can report the same paths after edits.
       let remainingBytes = 64 * 1024 * 1024;
       let remainingEntries = 10_000;

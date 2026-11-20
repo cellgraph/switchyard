@@ -1,6 +1,6 @@
 import type { AgentTurnResult } from "./agent.ts";
 import type { WorkerSessionReference, WorkerTurnResult } from "./local-worker.ts";
-import type { Worktree, WorktreeTarget } from "./worktree.ts";
+import type { Worktree, WorktreeLocation, WorktreeTarget } from "./worktree.ts";
 
 export type AgentRuntime = {
   provider: string;
@@ -36,13 +36,17 @@ export type AgentOperationStatus =
   | "unknown"
   | "manual_reconciliation";
 
+export type AgentSessionCheckpoint = { identity: string; digest: string };
+
 export type AgentTurnEvidence = {
+  expectedWorktree?: WorktreeLocation;
+  launchAuthorizedAt?: string;
   runtime?: AgentRuntime;
   worktree?: Worktree;
   reference?: WorkerSessionReference;
   agent?: Pick<AgentTurnResult, "outcome"> & { reason?: string };
   workspace?: WorkerTurnResult["workspace"];
-  checkpoint?: { workspace: string; session: string };
+  checkpoint?: { workspace: string; session: AgentSessionCheckpoint };
   error?: string;
 };
 
@@ -77,6 +81,8 @@ export interface AgentOperationWorker {
     prompt: string;
     previous: AgentSessionBinding | null;
     signal?: AbortSignal;
+    authorizeLaunch(): void;
+    recordExpectedWorktree(worktree: WorktreeLocation): void;
     recordWorkspace(worktree: Worktree): void;
     recordSession(reference: WorkerSessionReference): void;
   }): Promise<AgentTurnEvidence>;

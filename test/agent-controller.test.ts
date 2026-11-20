@@ -1,11 +1,12 @@
 import { spawnSync } from "node:child_process";
-import { lstatSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentAdapter, AgentSession } from "../src/agent.ts";
 import { createAgentController } from "../src/agent-controller.ts";
-import type { AgentOperationWorker } from "../src/agent-operation.ts";
+import type { AgentOperationWorker, AgentSessionCheckpoint } from "../src/agent-operation.ts";
+import { codexConfigFingerprint, codexSessionCheckpoint } from "../src/codex-runtime.ts";
 import { createLocalAgentExecution } from "../src/local-agent-execution.ts";
 import { WorkflowStore } from "../src/store.ts";
 import { createWorktreeManager } from "../src/worktree.ts";
@@ -29,7 +30,9 @@ describe("durable agent controller", () => {
   let runTurn: ReturnType<typeof vi.fn<AgentSession["runTurn"]>>;
   let startSession: ReturnType<typeof vi.fn<AgentAdapter["startSession"]>>;
   let resumeSession: ReturnType<typeof vi.fn<AgentAdapter["resumeSession"]>>;
-  let sessionCheckpoint: ReturnType<typeof vi.fn<(id: string, path: string) => string>>;
+  let sessionCheckpoint: ReturnType<
+    typeof vi.fn<(id: string, path: string) => AgentSessionCheckpoint>
+  >;
 
   beforeEach(() => {
     fixture = agentRepository();
@@ -45,7 +48,7 @@ describe("durable agent controller", () => {
       },
     }));
     resumeSession = vi.fn(() => ({ reference, runTurn }));
-    sessionCheckpoint = vi.fn(() => "session-witness");
+    sessionCheckpoint = vi.fn(() => ({ identity: "rollout", digest: "session-witness" }));
     requests = worker();
   });
 
@@ -142,7 +145,7 @@ describe("durable agent controller", () => {
     expect(startSession).toHaveBeenCalledTimes(1);
   });
 
-  it("excludes duplicate dispatch across independent SQLite connections while a turn is in flight", async () => {
+  it("excludes duplicate dispatch and preserves the outcome when a second process runs startup recovery", async () => {
     let complete!: (result: Awaited<ReturnType<AgentSession["runTurn"]>>) => void;
     runTurn.mockImplementationOnce(
       () =>
@@ -159,8 +162,21 @@ describe("durable agent controller", () => {
       expect(
         secondStore.agentOperations().get(fixture.request.operationId)?.evidence?.reference?.agent,
       ).toEqual(reference);
+      const recovery = spawnSync(process.execPath, ["src/main.ts", "--recover"], {
+        env: { ...process.env, SWITCHYARD_DB_PATH: fixture.db },
+        encoding: "utf8",
+      });
+      expect(recovery.stderr).toBe("");
+      expect(recovery.status).toBe(0);
+      expect(JSON.parse(recovery.stdout)).toEqual({ deliveries: 0, ambiguousOperations: 0 });
+      expect(secondStore.agentOperations().get(fixture.request.operationId)?.status).toBe(
+        "running",
+      );
       complete({ outcome: "completed", response: "done" });
-      expect((await first).status).toBe("completed");
+      expect(await first).toMatchObject({
+        status: "completed",
+        evidence: { agent: { outcome: "completed" }, workspace: { changedPaths: ["tracked.txt"] } },
+      });
       expect(runTurn).toHaveBeenCalledTimes(1);
     } finally {
       secondStore.close();
@@ -268,7 +284,7 @@ describe("durable agent controller", () => {
           throw new Error("Codex session is missing.");
         });
       if (scenario === "changed session")
-        sessionCheckpoint.mockReturnValueOnce("different-witness");
+        sessionCheckpoint.mockReturnValueOnce({ identity: "rollout", digest: "different-witness" });
       if (scenario === "runtime mismatch")
         requests.runtime = () => ({ ...runtime, cliVersion: "2" });
       if (scenario === "missing credentials")
@@ -304,6 +320,118 @@ describe("durable agent controller", () => {
     },
   );
 
+  it("rejects launch authorization revoked by another connection during resume preflight", async () => {
+    await start();
+    const reconciler = new WorkflowStore(fixture.db);
+    try {
+      sessionCheckpoint.mockImplementationOnce(() => {
+        reconciler.transition(fixture.workflow.id, { type: "head_changed", sha: "a".repeat(40) });
+        return { identity: "rollout", digest: "session-witness" };
+      });
+      const second = await createAgentController(store, requests).runTurn(followUp());
+      expect(second).toMatchObject({
+        status: "manual_reconciliation",
+        error: "Workflow authorization changed before the agent launched.",
+      });
+      expect(second.evidence).not.toHaveProperty("launchAuthorizedAt");
+      expect(resumeSession).not.toHaveBeenCalled();
+      expect(runTurn).toHaveBeenCalledTimes(1);
+    } finally {
+      reconciler.close();
+    }
+  });
+
+  it("rejects staging an empty intent-to-add file between turns", async () => {
+    runTurn.mockImplementationOnce(async () => {
+      const path = startSession.mock.calls[0]![0].workingDirectory;
+      writeFileSync(join(path, "empty.txt"), "");
+      git(path, "add", "-N", "empty.txt");
+      return { outcome: "completed", response: "done" };
+    });
+    const path = await start();
+    const originalIndexEntries = git(path, "ls-files", "--stage");
+    git(path, "add", "empty.txt");
+    expect(git(path, "ls-files", "--stage")).toBe(originalIndexEntries);
+    expect(await createAgentController(store, requests).runTurn(followUp())).toMatchObject({
+      status: "manual_reconciliation",
+      error: "Worktree changed since the previous agent operation.",
+    });
+    expect(resumeSession).not.toHaveBeenCalled();
+  });
+
+  it("rejects a changed system-level model provider before continuation", async () => {
+    const system = join(fixture.root, "system-codex");
+    mkdirSync(system);
+    const file = join(system, "config.toml");
+    writeFileSync(file, 'model_provider = "original"');
+    const configuration = () => codexConfigFingerprint(fixture.root, system);
+    requests.runtime = () => ({ ...runtime, configuration: configuration() });
+    await start();
+    writeFileSync(file, 'model_provider = "replacement"');
+    expect(await createAgentController(store, requests).runTurn(followUp())).toMatchObject({
+      status: "manual_reconciliation",
+      error: "Recorded agent runtime or session is incompatible with continuation.",
+    });
+    expect(resumeSession).not.toHaveBeenCalled();
+  });
+
+  it.each(["before launch", "after launch"])(
+    "holds when the state database selects a different rollout %s",
+    async (when) => {
+      const threadId = "00000000-0000-4000-8000-000000000001";
+      const home = join(fixture.root, "codex");
+      mkdirSync(home);
+      const state = new DatabaseSync(join(home, "state_5.sqlite"));
+      try {
+        state.exec(
+          "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, archived INTEGER)",
+        );
+        const selectRollout = state.prepare("INSERT OR REPLACE INTO threads VALUES (?, ?, 0)");
+        let secondPath: string;
+        sessionCheckpoint.mockImplementationOnce((_id, workingDirectory) => {
+          function createRollout(day: string) {
+            const directory = join(home, "sessions", "2026", "11", day);
+            mkdirSync(directory, { recursive: true });
+            const path = join(directory, `rollout-2026-11-${day}-${threadId}.jsonl`);
+            writeFileSync(
+              path,
+              JSON.stringify({
+                type: "session_meta",
+                payload: { id: threadId, cwd: workingDirectory },
+              }) + "\n",
+            );
+            return path;
+          }
+          const firstPath = createRollout("19");
+          secondPath = createRollout("20");
+          selectRollout.run(threadId, firstPath);
+          return codexSessionCheckpoint(home, threadId, workingDirectory);
+        });
+        await start();
+        sessionCheckpoint.mockImplementation((_id, directory) =>
+          codexSessionCheckpoint(home, threadId, directory),
+        );
+        if (when === "before launch") selectRollout.run(threadId, secondPath!);
+        else
+          runTurn.mockImplementationOnce(async () => {
+            selectRollout.run(threadId, secondPath!);
+            return { outcome: "completed", response: "done" };
+          });
+        expect(await createAgentController(store, requests).runTurn(followUp())).toMatchObject({
+          status: "manual_reconciliation",
+          error:
+            when === "before launch"
+              ? "Agent session changed since the previous operation."
+              : "Codex selected a different rollout during the turn.",
+        });
+        expect(runTurn).toHaveBeenCalledTimes(when === "before launch" ? 1 : 2);
+        expect(store.agentOperations().session(fixture.workflow.id)?.status).toBe("held");
+      } finally {
+        state.close();
+      }
+    },
+  );
+
   it("does not advance a fix to validation when the PR changes during execution", async () => {
     await start();
     store.transition(fixture.workflow.id, {
@@ -324,7 +452,7 @@ describe("durable agent controller", () => {
     });
   });
 
-  it.each(["dispatching", "running", "returned"] as const)(
+  it.each(["dispatching", "checkout", "running", "returned"] as const)(
     "never repeats an operation when a child process dies at the %s boundary",
     async (boundary) => {
       const marker = join(fixture.root, "external-side-effect");
@@ -332,7 +460,9 @@ describe("durable agent controller", () => {
         import { writeFileSync } from "node:fs";
         import { createAgentController } from "./src/agent-controller.ts";
         import { WorkflowStore } from "./src/store.ts";
-        const [db, request, runtime, boundary, marker] = process.argv.slice(1);
+        import { createWorktreeManager } from "./src/worktree.ts";
+        import { createLocalAgentExecution } from "./src/local-agent-execution.ts";
+        const [db, request, runtime, boundary, marker, repositoryDirectory, worktreeRoot] = process.argv.slice(1);
         const store = new WorkflowStore(db);
         if (boundary === "returned") {
           const repo = store.agentOperations();
@@ -345,7 +475,19 @@ describe("durable agent controller", () => {
             if (boundary === "dispatching") process.kill(process.pid, "SIGKILL");
             return JSON.parse(runtime);
           },
-          async execute() {
+          async execute(input) {
+            if (boundary === "checkout") {
+              const manager = createWorktreeManager({repositoryDirectory, worktreeRoot});
+              const unavailable = () => { throw new Error("Unexpected agent launch."); };
+              const worker = createLocalAgentExecution(manager, {
+                startSession: () => ({ reference: null, runTurn: unavailable }),
+                resumeSession: unavailable,
+              }, unavailable);
+              return worker.execute({
+                ...input,
+                recordWorkspace: () => process.kill(process.pid, "SIGKILL"),
+              });
+            }
             writeFileSync(marker, "external side effect");
             if (boundary === "running") process.kill(process.pid, "SIGKILL");
             return { agent: { outcome: "completed" } };
@@ -364,17 +506,30 @@ describe("durable agent controller", () => {
           JSON.stringify(runtime),
           boundary,
           marker,
+          fixture.repo,
+          fixture.worktrees,
         ],
         { encoding: "utf8" },
       );
       expect(child.stderr).toBe("");
       expect(child.signal).toBe("SIGKILL");
       expect(Boolean(lstatSync(marker, { throwIfNoEntry: false }))).toBe(
-        boundary !== "dispatching",
+        boundary === "running" || boundary === "returned",
       );
       reopen();
       expect(store.recover().ambiguousOperations).toBe(1);
-      expect(store.agentOperations().get(fixture.request.operationId)?.status).toBe("unknown");
+      const operation = store.agentOperations().get(fixture.request.operationId);
+      expect(operation?.status).toBe("unknown");
+      if (boundary === "checkout") {
+        const locator = operation?.evidence?.expectedWorktree;
+        expect(locator).toMatchObject({
+          branch: fixture.request.branch,
+          workflowId: fixture.workflow.id,
+        });
+        expect(operation?.evidence?.worktree).toBeUndefined();
+        expect(lstatSync(locator!.path).isDirectory()).toBe(true);
+        expect(git(locator!.path, "rev-parse", "HEAD")).toBe(fixture.workflow.headSha);
+      }
       expect(store.agentOperations().session(fixture.workflow.id)?.status).toBe("held");
       expect(store.getWorkflow(fixture.workflow.id)?.state).toBe("escalated");
       expect(store.recover().ambiguousOperations).toBe(0);

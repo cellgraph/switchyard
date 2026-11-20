@@ -73,6 +73,7 @@ const migrations = [
   CREATE INDEX agent_operations_by_workflow ON operations(workflow_id, status) WHERE kind='durable_agent_turn';
   CREATE UNIQUE INDEX one_unresolved_agent_operation ON operations(workflow_id)
     WHERE kind='durable_agent_turn' AND status IN ('requested','dispatching','running','unknown','interrupted','manual_reconciliation');`,
+  "ALTER TABLE operations ADD COLUMN owner_pid INTEGER;",
 ];
 
 export class WorkflowStore {

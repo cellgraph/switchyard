@@ -10,12 +10,38 @@ import {
   statSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, isAbsolute, join } from "node:path";
-import type { AgentRuntime } from "./agent-operation.ts";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import type { AgentRuntime, AgentSessionCheckpoint } from "./agent-operation.ts";
 import { codexConfig, codexEnvironment, codexTurnPolicy } from "./codex-agent.ts";
 
 const sdkModule = import.meta.resolve("@openai/codex-sdk");
 const requireFromSdk = createRequire(sdkModule);
+
+export function codexConfigFingerprint(home: string, systemDirectory = "/etc/codex"): string {
+  const profiles = readdirSync(home)
+    .filter((name) => name.endsWith(".config.toml"))
+    .sort();
+  const sources = [
+    ...["config.toml", "requirements.toml", "managed_config.toml"].map((name) =>
+      join(systemDirectory, name),
+    ),
+    ...["config.toml", ...profiles].map((name) => join(home, name)),
+  ];
+  const hash = createHash("sha256");
+  for (const path of sources) {
+    const stat = statSync(path, { throwIfNoEntry: false });
+    if (stat && (!stat.isFile() || stat.size > 1024 * 1024))
+      throw new Error("Codex configuration is not a supported regular file.");
+    hash.update(
+      JSON.stringify([
+        path,
+        stat ? createHash("sha256").update(readFileSync(path)).digest("hex") : null,
+      ]),
+    );
+  }
+  return hash.digest("hex");
+}
 
 export function codexRuntime(model: string, homePath: string, apiKey?: string): AgentRuntime {
   if (!model.trim()) throw new Error("A Codex model must be configured.");
@@ -35,7 +61,7 @@ export function codexRuntime(model: string, homePath: string, apiKey?: string): 
   const env = codexEnvironment(home);
   function cliCommand(...args: string[]): string {
     return execFileSync(process.execPath, [cli, ...args], {
-      env,
+      env: apiKey ? { ...env, CODEX_API_KEY: apiKey } : env,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 10_000,
@@ -44,7 +70,8 @@ export function codexRuntime(model: string, homePath: string, apiKey?: string): 
   let cliVersion: string;
   try {
     cliVersion = cliCommand("--version");
-    if (cliVersion !== `codex-cli ${sdkVersion}`) throw new Error("Unexpected CLI version.");
+    if (sdkVersion !== "0.171.0" || cliVersion !== `codex-cli ${sdkVersion}`)
+      throw new Error("Unexpected CLI version.");
   } catch {
     throw new Error("The bundled Codex CLI is unavailable or incompatible with the SDK.");
   }
@@ -55,11 +82,36 @@ export function codexRuntime(model: string, homePath: string, apiKey?: string): 
       throw new Error("Codex credentials are missing or inaccessible.");
     }
   }
-  const config = join(home, "config.toml");
+  let requirements: unknown;
+  try {
+    const startup = JSON.parse(
+      cliCommand(
+        "app-server",
+        "--print-startup-config",
+        "-c",
+        `sqlite_home=${JSON.stringify(home)}`,
+      ),
+    ) as {
+      appServerVersion?: string;
+      configRequirements?: { requirements?: { sqliteHome?: unknown } | null };
+    };
+    if (
+      startup.appServerVersion !== sdkVersion ||
+      startup.configRequirements?.requirements === undefined
+    )
+      throw new Error("Unknown startup config format.");
+    requirements = startup.configRequirements.requirements;
+    // Managed SQLite requirements override even CLI configuration.
+    if (startup.configRequirements.requirements?.sqliteHome != null)
+      throw new Error("Managed Codex SQLite location.");
+  } catch {
+    throw new Error("Could not verify Codex startup requirements and SQLite location.");
+  }
   const configuration = createHash("sha256")
     .update(
       JSON.stringify([
         codexConfig,
+        requirements,
         codexTurnPolicy,
         env,
         apiKey ? "api-key" : "profile",
@@ -68,7 +120,7 @@ export function codexRuntime(model: string, homePath: string, apiKey?: string): 
         String(stat.birthtimeNs),
       ]),
     )
-    .update(lstatSync(config, { throwIfNoEntry: false }) ? readFileSync(config) : "")
+    .update(codexConfigFingerprint(home))
     .digest("hex");
   return { provider: "codex", model, sdkVersion, cliVersion, home, configuration };
 }
@@ -77,31 +129,36 @@ export function codexSessionCheckpoint(
   home: string,
   threadId: string,
   workingDirectory: string,
-): string {
-  // The pinned CLI's rollout directory is the local resume source. A different layout
-  // requires a compatibility update before Switchyard can authorize continuation.
+): AgentSessionCheckpoint {
   if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(threadId))
     throw new Error("Codex did not report a supported session ID.");
-  const sessions = join(home, "sessions");
-  const matches: string[] = [];
-  function inspect(directory: string, depth: number): void {
-    if (!lstatSync(directory, { throwIfNoEntry: false })?.isDirectory()) return;
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      const path = join(directory, entry.name);
-      if (depth && entry.isDirectory() && /^\d{2,4}$/.test(entry.name)) inspect(path, depth - 1);
-      if (
-        !depth &&
-        entry.isFile() &&
-        entry.name.startsWith("rollout-") &&
-        entry.name.endsWith(`-${threadId}.jsonl`)
-      )
-        matches.push(path);
-    }
-  }
   try {
-    inspect(sessions, 3);
-    const path = matches[0];
-    if (matches.length !== 1 || !path) throw new Error("Missing or duplicate rollout.");
+    // Codex 0.171.0 prefers SQLite's selected path to a filesystem scan.
+    // Require that selection even for legacy threads, where Codex can fall back.
+    const statePath = join(home, "state_5.sqlite");
+    if (!lstatSync(statePath).isFile()) throw new Error("Codex state database is unavailable.");
+    const state = new DatabaseSync(statePath, { readOnly: true, timeout: 5_000 });
+    let selected: { rollout_path: string; archived: number } | undefined;
+    try {
+      selected = state
+        .prepare("SELECT rollout_path, archived FROM threads WHERE id=?")
+        .get(threadId) as typeof selected;
+    } finally {
+      state.close();
+    }
+    const path = selected?.rollout_path;
+    if (!path || selected?.archived !== 0 || !isAbsolute(path) || realpathSync(path) !== path)
+      throw new Error("Codex did not select an active rollout.");
+    const parts = relative(join(home, "sessions"), path).split(sep);
+    if (
+      parts.length !== 4 ||
+      !/^\d{4}$/.test(parts[0]!) ||
+      !/^\d{2}$/.test(parts[1]!) ||
+      !/^\d{2}$/.test(parts[2]!) ||
+      !parts[3]!.startsWith("rollout-") ||
+      !parts[3]!.endsWith(`-${threadId}.jsonl`)
+    )
+      throw new Error("Unsupported Codex rollout path.");
     const stat = lstatSync(path, { bigint: true });
     if (!stat.isFile() || stat.size > 64n * 1024n * 1024n) throw new Error("Unsupported rollout.");
     const contents = readFileSync(path);
@@ -117,10 +174,15 @@ export function codexSessionCheckpoint(
       meta.payload.cwd !== workingDirectory
     )
       throw new Error("Rollout identity differs.");
-    return createHash("sha256")
-      .update(JSON.stringify([path, String(stat.dev), String(stat.ino), String(stat.birthtimeNs)]))
-      .update(contents)
-      .digest("hex");
+    return {
+      identity: JSON.stringify([
+        path,
+        String(stat.dev),
+        String(stat.ino),
+        String(stat.birthtimeNs),
+      ]),
+      digest: createHash("sha256").update(contents).digest("hex"),
+    };
   } catch {
     throw new Error("Codex session is missing, inaccessible, or incompatible with this checkout.");
   }

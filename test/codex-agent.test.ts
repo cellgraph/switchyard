@@ -146,6 +146,26 @@ describe("Codex SDK adapter", () => {
     expect(sdk.runStreamed).not.toHaveBeenCalledWith("skip", expect.anything());
   });
 
+  it.each([false, true])(
+    "keeps a diagnostic followed by stream loss uncertain (cancelled: %s)",
+    async (cancelled) => {
+      const session = createCodexAgent(settings).startSession(workspace);
+      const controller = new AbortController();
+      const diagnostic = { type: "error", message: "permission denied" } as const;
+      stream([{ type: "turn.started" }, diagnostic], new Error("lost stream"));
+      const onEvent = vi.fn((event) => {
+        if (cancelled && event.data === diagnostic) controller.abort();
+      });
+      const result = await session.runTurn({ prompt: "test", signal: controller.signal, onEvent });
+      expect(result.outcome).toBe(cancelled ? "interrupted" : "unknown");
+      expect(onEvent).toHaveBeenCalledWith({
+        kind: "progress",
+        provider: "codex",
+        data: diagnostic,
+      });
+    },
+  );
+
   it("reports invalid structured output and startup errors", async () => {
     const session = createCodexAgent(settings).startSession(workspace);
     stream([{ type: "thread.started", thread_id: "opaque" }, completed]);

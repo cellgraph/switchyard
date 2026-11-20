@@ -25,6 +25,7 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
     target: WorktreeTarget,
     previous?: WorkerSessionReference,
     requireNew = false,
+    beforeLaunch?: () => void,
   ) {
     const worktree = worktrees.open(target, requireNew ? "new" : previous === undefined);
     assertAvailable(worktree.path);
@@ -40,16 +41,16 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
       throw new Error("Session belongs to a different linked checkout.");
 
     const workspace = { workingDirectory: worktree.path };
-    const session = previous
-      ? agent.resumeSession(workspace, previous.agent)
-      : agent.startSession(workspace);
+    const openAgentSession = () =>
+      previous ? agent.resumeSession(workspace, previous.agent) : agent.startSession(workspace);
+    let session = beforeLaunch ? undefined : openAgentSession();
     let needsCleanStart = previous === undefined;
 
     return {
       worktree,
       get reference(): WorkerSessionReference | null {
-        const reference = session.reference;
-        return reference && { worktree: { ...worktree }, agent: reference };
+        const reference = session?.reference;
+        return reference ? { worktree: { ...worktree }, agent: reference } : null;
       },
       async runTurn(expectedHead: string, turn: AgentTurn): Promise<WorkerTurnResult> {
         assertAvailable(worktree.path);
@@ -62,6 +63,8 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
             workspace: before,
           };
 
+        beforeLaunch?.();
+        session ??= openAgentSession();
         active.add(worktree.path);
         try {
           let result: AgentTurnResult;
@@ -96,9 +99,12 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
   }
 
   return {
-    startSession: (target: WorktreeTarget, requireNew = false) =>
-      openSession(target, undefined, requireNew),
-    resumeSession: (target: WorktreeTarget, reference: WorkerSessionReference) =>
-      openSession(target, reference),
+    startSession: (target: WorktreeTarget, requireNew = false, beforeLaunch?: () => void) =>
+      openSession(target, undefined, requireNew, beforeLaunch),
+    resumeSession: (
+      target: WorktreeTarget,
+      reference: WorkerSessionReference,
+      beforeLaunch?: () => void,
+    ) => openSession(target, reference, false, beforeLaunch),
   };
 }

@@ -39,20 +39,37 @@ function eligible(workflow: Workflow | null, intent: AgentTurnIntent): boolean {
 
 export function recoverAgentOperations(db: DatabaseSync): number {
   const now = new Date().toISOString();
-  db.prepare(
+  const claims = db
+    .prepare(
+      `SELECT operation_id, workflow_id, owner_pid FROM operations
+     WHERE kind='durable_agent_turn' AND status IN ('dispatching','running')`,
+    )
+    .all() as { operation_id: string; workflow_id: string; owner_pid: number | null }[];
+  const holdSession = db.prepare(
     `UPDATE agent_sessions SET execution=json_set(execution, '$.status', 'held', '$.updatedAt', ?)
-     WHERE execution IS NOT NULL AND workflow_id IN (
-       SELECT workflow_id FROM operations WHERE kind='durable_agent_turn' AND status IN ('dispatching','running')
-     )`,
-  ).run(now);
-  return Number(
-    db
-      .prepare(
-        `UPDATE operations SET status='unknown', error='Process restarted without a recorded agent outcome.',
-       updated_at=? WHERE kind='durable_agent_turn' AND status IN ('dispatching','running')`,
-      )
-      .run(now).changes,
+     WHERE workflow_id=? AND execution IS NOT NULL`,
   );
+  const markUnknown = db.prepare(
+    `UPDATE operations SET status='unknown', error='Agent owner exited without a recorded outcome.',
+     updated_at=? WHERE operation_id=?`,
+  );
+  let recovered = 0;
+  for (const claim of claims) {
+    // A reused PID or missing ownership evidence is ambiguous. Only ESRCH proves
+    // there is no local process left that could still commit the outcome.
+    if (!claim.owner_pid || claim.owner_pid < 1) continue;
+    try {
+      process.kill(claim.owner_pid, 0);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EPERM") continue;
+      if (code !== "ESRCH") throw error;
+      holdSession.run(now, claim.workflow_id);
+      markUnknown.run(now, claim.operation_id);
+      recovered++;
+    }
+  }
+  return recovered;
 }
 
 export function createAgentOperationStore(
@@ -258,6 +275,7 @@ export function createAgentOperationStore(
         assertNoLegacyOperation(intent.workflowId);
         const previous = session(intent.workflowId);
         if (!setStatus(id, "requested", "dispatching", null)) return null;
+        db.prepare("UPDATE operations SET owner_pid=? WHERE operation_id=?").run(process.pid, id);
         if (!previous) {
           const now = new Date().toISOString();
           saveSession(intent.workflowId, {
@@ -288,7 +306,29 @@ export function createAgentOperationStore(
       });
     },
 
-    progress(id: string, evidence: Pick<AgentTurnEvidence, "reference" | "worktree">): void {
+    authorizeLaunch(id: string): void {
+      transaction(() => {
+        const operation = get(id);
+        if (
+          operation?.status !== "running" ||
+          operation.evidence?.launchAuthorizedAt ||
+          !authorized(getWorkflow(operation.intent.workflowId), operation.intent)
+        )
+          throw new Error("Workflow authorization changed before the agent launched.");
+        if (
+          !setStatus(id, "running", "running", {
+            ...operation.evidence,
+            launchAuthorizedAt: new Date().toISOString(),
+          })
+        )
+          throw new Error("Agent operation lost its dispatch authorization.");
+      });
+    },
+
+    progress(
+      id: string,
+      evidence: Pick<AgentTurnEvidence, "reference" | "worktree" | "expectedWorktree">,
+    ): void {
       transaction(() => {
         const current = get(id);
         if (
@@ -331,7 +371,8 @@ export function createAgentOperationStore(
             ? "Agent did not return the session and checkout evidence needed for continuation."
             : undefined);
         const outcome = evidence.agent?.outcome;
-        const confirmed = current.status === "running" && outcome === "completed" && !error;
+        const confirmed =
+          Boolean(current.evidence?.launchAuthorizedAt) && outcome === "completed" && !error;
         let status: AgentOperationStatus = "manual_reconciliation";
         if (confirmed || outcome === "failed") status = "completed";
         if (outcome === "interrupted" || outcome === "unknown") status = outcome;

@@ -9,7 +9,6 @@ const eventKinds: Partial<Record<ThreadEvent["type"], AgentEvent["kind"]>> = {
   "turn.started": "turn_started",
   "turn.completed": "turn_completed",
   "turn.failed": "turn_failed",
-  error: "turn_failed",
 };
 
 export const codexTurnPolicy = {
@@ -62,7 +61,7 @@ export function createCodexAgent({
   const codex = new Codex({
     env,
     ...(apiKey === undefined ? {} : { apiKey }),
-    config: codexConfig,
+    config: { ...codexConfig, sqlite_home: codexHome },
   });
 
   function open({ workingDirectory }: AgentWorkspace, id?: string): AgentSession {
@@ -84,6 +83,7 @@ export function createCodexAgent({
         let completed = false;
         let failure: string | undefined;
         let sessionConfirmed = false;
+        let receivedEvent = false;
         let response = "";
         try {
           const { events } = await thread.runStreamed(prompt, {
@@ -91,6 +91,7 @@ export function createCodexAgent({
             ...(outputSchema === undefined ? {} : { outputSchema }),
           });
           for await (const event of events) {
+            receivedEvent = true;
             if (event.type === "thread.started") {
               if (reference !== null && event.thread_id !== reference)
                 return { outcome: "unknown", reason: "Codex reported a different session." };
@@ -101,7 +102,6 @@ export function createCodexAgent({
               response = event.item.text;
             if (event.type === "turn.completed") completed = true;
             if (event.type === "turn.failed") failure = codexFailure(event.error.message);
-            if (event.type === "error") failure = codexFailure(event.message);
             onEvent?.({ provider, kind: eventKinds[event.type] ?? "progress", data: event });
           }
         } catch (error) {
@@ -110,7 +110,7 @@ export function createCodexAgent({
             return { outcome: "interrupted", reason: "Codex execution was canceled." };
           // The SDK can include stderr and raw model output in exceptions.
           const code = (error as NodeJS.ErrnoException | null)?.code;
-          if (!reference && (code === "ENOENT" || code === "EACCES" || code === "EPERM"))
+          if (!receivedEvent && (code === "ENOENT" || code === "EACCES" || code === "EPERM"))
             return { outcome: "failed", reason: `Could not launch Codex (${code}).` };
           return { outcome: "unknown", reason: "The Codex event stream ended with an error." };
         }
