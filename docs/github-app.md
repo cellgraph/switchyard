@@ -65,4 +65,19 @@ After installing the pinned dependencies, run `npm test` without App credentials
 
 All six repository read endpoints were exercised on Switchyard PR #6 with existing `gh` credentials. App token issuance, the App's actual repository grants, and GitHub-to-receiver delivery still require live verification with an installed App. To verify an installation, run a manual refresh for a known open PR and inspect the workflow and check evidence in SQLite. For webhook verification, redeliver a GitHub event, confirm the delivery shows `202` in GitHub, and confirm the same delivery ID has one processed inbox row.
 
+The Phase 3A smoke test used the local fixtures to verify RS256 App JWT signing, repository-scoped token requests, token replacement and refresh, signed webhook receipts, deduplication, and reconciliation. It also ran the documented `--once` entry point and confirmed missing App credentials fail before SQLite is opened. No App client ID, private-key path, or installation configuration was available for the run.
+
+To finish the live polling check, use an App installed on the intended repository with the read grants above. Use a config containing that installation's numeric ID and a known open PR with check activity. Supply the App client ID and PEM path and run the following with an unused SQLite path in a private directory.
+
+```sh
+SWITCHYARD_DB_PATH=/private/path/app-smoke.sqlite npm start -- --once /private/path/switchyard.json
+sqlite3 -readonly /private/path/app-smoke.sqlite \
+  'SELECT repository, pull_request, state, head_sha FROM workflows;'
+sqlite3 -readonly /private/path/app-smoke.sqlite \
+  'SELECT c.name, c.sha, c.outcome FROM check_snapshots AS c
+   JOIN workflows AS w ON c.workflow_id = w.id AND c.sha = w.head_sha;'
+```
+
+Confirm the command exits successfully and the workflow matches the configured repository, PR, and current GitHub head SHA. Compare the recorded check evidence with the selected PR at that SHA. If the command reports a cooldown or a head change during the read, retry once the deadline passes. The polling check requires no webhook secret or tunnel. Any live delivery check is optional for local development.
+
 On November 19, 2026, `gh api repos/cellgraph/switchyard/rules/branches/main` showed an active ruleset requiring pull requests and signed commits and blocking deletions and non-fast-forward updates. The rules response listed no required status check or approving review count. Phase 2 requires no rules changes.

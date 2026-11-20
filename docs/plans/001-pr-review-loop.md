@@ -52,6 +52,10 @@ Implement the first Switchyard workflow from a Codex implementation session with
 4. Resume a saved thread after restarting the controller and route it back to the same worktree. If session files are gone or path/context mismatch, escalate.
 5. Capture structured turn events, final response, exit/failure status, and changed files without treating agent text as authoritative workflow state.
 
+Phase 3A implements the agent adapter, Git worktree checks, and local worker composition from items 1, 3, and 5. It covers in-process start and resume, turn evidence, and failure handling without connecting agent execution to the controller polling loop.
+
+Phase 3B will persist session and worktree identity and operation intent/outcome, verify resume from a fresh process, and reconcile missing sessions, interrupted turns, and ambiguous operations before allowing further execution.
+
 ### Acceptance criteria
 
 - An SDK thread starts in a dedicated worktree and a follow-up turn edits only that worktree.
