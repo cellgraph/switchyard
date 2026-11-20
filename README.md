@@ -19,7 +19,7 @@ No review comments is not evidence of a completed clean review. A new head commi
 
 ## Status
 
-This repository is at project initialization. See [CONTEXT.md](CONTEXT.md), [the architecture](docs/architecture.md), [ADR-0001](docs/adr/0001-local-controller-and-agent-boundary.md), and [implementation plan 001](docs/plans/001-pr-review-loop.md) for the current decisions and next steps.
+The local workflow store and GitHub App integration are implemented. See [CONTEXT.md](CONTEXT.md), [the architecture](docs/architecture.md), [ADR-0001](docs/adr/0001-local-controller-and-agent-boundary.md), and [implementation plan 001](docs/plans/001-pr-review-loop.md) for the current decisions and next steps.
 
 ## Development environment
 
@@ -27,11 +27,11 @@ This repository is at project initialization. See [CONTEXT.md](CONTEXT.md), [the
 - npm, pinned by `packageManager` in `package.json`; commit `package-lock.json` when dependencies are first installed.
 - TypeScript with strict checking.
 
-Install dependencies with `npm install`. Run `npm run format:check`, `npm run lint`, `npm run typecheck`, and `npm test`. `npm run format` applies formatting. The commands are wired into CI; implementation tests will be added with the first code milestone.
+Install dependencies with `npm ci`. Run `npm run format:check`, `npm run lint`, `npm run typecheck`, and `npm test`. `npm run format` applies formatting. CI runs the same commands. The webhook and REST fixtures run offline.
 
 ## GitHub setup
 
-The first milestone will need a GitHub App installation with narrowly scoped repository access, webhook configuration, and a reachable webhook URL for live delivery. Enable automatic Codex code review for the repository in Codex's GitHub settings. See [the architecture](docs/architecture.md#github-integration) and [plan 001](docs/plans/001-pr-review-loop.md#phase-2-github-app-and-webhook-inbox) for the proposed permissions and local setup. Configure a ruleset for `main` that requires pull requests and the `Quality checks` CI status. The Codex review summary currently appears as a PR comment; GitHub cannot require that comment as a status check. Do not require owner approval for every PR.
+See the [GitHub App setup guide](docs/github-app.md) for the permissions, webhook subscriptions, and commands for polling or live delivery. Enable automatic Codex code review in Codex's GitHub settings for independent implementation review.
 
 ## Contributing
 

@@ -31,17 +31,19 @@ export type Workflow = {
   cycleAwaitingReview: boolean;
   validationHeadSha: string | null;
   escalationReason: string | null;
+  closedByGitHub?: true;
 };
 
 export type WorkflowCommand =
   | { type: "head_changed"; sha: string }
+  | { type: "github_pull_request"; sha: string; state: "open" | "closed" }
   | { type: "review_started" }
   | { type: "review_received"; evidence: ReviewEvidence }
   | { type: "checks_received"; evidence: CheckEvidence[]; configuredNames: string[] | null }
   | { type: "fix_started" }
   | { type: "validation_started" }
   | { type: "cycle_finished"; outcome: CycleOutcome }
-  | { type: "escalate"; reason: string }
+  | { type: "escalate"; reason: string; observedHeadSha?: string }
   | { type: "stop"; reason: string };
 
 export type Transition = {
@@ -64,20 +66,41 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
   const from = current.state;
   const reason = transitionReason(command, current.headSha);
 
-  if (current.state === "stopped" || current.state === "escalated") {
+  const mayChangeGitHubClosure =
+    current.closedByGitHub === true &&
+    (command.type === "github_pull_request" ||
+      command.type === "escalate" ||
+      command.type === "stop");
+  if ((current.state === "stopped" && !mayChangeGitHubClosure) || current.state === "escalated") {
     throw new InvalidTransitionError(
       `Cannot transition a ${current.state} workflow without a future explicit recovery action.`,
     );
   }
 
   switch (command.type) {
+    case "github_pull_request":
+      if (!command.sha)
+        throw new InvalidTransitionError("A GitHub pull request requires a head SHA.");
+      if (command.sha !== current.headSha) setHead(next, command.sha);
+      if (command.state === "closed" || current.closedByGitHub) {
+        next.review = null;
+        next.checks = [];
+        if (command.state === "closed") {
+          next.state = "stopped";
+          next.closedByGitHub = true;
+          next.validationHeadSha = null;
+          next.escalationReason = "GitHub pull request is closed.";
+        } else {
+          next.state = "awaiting_review";
+          next.escalationReason = null;
+          delete next.closedByGitHub;
+        }
+      }
+      break;
     case "head_changed":
       if (!command.sha || command.sha === current.headSha)
         throw new InvalidTransitionError("A head change requires a new non-empty SHA.");
-      next.headSha = command.sha;
-      next.review = null;
-      next.checks = [];
-      next.state = current.state === "validating" ? "validating" : "awaiting_review";
+      setHead(next, command.sha);
       break;
     case "review_started":
       requireState(current, ["awaiting_review"]);
@@ -195,13 +218,20 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
     case "escalate":
       if (!command.reason.trim())
         throw new InvalidTransitionError("An escalation requires a reason.");
+      if (command.observedHeadSha !== undefined) {
+        if (!command.observedHeadSha)
+          throw new InvalidTransitionError("An observed head SHA cannot be empty.");
+        if (command.observedHeadSha !== current.headSha) setHead(next, command.observedHeadSha);
+      }
       next.state = "escalated";
       next.escalationReason = command.reason;
+      delete next.closedByGitHub;
       break;
     case "stop":
       if (!command.reason.trim()) throw new InvalidTransitionError("Stopping requires a reason.");
       next.state = "stopped";
       next.escalationReason = command.reason;
+      delete next.closedByGitHub;
       break;
   }
   if (next.state === "ready_for_human" && !isReady(next))
@@ -234,10 +264,19 @@ function requireState(workflow: Workflow, allowed: WorkflowState[]): void {
     );
 }
 
+function setHead(workflow: Workflow, sha: string): void {
+  workflow.headSha = sha;
+  workflow.review = null;
+  workflow.checks = [];
+  if (workflow.state !== "validating") workflow.state = "awaiting_review";
+}
+
 function transitionReason(command: WorkflowCommand, headSha: string): string {
   switch (command.type) {
     case "head_changed":
       return `head_changed to ${command.sha}`;
+    case "github_pull_request":
+      return `github_pull_request ${command.state} at ${command.sha}`;
     case "review_received":
       return `review_received: ${command.evidence.outcome} for ${command.evidence.sha}`;
     case "checks_received":
