@@ -193,17 +193,19 @@ describe("isolated worktrees and the local worker", () => {
     expect(readFileSync(join(moved, "original-only.txt"), "utf8")).toBe("keep these edits");
   });
 
-  it("refuses clean-start and change evidence when the index can hide tracked edits", () => {
+  it.each([
+    { flag: "assume-unchanged", tag: "h" },
+    { flag: "skip-worktree", tag: "S" },
+  ])("rejects $flag entries before trusting Git status", ({ flag, tag }) => {
     const worktree = worktrees.open(target, true);
-    git(path, "config", "core.ignoreStat", "true");
-    git(path, "update-index", "--assume-unchanged", "tracked.txt");
+    git(path, "update-index", `--${flag}`, "tracked.txt");
     writeFileSync(join(path, "tracked.txt"), "hidden modification");
     expect(git(path, "status", "--porcelain")).toBe("");
 
-    expect(() => worktrees.open(target, true)).toThrow("assume-unchanged");
-    expect(() => worktrees.validate(worktree, target.expectedHead)).toThrow("assume-unchanged");
-    expect(() => worktrees.observe(worktree, target.expectedHead)).toThrow("assume-unchanged");
-    expect(git(path, "ls-files", "-v", "tracked.txt")).toBe("h tracked.txt");
+    expect(() => worktrees.open(target, true)).toThrow(flag);
+    expect(() => worktrees.validate(worktree, target.expectedHead)).toThrow(flag);
+    expect(() => worktrees.observe(worktree, target.expectedHead)).toThrow(flag);
+    expect(git(path, "ls-files", "-v", "tracked.txt")).toBe(`${tag} tracked.txt`);
     expect(readFileSync(join(path, "tracked.txt"), "utf8")).toBe("hidden modification");
   });
 

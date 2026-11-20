@@ -85,8 +85,10 @@ function checkOperations(gitDir: string): void {
 }
 
 function changedPaths(path: string): string[] {
-  // Git status can hide working tree edits to entries marked assume-unchanged.
+  // Git status can omit changes to files with either of these index flags.
   const entries = git(path, "ls-files", "-v", "-z");
+  if (/(?:^|\0)[Ss] /.test(entries))
+    throw new Error("Workflow worktree has skip-worktree index entries.");
   if (/(?:^|\0)[a-z] /.test(entries))
     throw new Error("Workflow worktree has assume-unchanged index entries.");
   const status = git(
