@@ -37,7 +37,7 @@ function eligible(workflow: Workflow | null, intent: AgentTurnIntent): boolean {
   );
 }
 
-export function recoverAgentOperations(db: DatabaseSync): string[] {
+export function recoverAgentOperations(db: DatabaseSync) {
   const now = new Date().toISOString();
   const claims = db
     .prepare(
@@ -54,10 +54,14 @@ export function recoverAgentOperations(db: DatabaseSync): string[] {
      updated_at=? WHERE operation_id=?`,
   );
   const recovered: string[] = [];
+  const unverified: string[] = [];
   for (const claim of claims) {
     // A reused PID or missing ownership evidence is ambiguous. Only ESRCH proves
     // there is no local process left that could still commit the outcome.
-    if (!claim.owner_pid || claim.owner_pid < 1) continue;
+    if (!claim.owner_pid || claim.owner_pid < 1) {
+      unverified.push(claim.operation_id);
+      continue;
+    }
     try {
       process.kill(claim.owner_pid, 0);
     } catch (error) {
@@ -69,7 +73,7 @@ export function recoverAgentOperations(db: DatabaseSync): string[] {
       recovered.push(claim.workflow_id);
     }
   }
-  return recovered;
+  return { recovered, unverified };
 }
 
 export function createAgentOperationStore(

@@ -115,6 +115,48 @@ describe("durable agent controller", () => {
     reader.close();
   });
 
+  it("reports pre-ownership claims for inspection and preserves their unresolved state", () => {
+    const controller = createAgentController(store, requests);
+    const { operationId } = controller.request(fixture.request).intent;
+    store.agentOperations().claim(operationId);
+    store.agentOperations().start(operationId, runtime);
+    const db = new DatabaseSync(fixture.db);
+    try {
+      db.prepare("UPDATE operations SET owner_pid=NULL WHERE operation_id=?").run(operationId);
+    } finally {
+      db.close();
+    }
+    reopen();
+    expect(store.recover()).toEqual({
+      deliveries: 0,
+      ambiguousOperations: 0,
+      unverifiedAgentOperations: [operationId],
+    });
+    expect(store.agentOperations().get(operationId)?.status).toBe("running");
+    expect(() => createAgentController(store, requests).request(followUp())).toThrow(
+      "unresolved agent operation",
+    );
+    expect(startSession).not.toHaveBeenCalled();
+  });
+
+  it("holds a preview session with a checkpoint that predates verified rollout selection", async () => {
+    await start();
+    const db = new DatabaseSync(fixture.db);
+    try {
+      db.prepare(
+        "UPDATE agent_sessions SET execution=json_set(execution, '$.checkpoint.session', 'legacy-digest') WHERE workflow_id=?",
+      ).run(fixture.workflow.id);
+    } finally {
+      db.close();
+    }
+    reopen();
+    expect(await createAgentController(store, requests).runTurn(followUp())).toMatchObject({
+      status: "manual_reconciliation",
+      error: "The saved checkpoint predates verified rollout selection and requires inspection.",
+    });
+    expect(resumeSession).not.toHaveBeenCalled();
+  });
+
   it("leaves an undispatched request retryable across restart and fails closed on a conflicting request", async () => {
     const controller = createAgentController(store, requests);
     expect(controller.request(fixture.request).status).toBe("requested");

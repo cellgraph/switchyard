@@ -56,8 +56,12 @@ export function createAgentController(store: WorkflowStore, worker: AgentOperati
 
       let evidence: AgentTurnEvidence;
       try {
-        const runtime = worker.runtime();
         const { previous } = claim;
+        if (typeof previous?.checkpoint?.session === "string")
+          throw new Error(
+            "The saved checkpoint predates verified rollout selection and requires inspection.",
+          );
+        const runtime = worker.runtime();
         if (
           previous &&
           (previous.status !== "active" ||

@@ -417,20 +417,24 @@ export class WorkflowStore {
       throw new Error(`Operation ${operationId} is missing or no longer pending.`);
   }
 
-  recover(): { deliveries: number; ambiguousOperations: number } {
+  recover(): {
+    deliveries: number;
+    ambiguousOperations: number;
+    unverifiedAgentOperations?: string[];
+  } {
     return this.#transaction(() => {
       const deliveries = Number(
         this.#db.prepare("UPDATE deliveries SET status='pending' WHERE status='processing'").run()
           .changes,
       );
-      const ambiguousOperations =
-        Number(
-          this.#db
-            .prepare(
-              "UPDATE operations SET status='ambiguous', error='Process restarted before outcome was recorded.', updated_at=? WHERE status='pending'",
-            )
-            .run(new Date().toISOString()).changes,
-        ) + recoverAgentOperations(this.#db).length;
+      const ambiguousLegacyOperations = Number(
+        this.#db
+          .prepare(
+            "UPDATE operations SET status='ambiguous', error='Process restarted before outcome was recorded.', updated_at=? WHERE status='pending'",
+          )
+          .run(new Date().toISOString()).changes,
+      );
+      const { recovered, unverified } = recoverAgentOperations(this.#db);
       const affected = this.#db
         .prepare(
           "SELECT DISTINCT workflow_id FROM operations WHERE status IN ('ambiguous','unknown')",
@@ -440,18 +444,22 @@ export class WorkflowStore {
         affected.map(({ workflow_id }) => workflow_id),
         "An external operation has an ambiguous outcome after restart.",
       );
-      return { deliveries, ambiguousOperations };
+      return {
+        deliveries,
+        ambiguousOperations: ambiguousLegacyOperations + recovered.length,
+        ...(unverified.length ? { unverifiedAgentOperations: unverified } : {}),
+      };
     });
   }
 
   recoverAgentClaims(): number {
     return this.#transaction(() => {
-      const affected = recoverAgentOperations(this.#db);
+      const { recovered } = recoverAgentOperations(this.#db);
       this.#escalateAmbiguousWorkflows(
-        affected,
+        recovered,
         "An agent owner exited without a recorded outcome.",
       );
-      return affected.length;
+      return recovered.length;
     });
   }
 

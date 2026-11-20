@@ -106,7 +106,11 @@ async function main(): Promise<void> {
       }),
     );
     const recovered = store.recover();
-    if (recovered.deliveries || recovered.ambiguousOperations)
+    if (
+      recovered.deliveries ||
+      recovered.ambiguousOperations ||
+      recovered.unverifiedAgentOperations
+    )
       console.info(`Recovered SQLite state ${JSON.stringify(recovered)}`);
     const controller = createController({
       ...config,
