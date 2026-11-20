@@ -105,6 +105,8 @@ export function createController({
   }
 
   async function pass(): Promise<boolean> {
+    const abandoned = store.recoverAgentClaims();
+    if (abandoned) reportError(`Recovered ${abandoned} agent operation(s) with unknown outcomes.`);
     retireInactiveGitHubRetry(rateLimits, isRetryOwnerActive);
     const observations = new Map<PullRequestTarget, Promise<void>>();
     async function reconcileTargets(selected: PullRequestTarget[]) {

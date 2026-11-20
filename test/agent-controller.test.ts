@@ -1,4 +1,5 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { lstatSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -7,6 +8,7 @@ import type { AgentAdapter, AgentSession } from "../src/agent.ts";
 import { createAgentController } from "../src/agent-controller.ts";
 import type { AgentOperationWorker, AgentSessionCheckpoint } from "../src/agent-operation.ts";
 import { codexConfigFingerprint, codexSessionCheckpoint } from "../src/codex-runtime.ts";
+import { createController } from "../src/controller.ts";
 import { createLocalAgentExecution } from "../src/local-agent-execution.ts";
 import { WorkflowStore } from "../src/store.ts";
 import { createWorktreeManager } from "../src/worktree.ts";
@@ -180,6 +182,65 @@ describe("durable agent controller", () => {
       expect(runTurn).toHaveBeenCalledTimes(1);
     } finally {
       secondStore.close();
+    }
+  });
+
+  it("recovers an owner that exits after the poller starts without resetting the webhook inbox", async () => {
+    const script = `
+      import { WorkflowStore } from "./src/store.ts";
+      const [db, intent, runtime] = process.argv.slice(1);
+      const operations = new WorkflowStore(db).agentOperations();
+      const { operationId } = operations.request(JSON.parse(intent)).intent;
+      operations.claim(operationId);
+      operations.start(operationId, JSON.parse(runtime));
+      process.send("ready");
+      setInterval(() => {}, 1000);
+    `;
+    const request = fixture.request;
+    const child = spawn(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        script,
+        fixture.db,
+        JSON.stringify({
+          ...request,
+          configurationId: "fixture-config",
+          promptDigest: "fixture-digest",
+        }),
+        JSON.stringify(runtime),
+      ],
+      { stdio: ["ignore", "ignore", "inherit", "ipc"] },
+    );
+    const exited = once(child, "exit");
+    const reportError = vi.fn();
+    const poller = createController({
+      store,
+      targets: [],
+      reconcile: vi.fn(),
+      reportError,
+      reconcileIntervalMs: 0,
+    });
+    try {
+      const [message] = await Promise.race([once(child, "message"), exited]);
+      expect(message).toBe("ready");
+      expect(store.recover().ambiguousOperations).toBe(0);
+      expect(await poller.runPass()).toBe(true);
+      expect(store.agentOperations().get(request.operationId)?.status).toBe("running");
+
+      store.receiveDelivery("processing-fixture", {});
+      expect(store.claimDelivery("processing-fixture")).toBe(true);
+      child.kill("SIGKILL");
+      await exited;
+      expect(await poller.runPass()).toBe(true);
+      expect(store.agentOperations().get(request.operationId)?.status).toBe("unknown");
+      expect(store.getWorkflow(fixture.workflow.id)?.state).toBe("escalated");
+      expect(store.deliveryStatus("processing-fixture")?.status).toBe("processing");
+      expect(reportError).toHaveBeenCalledOnce();
+    } finally {
+      child.kill("SIGKILL");
+      await exited;
     }
   });
 

@@ -1,7 +1,13 @@
 import { homedir } from "node:os";
 import { isAbsolute } from "node:path";
 import { Codex, type ThreadEvent, type ThreadOptions } from "@openai/codex-sdk";
-import type { AgentAdapter, AgentEvent, AgentSession, AgentWorkspace } from "./agent.ts";
+import type {
+  AgentAdapter,
+  AgentEvent,
+  AgentSession,
+  AgentTurnResult,
+  AgentWorkspace,
+} from "./agent.ts";
 
 const provider = "codex";
 const eventKinds: Partial<Record<ThreadEvent["type"], AgentEvent["kind"]>> = {
@@ -27,14 +33,13 @@ export const codexConfig = {
   shell_environment_policy: { inherit: "core", exclude: ["*API_KEY*", "*TOKEN*", "*SECRET*"] },
 };
 
-function codexFailure(message: string): string {
+function codexDiagnostic(message: string): string | undefined {
   if (/model.*not supported|model.*does not exist/i.test(message))
     return "The configured Codex model is unavailable for this account.";
   if (/unauthorized|authentication|not logged in|invalid api key|\b401\b/i.test(message))
     return "Codex could not authenticate the request.";
   if (/permission denied|access denied|forbidden|\b403\b/i.test(message))
     return "Codex denied permission to run the request.";
-  return "Codex reported a turn error.";
 }
 
 export function codexEnvironment(codexHome: string): Record<string, string> {
@@ -82,9 +87,18 @@ export function createCodexAgent({
         if (signal?.aborted) return { outcome: "interrupted", reason: "Canceled before launch." };
         let completed = false;
         let failure: string | undefined;
+        let diagnostic: string | undefined;
         let sessionConfirmed = false;
         let receivedEvent = false;
         let response = "";
+        function uncertain(reason: string): AgentTurnResult {
+          const interrupted = signal?.aborted;
+          if (interrupted) reason = "Codex execution was canceled.";
+          return {
+            outcome: interrupted ? "interrupted" : "unknown",
+            reason: diagnostic ? `${reason} ${diagnostic}` : reason,
+          };
+        }
         try {
           const { events } = await thread.runStreamed(prompt, {
             ...(signal === undefined ? {} : { signal }),
@@ -101,25 +115,25 @@ export function createCodexAgent({
             if (event.type === "item.completed" && event.item.type === "agent_message")
               response = event.item.text;
             if (event.type === "turn.completed") completed = true;
-            if (event.type === "turn.failed") failure = codexFailure(event.error.message);
+            if (event.type === "error") diagnostic = codexDiagnostic(event.message) ?? diagnostic;
+            if (event.type === "turn.failed")
+              failure = codexDiagnostic(event.error.message) ?? "Codex reported a turn error.";
             onEvent?.({ provider, kind: eventKinds[event.type] ?? "progress", data: event });
           }
         } catch (error) {
           if (failure) return { outcome: "failed", reason: failure };
-          if (signal?.aborted)
-            return { outcome: "interrupted", reason: "Codex execution was canceled." };
           // The SDK can include stderr and raw model output in exceptions.
           const code = (error as NodeJS.ErrnoException | null)?.code;
-          if (!receivedEvent && (code === "ENOENT" || code === "EACCES" || code === "EPERM"))
+          if (
+            !signal?.aborted &&
+            !receivedEvent &&
+            (code === "ENOENT" || code === "EACCES" || code === "EPERM")
+          )
             return { outcome: "failed", reason: `Could not launch Codex (${code}).` };
-          return { outcome: "unknown", reason: "The Codex event stream ended with an error." };
+          return uncertain("The Codex event stream ended with an error.");
         }
         if (failure) return { outcome: "failed", reason: failure };
-        if (!completed) {
-          return signal?.aborted
-            ? { outcome: "interrupted", reason: "Codex execution was canceled." }
-            : { outcome: "unknown", reason: "Codex exited without a terminal turn event." };
-        }
+        if (!completed) return uncertain("Codex exited without a terminal turn event.");
         if (!sessionConfirmed)
           return { outcome: "unknown", reason: "Codex did not confirm the session for this turn." };
         if (outputSchema === undefined) return { outcome: "completed", response };

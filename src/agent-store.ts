@@ -37,7 +37,7 @@ function eligible(workflow: Workflow | null, intent: AgentTurnIntent): boolean {
   );
 }
 
-export function recoverAgentOperations(db: DatabaseSync): number {
+export function recoverAgentOperations(db: DatabaseSync): string[] {
   const now = new Date().toISOString();
   const claims = db
     .prepare(
@@ -53,7 +53,7 @@ export function recoverAgentOperations(db: DatabaseSync): number {
     `UPDATE operations SET status='unknown', error='Agent owner exited without a recorded outcome.',
      updated_at=? WHERE operation_id=?`,
   );
-  let recovered = 0;
+  const recovered: string[] = [];
   for (const claim of claims) {
     // A reused PID or missing ownership evidence is ambiguous. Only ESRCH proves
     // there is no local process left that could still commit the outcome.
@@ -66,7 +66,7 @@ export function recoverAgentOperations(db: DatabaseSync): number {
       if (code !== "ESRCH") throw error;
       holdSession.run(now, claim.workflow_id);
       markUnknown.run(now, claim.operation_id);
-      recovered++;
+      recovered.push(claim.workflow_id);
     }
   }
   return recovered;

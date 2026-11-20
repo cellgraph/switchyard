@@ -430,22 +430,37 @@ export class WorkflowStore {
               "UPDATE operations SET status='ambiguous', error='Process restarted before outcome was recorded.', updated_at=? WHERE status='pending'",
             )
             .run(new Date().toISOString()).changes,
-        ) + recoverAgentOperations(this.#db);
+        ) + recoverAgentOperations(this.#db).length;
       const affected = this.#db
         .prepare(
           "SELECT DISTINCT workflow_id FROM operations WHERE status IN ('ambiguous','unknown')",
         )
         .all() as Array<{ workflow_id: string }>;
-      for (const row of affected) {
-        const w = this.getWorkflow(row.workflow_id);
-        if (w && (w.state !== "stopped" || w.closedByGitHub) && w.state !== "escalated")
-          this.#transition(row.workflow_id, {
-            type: "escalate",
-            reason: "An external operation has an ambiguous outcome after restart.",
-          });
-      }
+      this.#escalateAmbiguousWorkflows(
+        affected.map(({ workflow_id }) => workflow_id),
+        "An external operation has an ambiguous outcome after restart.",
+      );
       return { deliveries, ambiguousOperations };
     });
+  }
+
+  recoverAgentClaims(): number {
+    return this.#transaction(() => {
+      const affected = recoverAgentOperations(this.#db);
+      this.#escalateAmbiguousWorkflows(
+        affected,
+        "An agent owner exited without a recorded outcome.",
+      );
+      return affected.length;
+    });
+  }
+
+  #escalateAmbiguousWorkflows(ids: string[], reason: string): void {
+    for (const id of ids) {
+      const w = this.getWorkflow(id);
+      if (w && (w.state !== "stopped" || w.closedByGitHub) && w.state !== "escalated")
+        this.#transition(id, { type: "escalate", reason });
+    }
   }
 
   transitions(id: string): Array<{ from: string; to: string; reason: string; headSha: string }> {
