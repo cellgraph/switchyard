@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { createAgentOperationStore, recoverAgentOperations } from "./agent-store.ts";
 import type { GitHubRateLimits, GitHubRateLimitState } from "./github-app.ts";
 import {
   transitionWorkflow,
@@ -67,14 +68,21 @@ const migrations = [
    AND (retry_request GLOB '*:GET:/repos/*/commits/*'
      OR retry_request GLOB '*:POST:/app/installations/*/access_tokens');`,
   `CREATE TABLE reconciliation_retries (retry_key TEXT PRIMARY KEY NOT NULL, retry_at INTEGER NOT NULL);`,
+  `ALTER TABLE agent_sessions ADD COLUMN execution TEXT;
+  ALTER TABLE worktrees ADD COLUMN execution TEXT;
+  CREATE INDEX agent_operations_by_workflow ON operations(workflow_id, status) WHERE kind='durable_agent_turn';
+  CREATE UNIQUE INDEX one_unresolved_agent_operation ON operations(workflow_id)
+    WHERE kind='durable_agent_turn' AND status IN ('requested','dispatching','running','unknown','interrupted','manual_reconciliation');`,
 ];
 
 export class WorkflowStore {
   readonly #db: DatabaseSync;
 
   constructor(path = ":memory:") {
-    this.#db = new DatabaseSync(path);
-    this.#db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
+    this.#db = new DatabaseSync(path, { timeout: 5_000 });
+    this.#db.exec(
+      "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;",
+    );
     this.#migrate();
   }
 
@@ -160,77 +168,95 @@ export class WorkflowStore {
   }
 
   transition(id: string, command: WorkflowCommand): Workflow {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
-      const current = this.getWorkflow(id);
-      if (!current) throw new Error(`Workflow ${id} does not exist.`);
+    return this.#transaction(() => this.#transition(id, command));
+  }
+
+  agentOperations() {
+    return createAgentOperationStore(this.#db, {
+      transaction: (run) => this.#transaction(run),
+      getWorkflow: (id) => this.getWorkflow(id),
+      transition: (id, command) => this.#transition(id, command),
+    });
+  }
+
+  #transition(id: string, command: WorkflowCommand): Workflow {
+    const current = this.getWorkflow(id);
+    if (!current) throw new Error(`Workflow ${id} does not exist.`);
+    if (
+      command.type === "github_pull_request" &&
+      command.state === "open" &&
+      current.closedByGitHub
+    ) {
+      const unresolved = this.#db
+        .prepare(
+          "SELECT DISTINCT status FROM operations WHERE workflow_id=? AND status IN ('pending','ambiguous','dispatching','running','unknown','interrupted','manual_reconciliation')",
+        )
+        .all(id);
       if (
-        command.type === "github_pull_request" &&
-        command.state === "open" &&
-        current.closedByGitHub
+        unresolved.some(({ status }) =>
+          ["ambiguous", "unknown", "interrupted", "manual_reconciliation"].includes(String(status)),
+        )
       ) {
-        const unresolved = this.#db
-          .prepare(
-            "SELECT DISTINCT status FROM operations WHERE workflow_id=? AND status IN ('pending','ambiguous')",
-          )
-          .all(id);
-        if (unresolved.some(({ status }) => status === "ambiguous")) {
-          command = {
-            type: "escalate",
-            reason: "An external operation has an ambiguous outcome.",
-            observedHeadSha: command.sha,
-          };
-        } else if (unresolved.length) {
-          throw new Error(
-            "Cannot resume a reopened pull request while an external operation is pending.",
-          );
-        }
-      }
-      const result = transitionWorkflow(current, command);
-      const w = result.workflow;
-      if (JSON.stringify(w) === JSON.stringify(current)) {
-        this.#db.exec("COMMIT");
-        return w;
-      }
-      const now = new Date().toISOString();
-      this.#db
-        .prepare(
-          `UPDATE workflows SET state=?, head_sha=?, required_checks=?, review=?, checks=?, fix_cycles=?, cycle_awaiting_review=?, validation_head_sha=?, escalation_reason=?, closed_by_github=?, updated_at=? WHERE id=?`,
-        )
-        .run(
-          w.state,
-          w.headSha,
-          JSON.stringify(w.requiredChecks),
-          JSON.stringify(w.review),
-          JSON.stringify(w.checks),
-          w.fixCycles,
-          w.cycleAwaitingReview ? 1 : 0,
-          w.validationHeadSha,
-          w.escalationReason,
-          w.closedByGitHub ? 1 : 0,
-          now,
-          id,
+        command = {
+          type: "escalate",
+          reason: "An external operation has an ambiguous outcome.",
+          observedHeadSha: command.sha,
+        };
+      } else if (unresolved.length) {
+        throw new Error(
+          "Cannot resume a reopened pull request while an external operation is pending.",
         );
+      }
+    }
+    const result = transitionWorkflow(current, command);
+    const w = result.workflow;
+    if (JSON.stringify(w) === JSON.stringify(current)) return w;
+    const now = new Date().toISOString();
+    this.#db
+      .prepare(
+        `UPDATE workflows SET state=?, head_sha=?, required_checks=?, review=?, checks=?, fix_cycles=?, cycle_awaiting_review=?, validation_head_sha=?, escalation_reason=?, closed_by_github=?, updated_at=? WHERE id=?`,
+      )
+      .run(
+        w.state,
+        w.headSha,
+        JSON.stringify(w.requiredChecks),
+        JSON.stringify(w.review),
+        JSON.stringify(w.checks),
+        w.fixCycles,
+        w.cycleAwaitingReview ? 1 : 0,
+        w.validationHeadSha,
+        w.escalationReason,
+        w.closedByGitHub ? 1 : 0,
+        now,
+        id,
+      );
+    this.#db
+      .prepare(
+        "INSERT INTO transitions (workflow_id, from_state, to_state, reason, head_sha, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(id, result.from, result.to, result.reason, result.headSha, now);
+    if (command.type === "review_received")
       this.#db
         .prepare(
-          "INSERT INTO transitions (workflow_id, from_state, to_state, reason, head_sha, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+          "INSERT INTO review_snapshots (workflow_id, sha, outcome, captured_at) VALUES (?, ?, ?, ?)",
         )
-        .run(id, result.from, result.to, result.reason, result.headSha, now);
-      if (command.type === "review_received")
+        .run(id, command.evidence.sha, command.evidence.outcome, now);
+    if (command.type === "checks_received")
+      for (const check of command.evidence)
         this.#db
           .prepare(
-            "INSERT INTO review_snapshots (workflow_id, sha, outcome, captured_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO check_snapshots (workflow_id, name, sha, outcome, captured_at) VALUES (?, ?, ?, ?, ?)",
           )
-          .run(id, command.evidence.sha, command.evidence.outcome, now);
-      if (command.type === "checks_received")
-        for (const check of command.evidence)
-          this.#db
-            .prepare(
-              "INSERT INTO check_snapshots (workflow_id, name, sha, outcome, captured_at) VALUES (?, ?, ?, ?, ?)",
-            )
-            .run(id, check.name, check.sha, check.outcome, now);
+          .run(id, check.name, check.sha, check.outcome, now);
+    return w;
+  }
+
+  #transaction<T>(run: () => T): T {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = run();
       this.#db.exec("COMMIT");
-      return w;
+      return result;
     } catch (error) {
       this.#db.exec("ROLLBACK");
       throw error;
@@ -347,14 +373,26 @@ export class WorkflowStore {
   }
 
   createOperation(operationId: string, workflowId: string, kind: string, input: unknown): boolean {
-    const now = new Date().toISOString();
-    return (
-      this.#db
-        .prepare(
-          "INSERT OR IGNORE INTO operations (operation_id, workflow_id, kind, status, input, created_at, updated_at) VALUES (?, ?, ?, 'pending', ?, ?, ?)",
-        )
-        .run(operationId, workflowId, kind, JSON.stringify(input), now, now).changes === 1
-    );
+    if (kind === "durable_agent_turn")
+      throw new Error("Use the agent operation store to request a turn.");
+    return this.#transaction(() => {
+      if (
+        this.#db
+          .prepare(
+            "SELECT 1 FROM operations WHERE workflow_id=? AND kind='durable_agent_turn' AND status!='completed'",
+          )
+          .get(workflowId)
+      )
+        throw new Error("Workflow already has an unresolved agent operation.");
+      const now = new Date().toISOString();
+      return (
+        this.#db
+          .prepare(
+            "INSERT OR IGNORE INTO operations (operation_id, workflow_id, kind, status, input, created_at, updated_at) VALUES (?, ?, ?, 'pending', ?, ?, ?)",
+          )
+          .run(operationId, workflowId, kind, JSON.stringify(input), now, now).changes === 1
+      );
+    });
   }
 
   finishOperation(
@@ -365,7 +403,7 @@ export class WorkflowStore {
   ): void {
     const updated = this.#db
       .prepare(
-        "UPDATE operations SET status=?, result=?, error=?, updated_at=? WHERE operation_id=? AND status='pending'",
+        "UPDATE operations SET status=?, result=?, error=?, updated_at=? WHERE operation_id=? AND status='pending' AND kind!='durable_agent_turn'",
       )
       .run(
         status,
@@ -379,39 +417,34 @@ export class WorkflowStore {
   }
 
   recover(): { deliveries: number; ambiguousOperations: number } {
-    let affected: Array<{ workflow_id: string }>;
-    let deliveries: number;
-    let ambiguousOperations: number;
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
-      deliveries = Number(
+    return this.#transaction(() => {
+      const deliveries = Number(
         this.#db.prepare("UPDATE deliveries SET status='pending' WHERE status='processing'").run()
           .changes,
       );
-      ambiguousOperations = Number(
-        this.#db
-          .prepare(
-            "UPDATE operations SET status='ambiguous', error='Process restarted before outcome was recorded.', updated_at=? WHERE status='pending'",
-          )
-          .run(new Date().toISOString()).changes,
-      );
-      affected = this.#db
-        .prepare("SELECT DISTINCT workflow_id FROM operations WHERE status='ambiguous'")
+      const ambiguousOperations =
+        Number(
+          this.#db
+            .prepare(
+              "UPDATE operations SET status='ambiguous', error='Process restarted before outcome was recorded.', updated_at=? WHERE status='pending'",
+            )
+            .run(new Date().toISOString()).changes,
+        ) + recoverAgentOperations(this.#db);
+      const affected = this.#db
+        .prepare(
+          "SELECT DISTINCT workflow_id FROM operations WHERE status IN ('ambiguous','unknown')",
+        )
         .all() as Array<{ workflow_id: string }>;
-      this.#db.exec("COMMIT");
-    } catch (error) {
-      this.#db.exec("ROLLBACK");
-      throw error;
-    }
-    for (const row of affected) {
-      const w = this.getWorkflow(row.workflow_id);
-      if (w && (w.state !== "stopped" || w.closedByGitHub) && w.state !== "escalated")
-        this.transition(row.workflow_id, {
-          type: "escalate",
-          reason: "An external operation has an ambiguous outcome after restart.",
-        });
-    }
-    return { deliveries, ambiguousOperations };
+      for (const row of affected) {
+        const w = this.getWorkflow(row.workflow_id);
+        if (w && (w.state !== "stopped" || w.closedByGitHub) && w.state !== "escalated")
+          this.#transition(row.workflow_id, {
+            type: "escalate",
+            reason: "An external operation has an ambiguous outcome after restart.",
+          });
+      }
+      return { deliveries, ambiguousOperations };
+    });
   }
 
   transitions(id: string): Array<{ from: string; to: string; reason: string; headSha: string }> {
@@ -430,29 +463,20 @@ export class WorkflowStore {
   }
 
   #migrate(): void {
-    this.#db.exec(
-      "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
-    );
-    const current = Number(
-      (
-        this.#db
-          .prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations")
-          .get() as { version: number }
-      ).version,
-    );
-    for (let i = current; i < migrations.length; i++) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+    this.#transaction(() => {
+      this.#db.exec(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+      );
+      const { version } = this.#db
+        .prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations")
+        .get() as { version: number };
+      for (let i = version; i < migrations.length; i++) {
         this.#db.exec(migrations[i]!);
         this.#db
           .prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
           .run(i + 1, new Date().toISOString());
-        this.#db.exec("COMMIT");
-      } catch (error) {
-        this.#db.exec("ROLLBACK");
-        throw error;
       }
-    }
+    });
   }
 }
 

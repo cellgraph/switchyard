@@ -21,8 +21,12 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
       throw new Error("Worktree requires inspection after an uncertain turn.");
   }
 
-  function openSession(target: WorktreeTarget, previous?: WorkerSessionReference) {
-    const worktree = worktrees.open(target, previous === undefined);
+  function openSession(
+    target: WorktreeTarget,
+    previous?: WorkerSessionReference,
+    requireNew = false,
+  ) {
+    const worktree = worktrees.open(target, requireNew ? "new" : previous === undefined);
     assertAvailable(worktree.path);
     if (
       previous &&
@@ -42,6 +46,7 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
     let needsCleanStart = previous === undefined;
 
     return {
+      worktree,
       get reference(): WorkerSessionReference | null {
         const reference = session.reference;
         return reference && { worktree: { ...worktree }, agent: reference };
@@ -91,7 +96,8 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
   }
 
   return {
-    startSession: (target: WorktreeTarget) => openSession(target),
+    startSession: (target: WorktreeTarget, requireNew = false) =>
+      openSession(target, undefined, requireNew),
     resumeSession: (target: WorktreeTarget, reference: WorkerSessionReference) =>
       openSession(target, reference),
   };

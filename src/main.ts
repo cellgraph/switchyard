@@ -1,6 +1,7 @@
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
+import { runAgentCommand } from "./agent-command.ts";
 import { createController, createGitHubRetryOwnerCheck, describeError } from "./controller.ts";
 import { createGitHubReader, type PullRequestTarget } from "./github-api.ts";
 import { createGitHubAppClient, resumeGitHubAfterSecondaryLimit } from "./github-app.ts";
@@ -53,6 +54,7 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const dbPath = process.env.SWITCHYARD_DB_PATH ?? "switchyard.sqlite";
   process.umask(0o077);
+  if (await runAgentCommand(args, dbPath)) return;
   if (args.length === 1 && args[0] === "--resume-github") {
     const store = new WorkflowStore(dbPath);
     try {

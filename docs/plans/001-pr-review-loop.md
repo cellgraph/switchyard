@@ -54,7 +54,14 @@ Implement the first Switchyard workflow from a Codex implementation session with
 
 Phase 3A implements the agent adapter, Git worktree checks, and local worker composition from items 1, 3, and 5. It covers in-process start and resume, turn evidence, and failure handling without connecting agent execution to the controller polling loop.
 
-Phase 3B will persist session and worktree identity and operation intent/outcome, verify resume from a fresh process, and reconcile missing sessions, interrupted turns, and ambiguous operations before allowing further execution.
+Phase 3B implements durable session bindings, operation claims and outcomes, restart recovery, and explicit controller-authorized local turns. The gated live smoke test resumed the same SDK thread and dirty checkout across separate processes and verified that the second turn retained context from the first. Held sessions remain available for inspection. See the [local operations guide](../agent-sessions.md).
+
+### Phase 3B implementation sequence
+
+1. Extend the existing operation, session, and worktree tables. Persist an explicit request, a conditional dispatch claim, and running state before any worker side effect. Persist the outcome and its workflow transition together.
+2. Route explicit local turns through the controller. Check workflow state and PR head when requesting, claiming, and finishing. A successful fix may enter validation. A standalone turn while awaiting review leaves that state intact. Polling and webhook reconciliation do not authorize turns.
+3. Validate the persisted runtime, session artifact, checkout, and content before a continuation. Resume only after a successful recorded operation. Leave undispatched requests available to the caller. Hold dispatch claims and running operations with missing outcomes for inspection.
+4. Verify the persistence and crash boundaries offline, then run a gated live smoke test with two separate controller processes.
 
 ### Acceptance criteria
 
@@ -65,6 +72,8 @@ Phase 3B will persist session and worktree identity and operation intent/outcome
 - User checkout remains untouched and worktree cleanup cannot remove an active or uncommitted workflow.
 
 ## Phase 4: Codex review adapter and findings
+
+GitHub is the collaboration interface. Switchyard is the workflow authority. Persist review runs, individual findings, dispositions, and resulting workflow decisions in Switchyard. Link the corresponding GitHub comments and reviews as communication artifacts and sources of evidence.
 
 1. Save sanitized real examples from Cellgraph PR #51 as parser fixtures, retaining representative marker versions, comment edits, clean and finding summaries, review receipts, and inline findings.
 2. Implement a versioned `CodexReviewAdapter` for the observed summary marker, receipt, and inline finding markers. Store parser outcomes and source IDs.

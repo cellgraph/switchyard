@@ -12,6 +12,41 @@ const eventKinds: Partial<Record<ThreadEvent["type"], AgentEvent["kind"]>> = {
   error: "turn_failed",
 };
 
+export const codexTurnPolicy = {
+  sandboxMode: "workspace-write",
+  approvalPolicy: "never",
+  networkAccessEnabled: false,
+  webSearchMode: "disabled",
+} satisfies ThreadOptions;
+
+export const codexConfig = {
+  sandbox_workspace_write: {
+    writable_roots: [],
+    exclude_slash_tmp: true,
+    exclude_tmpdir_env_var: true,
+  },
+  shell_environment_policy: { inherit: "core", exclude: ["*API_KEY*", "*TOKEN*", "*SECRET*"] },
+};
+
+function codexFailure(message: string): string {
+  if (/model.*not supported|model.*does not exist/i.test(message))
+    return "The configured Codex model is unavailable for this account.";
+  if (/unauthorized|authentication|not logged in|invalid api key|\b401\b/i.test(message))
+    return "Codex could not authenticate the request.";
+  if (/permission denied|access denied|forbidden|\b403\b/i.test(message))
+    return "Codex denied permission to run the request.";
+  return "Codex reported a turn error.";
+}
+
+export function codexEnvironment(codexHome: string): Record<string, string> {
+  const env: Record<string, string> = { HOME: homedir(), CODEX_HOME: codexHome };
+  for (const key of ["PATH", "TMPDIR", "LANG", "LC_ALL"]) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
+
 export function createCodexAgent({
   model,
   codexHome,
@@ -23,22 +58,11 @@ export function createCodexAgent({
 }): AgentAdapter {
   if (!model.trim()) throw new Error("A Codex model must be configured.");
   if (!isAbsolute(codexHome)) throw new Error("Codex home must be an absolute path.");
-  const env: Record<string, string> = { HOME: homedir(), CODEX_HOME: codexHome };
-  for (const key of ["PATH", "TMPDIR", "LANG", "LC_ALL"]) {
-    const value = process.env[key];
-    if (value !== undefined) env[key] = value;
-  }
+  const env = codexEnvironment(codexHome);
   const codex = new Codex({
     env,
     ...(apiKey === undefined ? {} : { apiKey }),
-    config: {
-      sandbox_workspace_write: {
-        writable_roots: [],
-        exclude_slash_tmp: true,
-        exclude_tmpdir_env_var: true,
-      },
-      shell_environment_policy: { inherit: "core", exclude: ["*API_KEY*", "*TOKEN*", "*SECRET*"] },
-    },
+    config: codexConfig,
   });
 
   function open({ workingDirectory }: AgentWorkspace, id?: string): AgentSession {
@@ -46,10 +70,7 @@ export function createCodexAgent({
     const options: ThreadOptions = {
       workingDirectory,
       model,
-      sandboxMode: "workspace-write",
-      approvalPolicy: "never",
-      networkAccessEnabled: false,
-      webSearchMode: "disabled",
+      ...codexTurnPolicy,
     };
     const thread = id ? codex.resumeThread(id, options) : codex.startThread(options);
     let reference = id ?? null;
@@ -61,7 +82,7 @@ export function createCodexAgent({
       async runTurn({ prompt, outputSchema, signal, onEvent }) {
         if (signal?.aborted) return { outcome: "interrupted", reason: "Canceled before launch." };
         let completed = false;
-        let failed = false;
+        let failure: string | undefined;
         let sessionConfirmed = false;
         let response = "";
         try {
@@ -79,11 +100,12 @@ export function createCodexAgent({
             if (event.type === "item.completed" && event.item.type === "agent_message")
               response = event.item.text;
             if (event.type === "turn.completed") completed = true;
-            if (event.type === "turn.failed" || event.type === "error") failed = true;
+            if (event.type === "turn.failed") failure = codexFailure(event.error.message);
+            if (event.type === "error") failure = codexFailure(event.message);
             onEvent?.({ provider, kind: eventKinds[event.type] ?? "progress", data: event });
           }
         } catch (error) {
-          if (failed) return { outcome: "failed", reason: "Codex reported a turn error." };
+          if (failure) return { outcome: "failed", reason: failure };
           if (signal?.aborted)
             return { outcome: "interrupted", reason: "Codex execution was canceled." };
           // The SDK can include stderr and raw model output in exceptions.
@@ -92,7 +114,7 @@ export function createCodexAgent({
             return { outcome: "failed", reason: `Could not launch Codex (${code}).` };
           return { outcome: "unknown", reason: "The Codex event stream ended with an error." };
         }
-        if (failed) return { outcome: "failed", reason: "Codex reported a turn error." };
+        if (failure) return { outcome: "failed", reason: failure };
         if (!completed) {
           return signal?.aborted
             ? { outcome: "interrupted", reason: "Codex execution was canceled." }

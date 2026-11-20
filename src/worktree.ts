@@ -1,6 +1,13 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync, realpathSync, statSync } from "node:fs";
+import {
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 
 export type WorktreeTarget = { workflowId: string; branch: string; expectedHead: string };
@@ -182,12 +189,16 @@ export function createWorktreeManager({
       throw new Error("Workflow worktree is on a different branch.");
     const gitDir = realpathSync(gitPath(worktree.path, "--git-dir"));
     const { dev, ino, birthtimeNs } = statSync(gitDir, { bigint: true });
+    const directory = statSync(worktree.path, { bigint: true });
     // Git may reuse a worktree administration path after a checkout is removed.
     const checkoutIdentity = JSON.stringify([
       gitDir,
       String(dev),
       String(ino),
       String(birthtimeNs),
+      String(directory.dev),
+      String(directory.ino),
+      String(directory.birthtimeNs),
     ]);
     if (expectedCheckout !== undefined && checkoutIdentity !== expectedCheckout)
       throw new Error("Workflow worktree is a different linked checkout.");
@@ -212,11 +223,14 @@ export function createWorktreeManager({
   }
 
   return {
-    open(target: WorktreeTarget, create: boolean): Worktree {
+    open(target: WorktreeTarget, create: boolean | "new"): Worktree {
       const worktree = locate(target);
       if (!commitSha.test(target.expectedHead)) throw new Error("Expected a full Git commit SHA.");
       const registered = registrations(worktree);
-      if (!registered.some(({ path }) => path === worktree.path)) {
+      const present = registered.some(({ path }) => path === worktree.path);
+      if (present && create === "new")
+        throw new Error("A workflow worktree already exists without a durable session binding.");
+      if (!present) {
         if (!create) throw new Error("Workflow worktree is missing.");
         if (lstatSync(worktree.path, { throwIfNoEntry: false }))
           throw new Error("Workflow worktree path already exists without a matching registration.");
@@ -257,6 +271,36 @@ export function createWorktreeManager({
     },
 
     validate,
+
+    checkpoint(worktree: Worktree, expectedHead: string): string {
+      validate(worktree, expectedHead);
+      const hash = createHash("sha256").update(git(worktree.path, "ls-files", "--stage", "-z"));
+      // Include ignored files and raw bytes, since Git status can report the same paths after edits.
+      let remainingBytes = 64 * 1024 * 1024;
+      let remainingEntries = 10_000;
+      function visit(directory: string): void {
+        for (const name of readdirSync(directory).sort()) {
+          if (directory === worktree.path && name === ".git") continue;
+          const path = join(directory, name);
+          const stat = lstatSync(path);
+          if (--remainingEntries < 0 || (remainingBytes -= stat.size) < 0)
+            throw new Error("Worktree exceeds the bounds for a durable checkout checkpoint.");
+          hash.update(JSON.stringify([relative(worktree.path, path), stat.mode]));
+          if (stat.isDirectory()) visit(path);
+          else if (stat.isSymbolicLink())
+            hash.update(
+              createHash("sha256")
+                .update(readlinkSync(path, { encoding: "buffer" }))
+                .digest(),
+            );
+          else if (stat.isFile())
+            hash.update(createHash("sha256").update(readFileSync(path)).digest());
+          else throw new Error("Worktree contains an unsupported file type.");
+        }
+      }
+      visit(worktree.path);
+      return hash.digest("hex");
+    },
 
     observe(worktree: Worktree, beforeHead: string) {
       const state = inspect(worktree, { expectedCheckout: worktree.checkoutIdentity });

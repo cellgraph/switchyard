@@ -22,7 +22,7 @@ GitHub App webhook ──▶ webhook inbox ──▶ SQLite workflow controller
 - **Agent adapter:** starts or resumes an implementation session and streams its turn result. Codex is the only implementation. Keep the session ID opaque and vendor-specific in storage. A future Claude Code adapter may implement the same narrow capabilities without shaping the first version around a lowest common denominator.
 - **SQLite:** stores workflow state, inbound webhook receipts, external operation records, session identifiers, cycle counts, head SHAs, review snapshots, and CI status snapshots. WAL mode and bounded transactions are appropriate for a single controller.
 
-No message broker or distributed scheduler is needed. A durable local work queue/operation table can be claimed by the local worker. Persist intent before invoking a non-transactional API or agent action and record its outcome afterward; after a crash, reconcile unknown operations instead of blindly repeating them.
+The controller claims agent operations through SQLite and calls the local worker in process. The worker receives one operation ID and checkout target, and returns evidence through a provider-neutral interface.
 
 ## Workflow states
 
@@ -62,7 +62,7 @@ GitHub check runs and legacy commit statuses are separate APIs. Read both for th
 
 ## Persistence and recovery
 
-Phase 1 implements the controller-owned state model and local SQLite store in `src/workflow.ts` and `src/store.ts`; see [the state model and recovery notes](state-model.md). Schema migrations are versioned from the initial schema. State plus transition history and evidence snapshots are written in one transaction. Delivery IDs are unique, and operations persist intent before an external side effect. Startup recovery requeues interrupted inbox processing and marks pending operations ambiguous, escalating affected workflows instead of replaying them.
+Phase 1 implements the controller-owned state model and local SQLite store in `src/workflow.ts` and `src/store.ts`; see [the state model and recovery notes](state-model.md). Schema migrations are versioned from the initial schema. State plus transition history and evidence snapshots are written in one transaction. Delivery IDs are unique, and operations persist intent before an external side effect. Startup recovery requeues interrupted inbox processing. It escalates workflows with unresolved external operations that may have acted before the restart.
 
 Minimum durable records are:
 
@@ -73,15 +73,27 @@ Minimum durable records are:
 - check/status snapshots keyed to commit SHA;
 - append-only transition/operation history sufficient to explain why the controller acted.
 
-On startup, recover unprocessed webhook inbox rows, reconcile in-flight operations, verify the worktree and session persistence path still exist, and refresh GitHub state. Never replay an agent turn simply because its completion record is missing; inspect the session/worktree and require an explicit recovery rule or escalate. Use SQLite migrations from the first schema version.
+## Durable local agent sessions
 
-## Codex session and workspace lifecycle
+Phase 3B extends the existing SQLite `agent_sessions`, `worktrees`, and `operations` tables. A workflow has one local agent session binding and a history of turn operations. A binding identifies the provider and model, the exact SDK and bundled CLI versions, the Codex home and runtime fingerprint, the provider thread ID, the linked Git checkout, and the initial and most recently observed local commit. The PR head used to authorize a turn is recorded separately from the expected and observed local head.
 
-Phase 3A provides an in-process local worker, a Git worktree manager, and a Codex SDK adapter. The caller selects a trusted repository checkout and an operator-owned worktree root outside its checkouts and Git metadata. A workflow ID determines one path under that root. Before every turn the worker checks the registered repository, workflow branch, exact expected commit, and Git operation state. A clean worktree is required for a new session. Continuations can keep existing edits. After the turn the worker reports the observed head and paths with committed, staged, unstaged, or untracked changes. These paths describe the worktree relative to the supplied head and can include edits from earlier turns. See [ADR-0002](adr/0002-local-worker-session-and-worktree-identity.md).
+The controller accepts explicit local requests with a stable operation ID, the workflow and branch, both expected heads, a local execution configuration, and a prompt. SQLite stores a digest of the prompt and requested configuration. The caller supplies the same request again to dispatch an undispatched operation. A reused ID with changed input is a conflict. Only one unresolved agent operation can exist per workflow. Phase 3B polling and webhook handlers continue to observe GitHub. They never authorize a turn.
 
-Codex requires an explicit model and absolute Codex home directory. Use a trusted profile with an existing Codex login or supply an API key directly to the adapter. The worker sets the Codex working directory to the worktree and uses workspace-write sandboxing with approvals, sandboxed command network access, and web search disabled. Agent progress carries the original provider event. Treat it as untrusted evidence and avoid logging raw provider data by default.
+| Operation status        | How the controller handles it                                                                                                                                                             |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `requested`             | The controller has recorded the request. The same request may be supplied again after restart, subject to the current workflow authorization.                                             |
+| `dispatching`           | SQLite has granted one claim. The controller probes the local runtime and checks compatibility with the saved binding.                                                                    |
+| `running`               | The worker may have touched Git or invoked Codex. Checkout and thread identity are persisted as they become available.                                                                    |
+| `completed`             | There is a confirmed turn outcome, or authorization expired before dispatch and the record explains that no turn was launched. Known failures hold the session and escalate the workflow. |
+| `interrupted`           | The worker observed a cancellation. It can have partial effects, so the session is held.                                                                                                  |
+| `unknown`               | The worker lost the outcome or the process restarted after a claim but before the final transaction. The session is held even if Git appears clean.                                       |
+| `manual_reconciliation` | Required evidence is missing or incompatible, or workflow authorization changed after dispatch. The operation and session are retained for inspection.                                    |
 
-The Phase 3A foundation runs on demand through the worker module. Phase 3B will connect it to controller operations and persist the opaque session reference, worktree and commit identity, Codex home, and SDK/CLI version. Before enabling restart recovery, verify continuation in a fresh process with the original session files and worktree. Inspect ambiguous turns and missing or mismatched sessions before authorizing any further work.
+Operation evidence, the session binding, and the resulting workflow transition are committed together. A successful standalone turn leaves the workflow in `awaiting_review`. A successful `fixing` turn can enter `validating` only with findings and a checkout for the currently recorded PR head. Reconciliation that changes the PR head or closes and reopens the PR invalidates earlier authorization. A completed agent turn never makes a PR ready for merge.
+
+The local worker checks the Git common directory, registered checkout, branch and exact local head. It compares the staged index and a bounded content checkpoint that includes staged, unstaged, untracked, and ignored files. This lets Switchyard preserve previously recorded edits across a restart and detect new changes even when the Git status paths are identical. Codex continuation requires the same readable rollout artifact for the recorded thread and working directory. Missing or changed checkouts, rollout files, configuration, or runtime versions hold the session. A fresh start refuses an existing workflow checkout without a binding. See [ADR-0002](adr/0002-local-worker-session-and-worktree-identity.md).
+
+Start recovery only after the previous controller has stopped. The database prevents duplicate dispatch, and an interrupted claim can leave a Codex subprocess or Git effects for an operator to inspect. Phase 3B does not guess the result, adopt an unproven session, reset a held session, or clean up its worktree. See the [local operations guide](agent-sessions.md) for commands and verification.
 
 ## GitHub integration
 
@@ -103,4 +115,4 @@ Recommend a ruleset for `main` that requires pull requests and the `Quality chec
 - Determine if one Codex thread can be resumed with the same context after a restarted controller while the worktree path remains stable, and how interrupted/unknown turns are identified.
 - Determine the least-privilege GitHub App permission set for reading review threads, checks, and PR code, and the most practical macOS authentication model for pushing.
 - Confirm whether “required checks” should be derived from branch protection/rulesets, supplied in local configuration, or both. Fail closed if the set cannot be determined.
-- Define supported manual actions for ambiguous reviews, conflicts, agent auth expiry, failed pushes, and worktree recovery.
+- Define operator actions that can resolve held operations after investigation. Phase 3B supports inspection and escalation.
