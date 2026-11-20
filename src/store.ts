@@ -66,6 +66,7 @@ const migrations = [
    WHERE scope = 'secondary' AND throttled_attempts BETWEEN 1 AND 4
    AND (retry_request GLOB '*:GET:/repos/*/commits/*'
      OR retry_request GLOB '*:POST:/app/installations/*/access_tokens');`,
+  `CREATE TABLE reconciliation_retries (retry_key TEXT PRIMARY KEY NOT NULL, retry_at INTEGER NOT NULL);`,
 ];
 
 export class WorkflowStore {
@@ -96,6 +97,22 @@ export class WorkflowStore {
       set: (scope, state) => {
         upsert.run(scope, state.retryAt, state.throttledAttempts, state.retryRequest);
       },
+    };
+  }
+
+  reconciliationRetries() {
+    const select = this.#db.prepare(
+      "SELECT retry_at FROM reconciliation_retries WHERE retry_key = ?",
+    );
+    const upsert = this.#db.prepare(
+      `INSERT INTO reconciliation_retries (retry_key, retry_at) VALUES (?, ?)
+       ON CONFLICT(retry_key) DO UPDATE SET retry_at=excluded.retry_at`,
+    );
+    const remove = this.#db.prepare("DELETE FROM reconciliation_retries WHERE retry_key = ?");
+    return {
+      get: (key: string) => (select.get(key) as { retry_at: number } | undefined)?.retry_at,
+      set: (key: string, retryAt: number) => upsert.run(key, retryAt),
+      delete: (key: string) => remove.run(key),
     };
   }
 

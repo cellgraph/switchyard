@@ -12,6 +12,10 @@ import { readReconcileHint } from "./webhook.ts";
 
 const retryDelayMs = 30_000;
 
+function retryKey(target: PullRequestTarget): string {
+  return `${target.installationId}:${target.repository}:${target.pullRequest}`;
+}
+
 export function describeError(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown controller error.";
 }
@@ -48,13 +52,41 @@ export function createController({
   isRetryOwnerActive?: (key: string) => boolean;
 }) {
   const rateLimits = store.githubRateLimits();
-  const startupDueAt = new Map(targets.map((target) => [target, 0]));
+  const retryStore = store.reconciliationRetries();
+  const retryDueAt = new Map<PullRequestTarget, number>();
+  for (const target of targets) {
+    const deadline = retryStore.get(retryKey(target));
+    if (deadline !== undefined) retryDueAt.set(target, deadline);
+  }
+  const pendingSweep = new Set<PullRequestTarget>();
   let nextSweep = 0;
   let running: Promise<boolean> | undefined;
 
+  function isActive(target: PullRequestTarget): boolean {
+    return canReconcilePullRequest(store, target.repository, target.pullRequest);
+  }
+
   function needsGitHub(selected: readonly PullRequestTarget[]): boolean {
-    return selected.some((target) =>
-      canReconcilePullRequest(store, target.repository, target.pullRequest),
+    return selected.some(isActive);
+  }
+
+  function updateRetryDeadline(target: PullRequestTarget, deadline?: number): void {
+    const previous = retryDueAt.get(target);
+    if (deadline === undefined) {
+      if (previous === undefined) return;
+      retryStore.delete(retryKey(target));
+      retryDueAt.delete(target);
+    } else if (previous === undefined || deadline > previous) {
+      retryStore.set(retryKey(target), deadline);
+      retryDueAt.set(target, deadline);
+    }
+  }
+
+  function deliveryDeferred(selected: PullRequestTarget[]): boolean {
+    const at = now();
+    const secondary = secondaryDeferral();
+    return selected.some(
+      (target) => (secondary || (retryDueAt.get(target) ?? 0) > at) && isActive(target),
     );
   }
 
@@ -91,9 +123,13 @@ export function createController({
     const observations = new Map<PullRequestTarget, Promise<void>>();
     async function reconcileTargets(selected: PullRequestTarget[]) {
       const failures: string[] = [];
-      const retryDeadlines = new Map<PullRequestTarget, number>();
       let retryAt = 0;
       for (const target of selected) {
+        if (!isActive(target)) {
+          updateRetryDeadline(target);
+          continue;
+        }
+        let deadline: number | undefined;
         try {
           let observation = observations.get(target);
           if (!observation) {
@@ -103,30 +139,28 @@ export function createController({
           await observation;
         } catch (error) {
           failures.push(`${target.repository}#${target.pullRequest}: ${describeError(error)}`);
-          let deadline: number | undefined;
           if (error instanceof GitHubRateLimitError) deadline = error.retryAt;
           else if (error instanceof GitHubTransientError)
             deadline = Math.max(now() + retryDelayMs, error.retryAt ?? 0);
           else if (error instanceof PullRequestHeadChangedError) deadline = now() + retryDelayMs;
-          if (deadline === undefined) continue;
-          retryDeadlines.set(target, deadline);
-          retryAt = Math.max(retryAt, deadline);
         }
+        updateRetryDeadline(target, deadline);
+        if (deadline !== undefined) retryAt = Math.max(retryAt, deadline);
       }
-      return { failures, retryAt, retryDeadlines };
+      return { failures, retryAt };
     }
 
     let success = true;
     const deliveries = store.dueDeliveries(
       now(),
       25,
-      secondaryDeferral()
-        ? ({ payload, workflowId }) => !needsGitHub(deliveryTargets(payload, workflowId))
+      deliveryDeferred(targets)
+        ? ({ payload, workflowId }) => !deliveryDeferred(deliveryTargets(payload, workflowId))
         : undefined,
     );
     for (const { deliveryId, payload, workflowId } of deliveries) {
       const selected = deliveryTargets(payload, workflowId);
-      if (secondaryDeferral() && needsGitHub(selected)) continue;
+      if (deliveryDeferred(selected)) continue;
       try {
         let retryAt = 0;
         await store.processDelivery(
@@ -156,24 +190,26 @@ export function createController({
 
     const sweepAt = now();
     const periodic = sweepAt >= nextSweep;
-    if (periodic || startupDueAt.size > 0) {
-      // Startup retries have their own deadlines, independent of periodic polling.
-      const due = targets.filter((target) => {
-        const startupDeadline = startupDueAt.get(target);
-        return startupDeadline === undefined ? periodic : startupDeadline <= sweepAt;
-      });
-      const { failures, retryDeadlines } = await reconcileTargets(due);
+    if (periodic) for (const target of targets) pendingSweep.add(target);
+    if (pendingSweep.size > 0) {
+      const due = targets.filter(
+        (target) =>
+          pendingSweep.has(target) &&
+          ((retryDueAt.get(target) ?? 0) <= sweepAt || !isActive(target)),
+      );
+      const { failures } = await reconcileTargets(due);
       for (const target of due) {
-        if (!startupDueAt.has(target)) continue;
-        const retryAt = retryDeadlines.get(target);
-        if (retryAt === undefined) startupDueAt.delete(target);
-        else startupDueAt.set(target, retryAt);
+        if (!retryDueAt.has(target)) pendingSweep.delete(target);
       }
-      if (periodic) nextSweep = reconcileIntervalMs > 0 ? now() + reconcileIntervalMs : Infinity;
       for (const failure of failures) reportError(`Periodic reconciliation failed for ${failure}`);
       if (failures.length) success = false;
     }
-    return success;
+    if (periodic) nextSweep = reconcileIntervalMs > 0 ? now() + reconcileIntervalMs : Infinity;
+    if (reportDeferred && success && pendingSweep.size > 0) {
+      const deadline = Math.max(...[...pendingSweep].map((target) => retryDueAt.get(target) ?? 0));
+      reportError(`GitHub reconciliation is deferred until ${new Date(deadline).toISOString()}.`);
+    }
+    return success && pendingSweep.size === 0;
   }
 
   return {

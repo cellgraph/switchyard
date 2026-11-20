@@ -433,6 +433,7 @@ describe("GitHub webhook intake and reconciliation", () => {
     store.close();
     const db = new DatabaseSync(dbPath);
     db.exec(`
+      DROP TABLE reconciliation_retries;
       DROP TABLE github_rate_limits;
       DROP INDEX deliveries_retry;
       ALTER TABLE deliveries DROP COLUMN retry_at;
@@ -549,7 +550,9 @@ describe("GitHub webhook intake and reconciliation", () => {
       store.githubRateLimits().set("secondary", { retryAt, throttledAttempts, retryRequest });
       store.close();
       const db = new DatabaseSync(dbPath);
-      db.exec("DELETE FROM schema_migrations WHERE version = 6;");
+      db.exec(
+        "DROP TABLE reconciliation_retries; DELETE FROM schema_migrations WHERE version >= 6;",
+      );
       db.close();
       store = new WorkflowStore(dbPath);
       expect(store.githubRateLimits().get("secondary")).toEqual({

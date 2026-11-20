@@ -77,11 +77,16 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
       ]);
 
       if (terminal()) return;
-      const latest = await github.readPullRequest(target);
-      if (terminal()) return;
       const readErrors = [checks, reviewInputs].flatMap((read) =>
         read.status === "rejected" ? [read.reason as unknown] : [],
       );
+      let latest: PullRequestState;
+      try {
+        latest = await github.readPullRequest(target);
+      } catch (error) {
+        throw githubRetryError([...readErrors, error]) ?? error;
+      }
+      if (terminal()) return;
       if (!observe(latest)) {
         const throttled = readErrors.some((error) => error instanceof GitHubRateLimitError);
         if (!throttled) github.completeReconciliation(target);
