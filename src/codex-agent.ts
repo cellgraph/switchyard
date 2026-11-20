@@ -1,0 +1,121 @@
+import { homedir } from "node:os";
+import { isAbsolute } from "node:path";
+import { Codex, type ThreadEvent, type ThreadOptions } from "@openai/codex-sdk";
+import type { AgentAdapter, AgentEvent, AgentSession, AgentWorkspace } from "./agent.ts";
+
+const provider = "codex";
+const eventKinds: Partial<Record<ThreadEvent["type"], AgentEvent["kind"]>> = {
+  "thread.started": "session_started",
+  "turn.started": "turn_started",
+  "turn.completed": "turn_completed",
+  "turn.failed": "turn_failed",
+  error: "turn_failed",
+};
+
+export function createCodexAgent({
+  model,
+  codexHome,
+  apiKey,
+}: {
+  model: string;
+  codexHome: string;
+  apiKey?: string;
+}): AgentAdapter {
+  if (!model.trim()) throw new Error("A Codex model must be configured.");
+  if (!isAbsolute(codexHome)) throw new Error("Codex home must be an absolute path.");
+  const env: Record<string, string> = { HOME: homedir(), CODEX_HOME: codexHome };
+  for (const key of ["PATH", "TMPDIR", "LANG", "LC_ALL"]) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  const codex = new Codex({
+    env,
+    ...(apiKey === undefined ? {} : { apiKey }),
+    config: {
+      sandbox_workspace_write: {
+        writable_roots: [],
+        exclude_slash_tmp: true,
+        exclude_tmpdir_env_var: true,
+      },
+      shell_environment_policy: { inherit: "core", exclude: ["*API_KEY*", "*TOKEN*", "*SECRET*"] },
+    },
+  });
+
+  function open({ workingDirectory }: AgentWorkspace, id?: string): AgentSession {
+    if (!isAbsolute(workingDirectory)) throw new Error("Agent workspace must be an absolute path.");
+    const options: ThreadOptions = {
+      workingDirectory,
+      model,
+      sandboxMode: "workspace-write",
+      approvalPolicy: "never",
+      networkAccessEnabled: false,
+      webSearchMode: "disabled",
+    };
+    const thread = id ? codex.resumeThread(id, options) : codex.startThread(options);
+    let reference = id ?? null;
+
+    return {
+      get reference() {
+        return reference ? { provider, id: reference } : null;
+      },
+      async runTurn({ prompt, outputSchema, signal, onEvent }) {
+        if (signal?.aborted) return { outcome: "interrupted", reason: "Canceled before launch." };
+        let completed = false;
+        let failed = false;
+        let sessionConfirmed = false;
+        let response = "";
+        try {
+          const { events } = await thread.runStreamed(prompt, {
+            ...(signal === undefined ? {} : { signal }),
+            ...(outputSchema === undefined ? {} : { outputSchema }),
+          });
+          for await (const event of events) {
+            if (event.type === "thread.started") {
+              if (reference !== null && event.thread_id !== reference)
+                return { outcome: "unknown", reason: "Codex reported a different session." };
+              reference = event.thread_id;
+              sessionConfirmed = true;
+            }
+            if (event.type === "item.completed" && event.item.type === "agent_message")
+              response = event.item.text;
+            if (event.type === "turn.completed") completed = true;
+            if (event.type === "turn.failed" || event.type === "error") failed = true;
+            onEvent?.({ provider, kind: eventKinds[event.type] ?? "progress", data: event });
+          }
+        } catch (error) {
+          if (failed) return { outcome: "failed", reason: "Codex reported a turn error." };
+          if (signal?.aborted)
+            return { outcome: "interrupted", reason: "Codex execution was canceled." };
+          // The SDK can include stderr and raw model output in exceptions.
+          const code = (error as NodeJS.ErrnoException | null)?.code;
+          if (!reference && (code === "ENOENT" || code === "EACCES" || code === "EPERM"))
+            return { outcome: "failed", reason: `Could not launch Codex (${code}).` };
+          return { outcome: "unknown", reason: "The Codex event stream ended with an error." };
+        }
+        if (failed) return { outcome: "failed", reason: "Codex reported a turn error." };
+        if (!completed) {
+          return signal?.aborted
+            ? { outcome: "interrupted", reason: "Codex execution was canceled." }
+            : { outcome: "unknown", reason: "Codex exited without a terminal turn event." };
+        }
+        if (!sessionConfirmed)
+          return { outcome: "unknown", reason: "Codex did not confirm the session for this turn." };
+        if (outputSchema === undefined) return { outcome: "completed", response };
+        try {
+          return { outcome: "completed", response, structuredOutput: JSON.parse(response) };
+        } catch {
+          return { outcome: "failed", reason: "Codex returned invalid structured JSON." };
+        }
+      },
+    };
+  }
+
+  return {
+    startSession: (workspace) => open(workspace),
+    resumeSession(workspace, reference) {
+      if (reference.provider !== provider || !reference.id.trim())
+        throw new Error("A Codex session reference is required.");
+      return open(workspace, reference.id);
+    },
+  };
+}
