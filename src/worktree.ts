@@ -197,19 +197,30 @@ export function createWorktreeManager({
         if (registered.some(({ branch }) => branch === worktree.branch))
           throw new Error("Workflow branch is already checked out.");
         checkOperations(source);
-        if (git(source, "cat-file", "-t", target.expectedHead) !== "commit\n")
-          throw new Error("Expected SHA is not a commit in the configured repository.");
-        git(
-          source,
-          "worktree",
-          "add",
-          "--no-track",
-          "-b",
-          worktree.branch,
-          "--",
-          worktree.path,
-          target.expectedHead,
-        );
+        const ref = `refs/heads/${worktree.branch}`;
+        const existing = git(source, "for-each-ref", "--format=%(refname)%09%(objectname)", ref)
+          .split("\n")
+          .find((line) => line.startsWith(`${ref}\t`))
+          ?.slice(ref.length + 1);
+        if (existing !== undefined) {
+          if (existing !== target.expectedHead)
+            throw new Error("Existing workflow branch is at a different commit.");
+          git(source, "worktree", "add", "--", worktree.path, worktree.branch);
+        } else {
+          if (git(source, "cat-file", "-t", target.expectedHead) !== "commit\n")
+            throw new Error("Expected SHA is not a commit in the configured repository.");
+          git(
+            source,
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            worktree.branch,
+            "--",
+            worktree.path,
+            target.expectedHead,
+          );
+        }
       }
       const state = validate(worktree, target.expectedHead);
       if (create && state.changedPaths.length)

@@ -148,6 +148,19 @@ describe("isolated worktrees and the local worker", () => {
     expect(() => worktrees.open({ ...target, branch: "main" }, true)).toThrow("semantic");
   });
 
+  it("attaches an unoccupied local branch only at the expected commit", () => {
+    git(primary, "branch", target.branch, target.expectedHead);
+    expect(() => worktrees.open({ ...target, expectedHead: "0".repeat(40) }, true)).toThrow(
+      "Existing workflow branch is at a different commit.",
+    );
+    expect(git(primary, "worktree", "list", "--porcelain")).not.toContain(path);
+
+    expect(worktrees.open(target, true).path).toBe(path);
+    expect(git(path, "branch", "--show-current")).toBe(target.branch);
+    expect(git(path, "rev-parse", "HEAD")).toBe(target.expectedHead);
+    expect(git(primary, "branch", "--show-current")).toBe("main");
+  });
+
   it("refuses unregistered directories and branch, commit, and repository mismatches", () => {
     fixtureRepository(path);
     expect(() => worktrees.open(target, true)).toThrow("path already exists");
