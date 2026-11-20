@@ -1,10 +1,22 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync, realpathSync, statSync } from "node:fs";
+import {
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 
 export type WorktreeTarget = { workflowId: string; branch: string; expectedHead: string };
-type WorktreeLocation = { path: string; repository: string; branch: string; workflowId: string };
+export type WorktreeLocation = {
+  path: string;
+  repository: string;
+  branch: string;
+  workflowId: string;
+};
 export type Worktree = WorktreeLocation & { checkoutIdentity: string };
 type RegisteredWorktree = { path: string; branch?: string; unavailable: boolean };
 
@@ -84,7 +96,7 @@ function checkOperations(gitDir: string): void {
   if (operation) throw new Error(`Worktree has an active Git operation or lock (${operation}).`);
 }
 
-function changedPaths(path: string): string[] {
+function checkoutStatus(path: string) {
   // Git status can omit changes to files with either of these index flags.
   const entries = git(path, "ls-files", "-v", "-z");
   if (/(?:^|\0)[Ss] /.test(entries))
@@ -100,7 +112,7 @@ function changedPaths(path: string): string[] {
     "--untracked-files=all",
     "--ignore-submodules=none",
   );
-  return status
+  const changedPaths = status
     .split("\0")
     .filter(Boolean)
     .map((entry) => {
@@ -109,6 +121,7 @@ function changedPaths(path: string): string[] {
         throw new Error("Workflow worktree has unresolved conflicts.");
       return entry.slice(3);
     });
+  return { status, changedPaths };
 }
 
 export function createWorktreeManager({
@@ -182,12 +195,16 @@ export function createWorktreeManager({
       throw new Error("Workflow worktree is on a different branch.");
     const gitDir = realpathSync(gitPath(worktree.path, "--git-dir"));
     const { dev, ino, birthtimeNs } = statSync(gitDir, { bigint: true });
+    const directory = statSync(worktree.path, { bigint: true });
     // Git may reuse a worktree administration path after a checkout is removed.
     const checkoutIdentity = JSON.stringify([
       gitDir,
       String(dev),
       String(ino),
       String(birthtimeNs),
+      String(directory.dev),
+      String(directory.ino),
+      String(directory.birthtimeNs),
     ]);
     if (expectedCheckout !== undefined && checkoutIdentity !== expectedCheckout)
       throw new Error("Workflow worktree is a different linked checkout.");
@@ -198,7 +215,7 @@ export function createWorktreeManager({
     return {
       checkoutIdentity,
       head,
-      changedPaths: changedPaths(worktree.path),
+      ...checkoutStatus(worktree.path),
     };
   }
 
@@ -212,11 +229,16 @@ export function createWorktreeManager({
   }
 
   return {
-    open(target: WorktreeTarget, create: boolean): Worktree {
+    locate,
+
+    open(target: WorktreeTarget, create: boolean | "new"): Worktree {
       const worktree = locate(target);
       if (!commitSha.test(target.expectedHead)) throw new Error("Expected a full Git commit SHA.");
       const registered = registrations(worktree);
-      if (!registered.some(({ path }) => path === worktree.path)) {
+      const present = registered.some(({ path }) => path === worktree.path);
+      if (present && create === "new")
+        throw new Error("A workflow worktree already exists without a durable session binding.");
+      if (!present) {
         if (!create) throw new Error("Workflow worktree is missing.");
         if (lstatSync(worktree.path, { throwIfNoEntry: false }))
           throw new Error("Workflow worktree path already exists without a matching registration.");
@@ -257,6 +279,42 @@ export function createWorktreeManager({
     },
 
     validate,
+
+    checkpoint(worktree: Worktree, expectedHead: string): string {
+      const { status } = inspect(worktree, {
+        expectedCheckout: worktree.checkoutIdentity,
+        expectedHead,
+      });
+      // Porcelain distinguishes intent-to-add from staged addition even when index blobs match.
+      const hash = createHash("sha256").update(
+        JSON.stringify([status, git(worktree.path, "ls-files", "--stage", "-z")]),
+      );
+      // Include ignored files and raw bytes, since Git status can report the same paths after edits.
+      let remainingBytes = 64 * 1024 * 1024;
+      let remainingEntries = 10_000;
+      function visit(directory: string): void {
+        for (const name of readdirSync(directory).sort()) {
+          if (directory === worktree.path && name === ".git") continue;
+          const path = join(directory, name);
+          const stat = lstatSync(path);
+          if (--remainingEntries < 0 || (remainingBytes -= stat.size) < 0)
+            throw new Error("Worktree exceeds the bounds for a durable checkout checkpoint.");
+          hash.update(JSON.stringify([relative(worktree.path, path), stat.mode]));
+          if (stat.isDirectory()) visit(path);
+          else if (stat.isSymbolicLink())
+            hash.update(
+              createHash("sha256")
+                .update(readlinkSync(path, { encoding: "buffer" }))
+                .digest(),
+            );
+          else if (stat.isFile())
+            hash.update(createHash("sha256").update(readFileSync(path)).digest());
+          else throw new Error("Worktree contains an unsupported file type.");
+        }
+      }
+      visit(worktree.path);
+      return hash.digest("hex");
+    },
 
     observe(worktree: Worktree, beforeHead: string) {
       const state = inspect(worktree, { expectedCheckout: worktree.checkoutIdentity });

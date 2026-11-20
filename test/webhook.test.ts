@@ -12,6 +12,7 @@ import { createReconciler } from "../src/reconcile.ts";
 import { WorkflowStore } from "../src/store.ts";
 import { createWebhookServer } from "../src/webhook.ts";
 import type { CheckEvidence } from "../src/workflow.ts";
+import { removeDurableAgentMigration } from "./fixtures/legacy-schema.ts";
 
 type Fixture = { id: string; event: string; payload: Record<string, unknown> };
 const fixtures = JSON.parse(
@@ -432,6 +433,7 @@ describe("GitHub webhook intake and reconciliation", () => {
     const workflowId = workflow()!.id;
     store.close();
     const db = new DatabaseSync(dbPath);
+    removeDurableAgentMigration(db);
     db.exec(`
       DROP TABLE reconciliation_retries;
       DROP TABLE github_rate_limits;
@@ -550,6 +552,7 @@ describe("GitHub webhook intake and reconciliation", () => {
       store.githubRateLimits().set("secondary", { retryAt, throttledAttempts, retryRequest });
       store.close();
       const db = new DatabaseSync(dbPath);
+      removeDurableAgentMigration(db);
       db.exec(
         "DROP TABLE reconciliation_retries; DELETE FROM schema_migrations WHERE version >= 6;",
       );
