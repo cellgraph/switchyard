@@ -6,6 +6,7 @@ import type { FixGit } from "./fix-git.ts";
 import type { FixConfig, FixCycle, ValidationResult } from "./fix-store.ts";
 import type { PullRequestState } from "./github-api.ts";
 import type { FixStoreState, WorkflowStore } from "./store.ts";
+import type { Workflow } from "./workflow.ts";
 
 type Dependencies = {
   store: WorkflowStore;
@@ -44,6 +45,22 @@ function tokenUsage(store: WorkflowStore, cycles: FixCycle[]): number | null {
     total += usage.inputTokens + usage.outputTokens;
   }
   return total;
+}
+
+function failedPublishedChecks(workflow: Workflow, cycle: FixCycle | undefined): string[] {
+  if (
+    cycle?.phase !== "finished" ||
+    cycle.commit !== workflow.headSha ||
+    workflow.review?.sha !== workflow.headSha ||
+    workflow.review.outcome !== "completed_clean"
+  )
+    return [];
+  return (workflow.requiredChecks ?? []).filter((name) =>
+    workflow.checks.some(
+      (check) =>
+        check.sha === workflow.headSha && check.name === name && check.outcome === "failed",
+    ),
+  );
 }
 
 export function fixStatus(store: WorkflowStore, workflowId: string) {
@@ -86,11 +103,13 @@ export function fixStatus(store: WorkflowStore, workflowId: string) {
           ? choices[current.phase]
           : pending.length
             ? "Record an operator disposition for each new finding."
-            : workflow.state === "fixing"
-              ? "Advance to evaluate the current review."
-              : workflow.review?.outcome === "completed_clean"
-                ? "Wait for all configured required checks on the clean reviewed head."
-                : "Wait for a completed exact-head review.";
+            : failedPublishedChecks(workflow, latest).length
+              ? "Advance to record the failed required checks and hold the workflow."
+              : workflow.state === "fixing"
+                ? "Advance to evaluate the current review."
+                : workflow.review?.outcome === "completed_clean"
+                  ? "Wait for all configured required checks on the clean reviewed head."
+                  : "Wait for a completed exact-head review.";
   return {
     workflow,
     nextAction,
@@ -448,6 +467,14 @@ Review data: ${JSON.stringify(cycle.review)}`,
           transition({
             type: "escalate",
             reason: "Review evidence is indeterminate. Inspect the exact-head review runs.",
+          });
+          return;
+        }
+        const failed = failedPublishedChecks(workflow, latest);
+        if (failed.length) {
+          transition({
+            type: "escalate",
+            reason: `Required GitHub checks failed for published commit ${workflow.headSha}. Inspect the failed checks: ${failed.join(", ")}.`,
           });
           return;
         }

@@ -24,7 +24,7 @@ describe("bounded single-PR fixes", () => {
   let config: FixConfig;
   let reader: GitHubReader;
   let observedHead: string | undefined;
-  let passedChecks: boolean;
+  let checkOutcome: "passed" | "failed" | null;
   let cleanReviewSha: string | undefined;
   let markForJudgment: boolean;
   let onTurn: () => Promise<void>;
@@ -71,7 +71,7 @@ describe("bounded single-PR fixes", () => {
     worktrees = createWorktreeManager(config);
     repository = createFixGit(worktrees, remote);
     observedHead = undefined;
-    passedChecks = false;
+    checkOutcome = null;
     cleanReviewSha = undefined;
     markForJudgment = false;
     launches = 0;
@@ -118,7 +118,7 @@ describe("bounded single-PR fixes", () => {
         };
       },
       async readChecks(_target, sha) {
-        return passedChecks ? [{ name: "Quality checks", sha, outcome: "passed" }] : [];
+        return checkOutcome ? [{ name: "Quality checks", sha, outcome: checkOutcome }] : [];
       },
       async readReviewInputs() {
         const summary = codexFixture.issueComments[0]!;
@@ -267,7 +267,7 @@ describe("bounded single-PR fixes", () => {
     expect(store.getWorkflow(workflowId)?.state).toBe("validating");
     observedHead = undefined;
     cleanReviewSha = base;
-    passedChecks = true;
+    checkOutcome = "passed";
     restart();
     await controller().advance();
     expect(current()).toMatchObject({ phase: "finished", push: "confirmed" });
@@ -277,10 +277,10 @@ describe("bounded single-PR fixes", () => {
     });
 
     cleanReviewSha = commit;
-    passedChecks = false;
+    checkOutcome = null;
     await controller().advance();
     expect(store.getWorkflow(workflowId)?.state).toBe("awaiting_review");
-    passedChecks = true;
+    checkOutcome = "passed";
     const status = await controller().advance();
     expect(status.workflow.state).toBe("ready_for_human");
     expect(status.nextAction).toBe("Human merge review.");
@@ -449,6 +449,23 @@ describe("bounded single-PR fixes", () => {
     });
     expect(push).toHaveBeenCalledTimes(1);
     expect(remoteHead()).toBe(fixture.workflow.headSha);
+  });
+
+  it("escalates a completed clean review with a failed required check on the published head", async () => {
+    await validate();
+    await publish();
+    checkOutcome = "failed";
+    const waiting = await controller().advance();
+    expect(waiting.workflow).toMatchObject({ state: "awaiting_review", escalationReason: null });
+    cleanReviewSha = remoteHead();
+    const result = await controller().advance();
+    expect(result.workflow).toMatchObject({
+      state: "escalated",
+      headSha: cleanReviewSha,
+      escalationReason: expect.stringContaining("Inspect the failed checks: Quality checks"),
+    });
+    expect(result.cycles.at(-1)).toMatchObject({ phase: "finished", push: "confirmed" });
+    expect(launches).toBe(1);
   });
 
   it("requires new finding decisions, then enforces the configured PR cycle limit", async () => {

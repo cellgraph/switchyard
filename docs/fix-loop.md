@@ -51,7 +51,7 @@ Allowed paths are literal files or directory prefixes ending in `/`. Narrow the 
 2. Advance again to propose a fix. Inspect the exact head, review run, selected findings, rationale, path scope, and limits. Approve the cycle ID from the JSON.
 3. Advance to run the agent and validation. The agent can open a new session or resume a matching active session. Inspect the validation evidence in status and the staged changes with `git diff --cached` in the recorded worktree.
 4. Approve publication using that cycle ID. Advance to create one commit and attempt a normal fast-forward push against the authorized PR branch.
-5. Advance to reconcile the remote branch and GitHub head. Keep the normal polling controller running or advance again to observe a subsequent review and required checks. New findings return to operator triage. A clean exact-head review with passing configured checks hands the PR to a human.
+5. Advance to reconcile the remote branch and GitHub head. Keep the normal polling controller running or advance again to observe a subsequent review and required checks. New findings return to operator triage. A clean exact-head review with passing configured checks hands the PR to a human. A failed required check on the clean reviewed publication escalates on the next advance.
 
 ```sh
 export SWITCHYARD_DB_PATH=/absolute/path/to/switchyard.sqlite
