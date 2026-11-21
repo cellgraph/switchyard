@@ -366,38 +366,44 @@ describe("GitHub App review transport", () => {
     expect(cursors).toEqual([null, "second"]);
   });
 
-  it("scopes the write token, posts only to the requested endpoint, and never replays a rejected POST", async () => {
-    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
-    const posts: unknown[] = [];
-    const client = createGitHubAppClient({
-      clientId: "client",
-      privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
-      reviewWrites: true,
-      fetcher: async (input, init) => {
-        const request = new Request(input, init);
-        const path = new URL(request.url).pathname;
-        if (path === "/app") return Response.json({ slug: "switchyard-test" });
-        const body: unknown = await request.json();
-        expect(request.method).toBe("POST");
-        if (path === "/app/installations/5/access_tokens") {
-          expect(body).toEqual({
-            repositories: ["repo"],
-            permissions: { pull_requests: "write", checks: "read", statuses: "read" },
+  it.each([401, 403, 429])(
+    "scopes the write token and classifies a single HTTP %i POST as rejected",
+    async (code) => {
+      const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+      const posts: unknown[] = [];
+      const client = createGitHubAppClient({
+        clientId: "client",
+        privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+        reviewWrites: true,
+        fetcher: async (input, init) => {
+          const request = new Request(input, init);
+          const path = new URL(request.url).pathname;
+          if (path === "/app") return Response.json({ slug: "switchyard-test" });
+          const body: unknown = await request.json();
+          expect(request.method).toBe("POST");
+          if (path === "/app/installations/5/access_tokens") {
+            expect(body).toEqual({
+              repositories: ["repo"],
+              permissions: { pull_requests: "write", checks: "read", statuses: "read" },
+            });
+            return Response.json({
+              token: "fixture-token",
+              expires_at: new Date(Date.now() + 120_000).toISOString(),
+            });
+          }
+          expect(path).toBe("/repos/owner/repo/pulls/1/comments/123/replies");
+          posts.push(body);
+          return new Response(null, {
+            status: code,
+            ...(code === 401 ? {} : { headers: { "retry-after": "60" } }),
           });
-          return Response.json({
-            token: "fixture-token",
-            expires_at: new Date(Date.now() + 120_000).toISOString(),
-          });
-        }
-        expect(path).toBe("/repos/owner/repo/pulls/1/comments/123/replies");
-        posts.push(body);
-        return new Response(null, { status: 401 });
-      },
-    });
-    expect(await client.readAppBot(target)).toBe(bot);
-    await expect(client.postReviewComment(target, 123, { body: "reply" })).rejects.toBeInstanceOf(
-      GitHubWriteRejected,
-    );
-    expect(posts).toEqual([{ body: "reply" }]);
-  });
+        },
+      });
+      expect(await client.readAppBot(target)).toBe(bot);
+      await expect(client.postReviewComment(target, 123, { body: "reply" })).rejects.toBeInstanceOf(
+        GitHubWriteRejected,
+      );
+      expect(posts).toEqual([{ body: "reply" }]);
+    },
+  );
 });

@@ -472,19 +472,36 @@ export function createGitHubAppClient({
       const comments = `/repos/${target.repository}/pulls/${target.pullRequest}/comments`;
       const path = parentId === null ? comments : `${comments}/${parentId}/replies`;
       return queueRead(target.installationId, async () => {
-        checkRetryDeadline(pullRequestRetryKey(target, target.pullRequest));
         const cacheKey = `${target.installationId}:${target.repository}`;
-        const token = await tokenFor(target, cacheKey, target.pullRequest);
-        const response = await request(
-          target,
-          {
-            path,
-            method: "POST",
-            body: JSON.stringify(body),
-            reconcilePullRequest: target.pullRequest,
-          },
-          token.value,
-        );
+        let token: Token;
+        try {
+          checkRetryDeadline(pullRequestRetryKey(target, target.pullRequest));
+          token = await tokenFor(target, cacheKey, target.pullRequest);
+        } catch (cause) {
+          // No comment request was sent while checking the deadline or fetching its token.
+          throw new GitHubWriteRejected(
+            cause instanceof Error ? cause.message : "GitHub review publication preflight failed.",
+            { cause },
+          );
+        }
+        let response: Response;
+        try {
+          response = await request(
+            target,
+            {
+              path,
+              method: "POST",
+              body: JSON.stringify(body),
+              reconcilePullRequest: target.pullRequest,
+            },
+            token.value,
+          );
+        } catch (cause) {
+          // This error proves either a local throttle or a remote 403/429 rejection.
+          if (cause instanceof GitHubRateLimitError)
+            throw new GitHubWriteRejected(cause.message, { cause });
+          throw cause;
+        }
         if (response.status === 401) tokens.delete(cacheKey);
         if ([400, 401, 403, 404, 422].includes(response.status))
           throw new GitHubWriteRejected(
