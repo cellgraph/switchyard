@@ -1,6 +1,6 @@
 # GitHub App and local reconciliation
 
-Switchyard tracks PR numbers explicitly selected in a local configuration. The controller uses GitHub's current PR state after receiving a webhook and on every configured polling interval. It records lifecycle changes and exact-head check evidence in SQLite. Review submissions, inline comments, and PR conversation comments are read as inputs for the future Codex review adapter. Phase 2 leaves the required-check set unknown and produces no review verdicts, so GitHub reconciliation cannot promote a workflow to `ready_for_human`.
+Switchyard tracks PR numbers explicitly selected in a local configuration. The controller uses GitHub's current PR state after receiving a webhook and on every configured polling interval. It records lifecycle changes and exact-head check evidence in SQLite. Review submissions, inline comments, and PR conversation comments feed the [durable Codex review adapter](reviews.md). Required-check discovery belongs to Phase 5, so GitHub reconciliation cannot promote a workflow to `ready_for_human` on its own.
 
 ## Register and install the App
 
@@ -58,6 +58,10 @@ sqlite3 -readonly switchyard.sqlite \
 Consecutive secondary throttling doubles the wait from one minute and honors longer GitHub retry windows. A successful reconciliation clears its PR retry count, including when the PR closes, the head changes, or a comment page disappears. It can also clear a token-exchange retry for the same repository. An unfinished or failed reconciliation preserves the count. The controller retires counts below the retry limit for untracked PRs and terminal workflows before each pass and when a secondary throttle arrives. A late throttle from a workflow that stopped in flight still sets a cooldown. Only an active retry owner can advance the attempt count. A pause that already requires operator action stays in effect. Upgrading older retry keys without those scopes preserves active deadlines and explicit pauses. After five throttled attempts, API requests stay paused across restarts. Deliveries that need GitHub keep their inbox status and attempt counts until the operator resumes and the cooldown expires. Deliveries that require no GitHub work can still finish. Stop the controller and run `npm start -- --resume-github` using the same `SWITCHYARD_DB_PATH` to resume. The command clears the retry limit and preserves the last backoff deadline. It uses the local SQLite file without making GitHub requests. [GitHub REST API rate-limit guidance](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api#exceeding-the-rate-limit)
 
 Check run, check suite, and commit status events refresh the configured PRs in their repository. A check event may have an empty PR list, including for fork cases. Switchyard fetches the check run and status lists for the authoritative PR head in the configured base repository, and missing records remain missing. A shared check name across producers, a skipped or neutral run, or unrecognized evidence is recorded as unknown if returned. Repository ruleset discovery and required-check policy belong to Phase 5.
+
+## Optional review publication
+
+Normal webhook and polling reconciliation uses the read permissions above. For explicit publication, the App needs **Pull requests: Read and write** and the installation must accept the change. The `--review-sync` command requests a repository-scoped write token only in publish mode. Reconcile mode can read root comments, replies, and thread state with a read token. See the [review operations guide](reviews.md#github-synchronization-and-recovery).
 
 ## Offline development and live verification
 

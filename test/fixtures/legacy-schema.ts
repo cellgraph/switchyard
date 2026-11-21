@@ -7,6 +7,6 @@ export function removeDurableAgentMigration(db: DatabaseSync): void {
     ALTER TABLE agent_sessions DROP COLUMN execution;
     ALTER TABLE worktrees DROP COLUMN execution;
     ALTER TABLE operations DROP COLUMN owner_pid;
-    DELETE FROM schema_migrations WHERE version>=8;
+    DROP TABLE review_publications; DROP TABLE finding_actions; DROP TABLE review_findings; DROP TABLE review_runs; DELETE FROM schema_migrations WHERE version>=8;
   `);
 }

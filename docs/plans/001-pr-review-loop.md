@@ -71,7 +71,7 @@ Phase 3B implements durable session bindings, operation claims and outcomes, res
 - Missing credentials, missing CLI, missing session files, permission denials, and worktree conflicts are visible failures with safe escalation.
 - User checkout remains untouched and worktree cleanup cannot remove an active or uncommitted workflow.
 
-## Phase 4: Codex review adapter and findings
+## Phase 4: Codex review adapter and durable findings
 
 GitHub is the collaboration interface. Switchyard is the workflow authority. Persist review runs, individual findings, dispositions, and resulting workflow decisions in Switchyard. Link the corresponding GitHub comments and reviews as communication artifacts and sources of evidence.
 
@@ -80,6 +80,9 @@ GitHub is the collaboration interface. Switchyard is the workflow authority. Per
 3. Discover summary comments by supported author and marker, but do not assume one particular timeline event always carries the final state. Fetch current PR/review/comment data after notifications.
 4. Verify the current head SHA and explicit completion fields before generating a review verdict. Match inline findings to their reviewed SHA/source review where available and preserve file/line context.
 5. Add a fallback detector for supported review-receipt formats. If it cannot prove review completion and the commit reviewed, return `indeterminate`; never use missing comments or a reaction as clean evidence.
+
+6. Add durable review runs and operator-managed structured result ingestion. Store findings and append-only decisions with the run, and bind the workflow verdict to the exact-head run.
+7. Provide per-finding GitHub publication and reconciliation commands. Persist intent before a write and hold ambiguous attempts for inspection. See [ADR-0003](../adr/0003-durable-review-evidence-and-publication.md) and the [review operations guide](../reviews.md).
 
 ### Acceptance criteria
 

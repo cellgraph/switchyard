@@ -1,0 +1,62 @@
+{
+  "clean": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "reviewed": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "issueComments": [
+    {
+      "id": 1,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]"
+      },
+      "created_at": "2026-01-01T00:00:00Z",
+      "updated_at": "2026-01-02T00:00:00Z",
+      "body": "<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->"
+    }
+  ],
+  "reviews": [
+    {
+      "id": 2,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]"
+      },
+      "state": "COMMENTED",
+      "commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "body": "<!-- codex-review-receipt:v1 -->\n\n\n### 💡 Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `bbbbbbbbbb`"
+    }
+  ],
+  "reviewComments": [
+    {
+      "id": 10,
+      "node_id": "comment-0",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]"
+      },
+      "pull_request_review_id": 2,
+      "path": "src/module-0.ts",
+      "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "original_commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "line": 21,
+      "original_line": 21,
+      "original_start_line": 19,
+      "side": "RIGHT",
+      "start_side": "RIGHT",
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Verify example invariant 1**\n\nThis fixture preserves the provider format and uses synthetic review text.\n\nUseful? React with 👍 / 👎.\n\n<!-- codex-code-review-finding:v1 -->"
+    },
+    {
+      "id": 11,
+      "node_id": "comment-1",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]"
+      },
+      "pull_request_review_id": 2,
+      "path": "src/module-1.ts",
+      "commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "original_commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "line": null,
+      "original_line": 631,
+      "original_start_line": 630,
+      "side": "RIGHT",
+      "start_side": "RIGHT",
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Verify example invariant 2**\n\nThis fixture preserves the provider format and uses synthetic review text.\n\nUseful? React with 👍 / 👎.\n\n<!-- codex-code-review-finding:v1 -->"
+    }
+  ]
+}

@@ -18,7 +18,7 @@ export type WorkflowIdentity = {
   pullRequest: number;
 };
 export type CheckEvidence = { name: string; sha: string; outcome: CheckOutcome };
-export type ReviewEvidence = { sha: string; outcome: ReviewOutcome };
+export type ReviewEvidence = { sha: string; outcome: ReviewOutcome; runId?: string };
 export type Workflow = {
   id: string;
   identity: WorkflowIdentity;
@@ -38,6 +38,7 @@ export type WorkflowCommand =
   | { type: "head_changed"; sha: string }
   | { type: "github_pull_request"; sha: string; state: "open" | "closed" }
   | { type: "review_started" }
+  | { type: "review_invalidated"; reason: string }
   | { type: "review_received"; evidence: ReviewEvidence }
   | { type: "checks_received"; evidence: CheckEvidence[]; configuredNames: string[] | null }
   | { type: "fix_started" }
@@ -106,12 +107,17 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
       requireState(current, ["awaiting_review"]);
       next.state = "review_running";
       break;
+    case "review_invalidated":
+      next.review = null;
+      if (current.state !== "validating") next.state = "awaiting_review";
+      break;
     case "review_received":
       if (command.evidence.sha !== current.headSha)
         throw new InvalidTransitionError("Review evidence must match the current head SHA.");
       if (
         current.review?.sha === command.evidence.sha &&
-        current.review.outcome === command.evidence.outcome
+        current.review.outcome === command.evidence.outcome &&
+        current.review.runId === command.evidence.runId
       )
         return {
           workflow: current,
@@ -278,13 +284,14 @@ function transitionReason(command: WorkflowCommand, headSha: string): string {
     case "github_pull_request":
       return `github_pull_request ${command.state} at ${command.sha}`;
     case "review_received":
-      return `review_received: ${command.evidence.outcome} for ${command.evidence.sha}`;
+      return `review_received: ${command.evidence.outcome} for ${command.evidence.sha}${command.evidence.runId ? ` (run ${command.evidence.runId})` : ""}`;
     case "checks_received":
       return `checks_received for ${headSha}: ${command.evidence.map((check) => `${check.name}=${check.outcome}`).join(", ") || "no check evidence"}`;
     case "cycle_finished":
       return `cycle_finished: ${command.outcome}`;
     case "escalate":
     case "stop":
+    case "review_invalidated":
       return command.reason;
     default:
       return command.type;

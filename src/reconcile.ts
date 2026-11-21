@@ -1,3 +1,4 @@
+import { observeCodexReview } from "./codex-review.ts";
 import type { GitHubReader, PullRequestState, PullRequestTarget } from "./github-api.ts";
 import { GitHubRateLimitError, githubRetryError } from "./github-app.ts";
 import type { WorkflowStore } from "./store.ts";
@@ -58,7 +59,7 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
     function recordChecks(evidence: CheckEvidence[]): void {
       const current = id === undefined ? null : store.getWorkflow(id);
       if (current && current.state !== "stopped" && current.state !== "escalated") {
-        // Required check discovery and review interpretation are later phases.
+        // Required check discovery remains in Phase 5.
         store.transition(current.id, { type: "checks_received", evidence, configuredNames: null });
       }
     }
@@ -80,10 +81,23 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
       const readErrors = [checks, reviewInputs].flatMap((read) =>
         read.status === "rejected" ? [read.reason as unknown] : [],
       );
+      const review =
+        reviewInputs.status === "fulfilled"
+          ? observeCodexReview(start.headSha, reviewInputs.value)
+          : undefined;
       let latest: PullRequestState;
       try {
         latest = await github.readPullRequest(target);
       } catch (error) {
+        // Contradicting evidence can revoke local authorization even when the final
+        // head is unconfirmed. A completed verdict still needs head confirmation.
+        if (
+          id !== undefined &&
+          review !== undefined &&
+          (review === null || "error" in review || review.status === "running")
+        ) {
+          store.reviews().observeCodex(id, start.headSha, review);
+        }
         throw githubRetryError([...readErrors, error]) ?? error;
       }
       if (terminal()) return;
@@ -93,12 +107,15 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
         return;
       }
       const retry = githubRetryError(readErrors);
-      if (retry) throw retry;
-      if (latest.headSha !== start.headSha) throw new PullRequestHeadChangedError();
+      if (latest.headSha !== start.headSha) throw retry ?? new PullRequestHeadChangedError();
 
+      recordChecks(checks.status === "fulfilled" ? checks.value : []);
+      if (id !== undefined && review !== undefined)
+        store.reviews().observeCodex(id, latest.headSha, review);
+
+      if (retry) throw retry;
       if (reviewInputs.status === "rejected") throw reviewInputs.reason;
       if (checks.status === "rejected") throw checks.reason;
-      recordChecks(checks.value);
       github.completeReconciliation(target);
     } catch (error) {
       if (terminal()) return;
