@@ -35,7 +35,7 @@ describe("durable review runs", () => {
     store.close();
     using raw = new DatabaseSync(path);
     raw.exec(`
-      DROP TABLE fix_cycles; DROP TABLE review_publications; DROP TABLE finding_actions;
+      DROP TABLE github_observation_generations; DROP TABLE fix_cycles; DROP TABLE review_publications; DROP TABLE finding_actions;
       DROP TABLE review_findings; DROP TABLE review_runs;
       DELETE FROM schema_migrations WHERE version>=10;
     `);
@@ -44,7 +44,7 @@ describe("durable review runs", () => {
     expect(store.reviews().inspect(workflowId).runs).toEqual([]);
     expect(store.reviews().start(reviewStart).status).toBe("running");
     expect(raw.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({
-      version: 12,
+      version: 13,
     });
   });
 

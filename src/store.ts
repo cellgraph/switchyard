@@ -33,6 +33,11 @@ export type FixStoreState = {
   reanchor(cycle: FixCycle, workspace: string): void;
 };
 
+export type GitHubObservationWriter = {
+  transition(id: string, command: WorkflowCommand): Workflow;
+  observeCodex: ReturnType<WorkflowStore["reviews"]>["observeCodex"];
+};
+
 const migrations = [
   `CREATE TABLE workflows (
     id TEXT PRIMARY KEY, repository TEXT NOT NULL, pull_request INTEGER NOT NULL,
@@ -96,6 +101,10 @@ const migrations = [
   reviewMigration,
   "ALTER TABLE review_runs ADD COLUMN latest_summary TEXT;",
   fixMigration,
+  `CREATE TABLE github_observation_generations (
+    repository TEXT NOT NULL COLLATE NOCASE, pull_request INTEGER NOT NULL, generation INTEGER NOT NULL,
+    PRIMARY KEY (repository, pull_request)
+  );`,
 ];
 
 export class WorkflowStore {
@@ -199,11 +208,59 @@ export class WorkflowStore {
   }
 
   reviews() {
+    return this.#reviews((run) => this.#transaction(run));
+  }
+
+  #reviews(transaction: <T>(run: () => T) => T) {
     return createReviewStore(this.#db, {
-      transaction: (run) => this.#transaction(run),
+      transaction,
+      assertDispositionAllowed: (id, runId) => this.#assertPublicationUnclaimed(id, runId),
       getWorkflow: (id) => this.getWorkflow(id),
       transition: (id, command) => this.#transition(id, command),
     });
+  }
+
+  beginGitHubObservation(repository: string, pullRequest: number) {
+    const { generation } = this.#db
+      .prepare(
+        `
+      INSERT INTO github_observation_generations(repository, pull_request, generation)
+      VALUES (?,?,1) ON CONFLICT(repository, pull_request) DO UPDATE SET generation=generation+1
+      RETURNING generation
+    `,
+      )
+      .get(repository, pullRequest) as { generation: number };
+    return {
+      apply: (run: (observation: GitHubObservationWriter) => void): boolean =>
+        this.#transaction(() => {
+          const latest = this.#db
+            .prepare(
+              `
+          SELECT generation FROM github_observation_generations WHERE repository=? AND pull_request=?
+        `,
+            )
+            .get(repository, pullRequest);
+          if (latest?.generation !== generation) return false;
+          run({
+            transition: (id, command) => this.#transition(id, command),
+            observeCodex: this.#reviews((operation) => operation()).observeCodex,
+          });
+          return true;
+        }),
+    };
+  }
+
+  #assertPublicationUnclaimed(id: string, runId?: string) {
+    const cycle = readFixCycles(this.#db, id).at(-1);
+    if (
+      cycle?.push &&
+      cycle.push !== "confirmed" &&
+      (runId === undefined || cycle.review.id === runId)
+    ) {
+      throw new Error(
+        "Publication has already started. Reconcile the push before changing its findings or stopping the workflow.",
+      );
+    }
   }
 
   agentOperations() {
@@ -277,6 +334,7 @@ export class WorkflowStore {
   #transition(id: string, command: WorkflowCommand): Workflow {
     const current = this.getWorkflow(id);
     if (!current) throw new Error(`Workflow ${id} does not exist.`);
+    if (command.type === "stop") this.#assertPublicationUnclaimed(id);
     if (
       command.type === "github_pull_request" &&
       command.state === "open" &&

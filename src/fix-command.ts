@@ -3,7 +3,7 @@ import { isAbsolute } from "node:path";
 import { localCodexWorker } from "./agent-command.ts";
 import { authorizeFix, createFixController, fixStatus } from "./fix-controller.ts";
 import { createFixGit, runValidation } from "./fix-git.ts";
-import type { FixConfig } from "./fix-store.ts";
+import { requiredChecksForCycle, type FixConfig } from "./fix-store.ts";
 import type { GitHubReader, PullRequestTarget } from "./github-api.ts";
 import { object } from "./github-data.ts";
 import { createReconciler } from "./reconcile.ts";
@@ -121,11 +121,14 @@ export async function runFixCommand(
       process.once("SIGTERM", stop);
       try {
         const worktrees = createWorktreeManager(config);
-        const reconcile = createReconciler(store, reader, () => config.requiredChecks);
+        const reconcile = createReconciler(store, reader, () =>
+          requiredChecksForCycle(store.fixes(workflowId).read().at(-1), configured.requiredChecks),
+        );
         await createFixController({
           store,
           workflowId,
           config,
+          configuredRequiredChecks: configured.requiredChecks,
           worker: localCodexWorker(config),
           git: createFixGit(worktrees, `git@github.com:${target.repository}.git`),
           validate: runValidation,

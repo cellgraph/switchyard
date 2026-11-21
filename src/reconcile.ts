@@ -1,12 +1,18 @@
 import { observeCodexReview } from "./codex-review.ts";
 import type { GitHubReader, PullRequestState, PullRequestTarget } from "./github-api.ts";
 import { GitHubRateLimitError, githubRetryError } from "./github-app.ts";
-import type { WorkflowStore } from "./store.ts";
+import type { GitHubObservationWriter, WorkflowStore } from "./store.ts";
 import type { CheckEvidence, Workflow } from "./workflow.ts";
 
 export class PullRequestHeadChangedError extends Error {
+  constructor(message = "Pull request head changed during reconciliation.") {
+    super(message);
+  }
+}
+
+class SupersededObservationError extends PullRequestHeadChangedError {
   constructor() {
-    super("Pull request head changed during reconciliation.");
+    super("A newer GitHub reconciliation superseded this observation.");
   }
 }
 
@@ -30,17 +36,21 @@ export function createReconciler(
   requiredChecks: (target: PullRequestTarget) => string[] | null = () => null,
 ) {
   return async (target: PullRequestTarget): Promise<void> => {
-    const existing = store.findWorkflow(target.repository, target.pullRequest);
-    if (isReconciliationTerminal(existing)) return;
+    const { repository, pullRequest } = target;
+    const findWorkflow = () => store.findWorkflow(repository, pullRequest);
+    if (isReconciliationTerminal(findWorkflow())) return;
+    const generation = store.beginGitHubObservation(repository, pullRequest);
+    function apply(run: (observation: GitHubObservationWriter) => void): void {
+      if (!generation.apply(run)) throw new SupersededObservationError();
+    }
 
-    let id = existing?.id;
-    const terminal = () => !canReconcilePullRequest(store, target.repository, target.pullRequest);
-    function observe(snapshot: PullRequestState): boolean {
-      if (id === undefined) {
-        id = `${target.repository}#${target.pullRequest}`;
+    function observe(snapshot: PullRequestState, observation: GitHubObservationWriter): Workflow {
+      const current = findWorkflow();
+      const id = current?.id ?? `${repository}#${pullRequest}`;
+      if (!current) {
         store.createWorkflow({
           id,
-          identity: { repository: target.repository, pullRequest: target.pullRequest },
+          identity: { repository, pullRequest },
           state: "awaiting_review",
           headSha: snapshot.headSha,
           requiredChecks: null,
@@ -52,39 +62,42 @@ export function createReconciler(
           escalationReason: null,
         });
       }
-      const workflow = store.transition(id, {
+      return observation.transition(id, {
         type: "github_pull_request",
         state: snapshot.state,
         sha: snapshot.headSha,
       });
-      return workflow.state !== "stopped" && workflow.state !== "escalated";
     }
 
-    function recordChecks(evidence: CheckEvidence[]): void {
-      const current = id === undefined ? null : store.getWorkflow(id);
-      if (current && current.state !== "stopped" && current.state !== "escalated") {
-        store.transition(current.id, {
-          type: "checks_received",
-          evidence,
-          configuredNames: requiredChecks(target),
-        });
-      }
+    function recordChecks(
+      observation: GitHubObservationWriter,
+      current: Workflow,
+      evidence: CheckEvidence[],
+    ) {
+      observation.transition(current.id, {
+        type: "checks_received",
+        evidence,
+        configuredNames: requiredChecks(target),
+      });
     }
 
     try {
       const start = await github.readPullRequest(target);
-      if (terminal()) return;
-      if (!observe(start)) {
-        github.completeReconciliation(target);
-        return;
-      }
+      let active = false;
+      apply((observation) => {
+        if (isReconciliationTerminal(findWorkflow())) return;
+        const workflow = observe(start, observation);
+        active = workflow.state !== "stopped" && workflow.state !== "escalated";
+        if (!active) github.completeReconciliation(target);
+      });
+      if (!active) return;
 
       const [checks, reviewInputs] = await Promise.allSettled([
         github.readChecks(target, start.headSha),
         github.readReviewInputs(target),
       ]);
 
-      if (terminal()) return;
+      if (isReconciliationTerminal(findWorkflow())) return;
       const readErrors = [checks, reviewInputs].flatMap((read) =>
         read.status === "rejected" ? [read.reason as unknown] : [],
       );
@@ -96,42 +109,56 @@ export function createReconciler(
       try {
         latest = await github.readPullRequest(target);
       } catch (error) {
-        // Contradicting evidence can revoke local authorization even when the final
-        // head is unconfirmed. A completed verdict still needs head confirmation.
+        // A contradictory review can revoke authorization before head confirmation.
         if (
-          id !== undefined &&
           review !== undefined &&
           (review === null || "error" in review || review.status === "running")
         ) {
-          store.reviews().observeCodex(id, start.headSha, review);
+          apply((observation) => {
+            const current = findWorkflow();
+            if (current?.headSha === start.headSha && !isReconciliationTerminal(current))
+              observation.observeCodex(current.id, start.headSha, review);
+          });
         }
         throw githubRetryError([...readErrors, error]) ?? error;
       }
-      if (terminal()) return;
-      if (!observe(latest)) {
-        const throttled = readErrors.some((error) => error instanceof GitHubRateLimitError);
-        if (!throttled) github.completeReconciliation(target);
-        return;
-      }
+
       const retry = githubRetryError(readErrors);
+      let unfinished = false;
+      apply((observation) => {
+        if (isReconciliationTerminal(findWorkflow())) return;
+        const current = observe(latest, observation);
+        if (current.state === "stopped" || current.state === "escalated") {
+          if (!readErrors.some((error) => error instanceof GitHubRateLimitError))
+            github.completeReconciliation(target);
+          return;
+        }
+        unfinished = true;
+        if (latest.headSha !== start.headSha) return;
+
+        recordChecks(
+          observation,
+          current,
+          readErrors.length || checks.status !== "fulfilled" ? [] : checks.value,
+        );
+        if (review !== undefined) observation.observeCodex(current.id, latest.headSha, review);
+        if (!readErrors.length) github.completeReconciliation(target);
+      });
+      if (!unfinished) return;
       if (latest.headSha !== start.headSha) throw retry ?? new PullRequestHeadChangedError();
-
-      if (id !== undefined) {
-        const current = store.getWorkflow(id);
-        if (current?.headSha !== latest.headSha) throw new PullRequestHeadChangedError();
-      }
-      recordChecks(checks.status === "fulfilled" ? checks.value : []);
-      if (id !== undefined && review !== undefined)
-        store.reviews().observeCodex(id, latest.headSha, review);
-
       if (retry) throw retry;
       if (reviewInputs.status === "rejected") throw reviewInputs.reason;
       if (checks.status === "rejected") throw checks.reason;
-      github.completeReconciliation(target);
     } catch (error) {
-      if (terminal()) return;
-      recordChecks([]);
-      throw error;
+      if (error instanceof SupersededObservationError) throw error;
+      let active = false;
+      apply((observation) => {
+        const current = findWorkflow();
+        if (isReconciliationTerminal(current)) return;
+        active = true;
+        if (current && current.state !== "stopped") recordChecks(observation, current, []);
+      });
+      if (active) throw error;
     }
   };
 }

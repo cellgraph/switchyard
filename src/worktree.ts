@@ -142,30 +142,36 @@ function checkoutStatus(path: string) {
   return { status, changedPaths };
 }
 
-function contentCheckpoint(pathRoot: string, hash = createHash("sha256")): string {
-  // Include ignored files and raw bytes, since Git status can report the same paths after edits.
+function contentCheckpoint(
+  pathRoot: string,
+  hash = createHash("sha256"),
+  entries?: string[],
+): string {
+  // Include raw bytes, since Git status can report the same paths after edits.
   let remainingBytes = 64 * 1024 * 1024;
   let remainingEntries = 10_000;
-  function visit(directory: string): void {
-    for (const name of readdirSync(directory).sort()) {
-      if (directory === pathRoot && name === ".git") continue;
-      const path = join(directory, name);
-      const stat = lstatSync(path);
-      if (--remainingEntries < 0 || (remainingBytes -= stat.size) < 0)
-        throw new Error("Worktree exceeds the bounds for a durable checkout checkpoint.");
-      hash.update(JSON.stringify([relative(pathRoot, path), stat.mode]));
-      if (stat.isDirectory()) visit(path);
-      else if (stat.isSymbolicLink())
-        hash.update(
-          createHash("sha256")
-            .update(readlinkSync(path, { encoding: "buffer" }))
-            .digest(),
-        );
-      else if (stat.isFile()) hash.update(createHash("sha256").update(readFileSync(path)).digest());
-      else throw new Error("Worktree contains an unsupported file type.");
-    }
+  function visit(path: string): void {
+    const stat = lstatSync(path);
+    if (--remainingEntries < 0 || (remainingBytes -= stat.size) < 0)
+      throw new Error("Worktree exceeds the bounds for a durable checkout checkpoint.");
+    hash.update(JSON.stringify([relative(pathRoot, path), stat.mode]));
+    if (stat.isDirectory()) {
+      for (const name of readdirSync(path).sort()) visit(join(path, name));
+    } else if (stat.isSymbolicLink()) {
+      hash.update(
+        createHash("sha256")
+          .update(readlinkSync(path, { encoding: "buffer" }))
+          .digest(),
+      );
+    } else if (stat.isFile()) {
+      hash.update(createHash("sha256").update(readFileSync(path)).digest());
+    } else throw new Error("Worktree contains an unsupported file type.");
   }
-  visit(pathRoot);
+  for (const entry of entries ??
+    readdirSync(pathRoot)
+      .sort()
+      .filter((name) => name !== ".git"))
+    visit(join(pathRoot, entry.replace(/\/$/, "")));
   return hash.digest("hex");
 }
 
@@ -340,6 +346,24 @@ export function createWorktreeManager({
     contentCheckpoint(worktree: Worktree, expectedHead: string): string {
       validate(worktree, expectedHead);
       return contentCheckpoint(worktree.path);
+    },
+
+    ignoredCheckpoint(worktree: Worktree, expectedHead: string): string {
+      validate(worktree, expectedHead);
+      const ignored = git(
+        worktree.path,
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+        "-z",
+      );
+      return contentCheckpoint(
+        worktree.path,
+        undefined,
+        ignored.split("\0").filter(Boolean).sort(),
+      );
     },
 
     observe(worktree: Worktree, beforeHead: string) {

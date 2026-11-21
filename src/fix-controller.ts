@@ -21,6 +21,7 @@ type Dependencies = {
     timeout: number,
   ): Promise<ValidationResult>;
   config: FixConfig;
+  configuredRequiredChecks?: string[];
   signal?: AbortSignal;
 };
 
@@ -287,8 +288,9 @@ Review data: ${JSON.stringify(cycle.review)}`,
     }
     try {
       assertReview(current, "validating");
+      const ignoredCheckpoint = verifiedIgnoredBaseline(current);
       if (!current.candidate) {
-        const candidate = git.stage(current, agentCheckpoint);
+        const candidate = git.stage(current, agentCheckpoint, ignoredCheckpoint);
         record((before) => ({ ...before, candidate }));
       }
       for (const command of current.config.validation) {
@@ -362,11 +364,19 @@ Review data: ${JSON.stringify(cycle.review)}`,
     });
   }
 
+  function verifiedIgnoredBaseline(cycle: FixCycle): string {
+    const baseline = store.agentOperations().get(cycle.operationId)?.evidence?.ignoredCheckpoint;
+    if (!baseline)
+      throw new Error("The candidate lacks a verified pre-turn baseline for ignored inputs.");
+    return baseline;
+  }
+
   async function publish(cycle: FixCycle, pr: PullRequestState) {
     let current = cycle;
     try {
       assertBase(pr, current);
       assertReview(current, "validating");
+      verifiedIgnoredBaseline(current);
       if (git.remoteHead(current) !== current.head)
         throw new Error("The remote branch is missing or differs from the authorized parent.");
       if (!current.commit) {
@@ -381,16 +391,22 @@ Review data: ${JSON.stringify(cycle.review)}`,
       const fresh = await deps.readPullRequest();
       assertBase(fresh, current);
       assertReview(current, "validating");
-      const pushing = edit(
-        current,
-        (before) => ({ ...before, phase: "pushing", push: "intent" }),
-        "validating",
-      );
-      if (!pushing) return;
+      let claimed = false;
       try {
-        git.push(pushing);
+        git.push(current, () => {
+          const pushing = edit(
+            current,
+            (before) => ({ ...before, phase: "pushing", push: "intent" }),
+            "validating",
+          );
+          if (!pushing) throw new Error("Publication lost its dispatch claim.");
+          current = pushing;
+          claimed = true;
+        });
+        if (!claimed) throw new Error("Git returned without claiming publication dispatch.");
       } catch (error) {
-        edit(pushing, (before) => ({
+        if (!claimed) throw error;
+        edit(current, (before) => ({
           ...before,
           phase: "confirming",
           owner: null,
@@ -399,7 +415,7 @@ Review data: ${JSON.stringify(cycle.review)}`,
         }));
         return;
       }
-      edit(pushing, (before) => ({
+      edit(current, (before) => ({
         ...before,
         phase: "confirming",
         owner: null,
@@ -446,6 +462,11 @@ Review data: ${JSON.stringify(cycle.review)}`,
         return;
       reanchor(cycle, checkpoint);
       save({ ...cycle, phase: "finished", owner: null, push: "confirmed" });
+      transition({
+        type: "checks_received",
+        evidence: workflow.checks,
+        configuredNames: deps.configuredRequiredChecks ?? config.requiredChecks,
+      });
       transition({ type: "cycle_finished", outcome: "successful" });
     });
   }

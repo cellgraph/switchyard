@@ -1,11 +1,11 @@
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentAdapter } from "../src/agent.ts";
 import { authorizeFix, createFixController } from "../src/fix-controller.ts";
 import { createFixGit, runValidation } from "../src/fix-git.ts";
-import type { FixConfig, FixCycle } from "../src/fix-store.ts";
+import { requiredChecksForCycle, type FixConfig, type FixCycle } from "../src/fix-store.ts";
 import type { GitHubReader, PullRequestState } from "../src/github-api.ts";
 import { createLocalAgentExecution } from "../src/local-agent-execution.ts";
 import { createReconciler } from "../src/reconcile.ts";
@@ -27,7 +27,7 @@ describe("bounded single-PR fixes", () => {
   let checkOutcome: "passed" | "failed" | null;
   let cleanReviewSha: string | undefined;
   let markForJudgment: boolean;
-  let onTurn: () => Promise<void>;
+  let onTurn: (workingDirectory: string) => Promise<void>;
   let launches: number;
   let resumes: number;
   let session: AgentAdapter;
@@ -84,7 +84,7 @@ describe("bounded single-PR fixes", () => {
           launches++;
           expect(turn.prompt).toContain(finding.evidence);
           expect(turn.prompt).toContain("Operator reproduced the issue.");
-          await onTurn();
+          await onTurn(workingDirectory);
           turn.onEvent?.({
             provider: "codex",
             kind: "turn_completed",
@@ -150,12 +150,20 @@ describe("bounded single-PR fixes", () => {
     rmSync(fixture.root, { recursive: true, force: true });
   });
 
-  function controller(db = store, gitBoundary = repository, refresh?: () => Promise<void>) {
-    const reconcile = createReconciler(db, reader, () => config.requiredChecks);
+  function controller(
+    db = store,
+    gitBoundary = repository,
+    refresh?: () => Promise<void>,
+    configuredRequiredChecks = config.requiredChecks,
+  ) {
+    const reconcile = createReconciler(db, reader, () =>
+      requiredChecksForCycle(current(db), configuredRequiredChecks),
+    );
     return createFixController({
       store: db,
       workflowId,
       config,
+      configuredRequiredChecks,
       git: gitBoundary,
       readPullRequest: () => reader.readPullRequest(target),
       refresh: refresh ?? (() => reconcile(target)),
@@ -435,7 +443,8 @@ describe("bounded single-PR fixes", () => {
 
   it("never replays an ambiguous push with the original ref still visible", async () => {
     await validate();
-    const push = vi.spyOn(repository, "push").mockImplementation(() => {
+    const push = vi.spyOn(repository, "push").mockImplementation((_cycle, claim) => {
+      claim();
       throw new Error("Transport closed without reporting a result.");
     });
     await publish();
@@ -535,14 +544,238 @@ describe("bounded single-PR fixes", () => {
     await validate();
     await publish({
       ...repository,
-      push(cycle) {
-        git(remote, "update-ref", "-d", "refs/heads/feat/pr");
-        repository.push(cycle);
+      push(cycle, claim) {
+        repository.push(cycle, () => {
+          claim();
+          git(remote, "update-ref", "-d", "refs/heads/feat/pr");
+        });
       },
     });
     expect(current()).toMatchObject({ phase: "confirming", push: "unknown" });
     expect(git(remote, "for-each-ref", "refs/heads/feat/pr")).toBe("");
   });
+
+  it.each(["disposition", "stop"])(
+    "blocks dispatch if a concurrent %s wins before Git starts",
+    async (writer) => {
+      await validate();
+      const other = new WorkflowStore(fixture.db);
+      try {
+        await publish({
+          ...repository,
+          push(cycle, claim) {
+            repository.push(cycle, () => {
+              if (writer === "disposition") revoke(other, cycle);
+              else
+                other.transition(workflowId, {
+                  type: "stop",
+                  reason: "Operator stopped the workflow.",
+                });
+              claim();
+            });
+          },
+        });
+        expect(current()).toMatchObject({ phase: "escalated" });
+        expect(current().push).toBeUndefined();
+        expect(remoteHead()).toBe(fixture.workflow.headSha);
+      } finally {
+        other.close();
+      }
+    },
+  );
+
+  function revoke(db: WorkflowStore, cycle: FixCycle) {
+    const finding = cycle.review.findings[0]!;
+    return db.reviews().act({
+      id: "revoke-for-publication-test",
+      findingId: finding.id,
+      headSha: cycle.head,
+      action: "superseded",
+      actor: "operator",
+      rationale: "Withdraw the fix.",
+      previousActionId: finding.lastActionId,
+    });
+  }
+
+  it("rejects revocation and stop from another connection once Git claims dispatch", async () => {
+    await validate();
+    const other = new WorkflowStore(fixture.db);
+    try {
+      await publish({
+        ...repository,
+        push(cycle, claim) {
+          repository.push(cycle, () => {
+            claim();
+            expect(current(other).push).toBe("intent");
+            expect(() => revoke(other, cycle)).toThrow(/publication has already started/i);
+            expect(() =>
+              other.transition(workflowId, { type: "stop", reason: "Stop now." }),
+            ).toThrow(/publication has already started/i);
+          });
+        },
+      });
+      expect(remoteHead()).toBe(current().commit);
+      expect(current().push).toBe("returned");
+      expect(store.reviews().inspect(workflowId).actionableFindings).toEqual([
+        current().review.findings[0]!.id,
+      ]);
+    } finally {
+      other.close();
+    }
+  });
+
+  async function delayFinalObservation(
+    db: WorkflowStore,
+    delayedReader: GitHubReader,
+    assertNewer: () => Promise<void>,
+  ) {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let reads = 0;
+    const old = createReconciler(
+      db,
+      {
+        ...delayedReader,
+        async readPullRequest(target) {
+          const snapshot = await delayedReader.readPullRequest(target);
+          if (++reads === 2) {
+            entered.resolve();
+            await release.promise;
+          }
+          return snapshot;
+        },
+      },
+      () => config.requiredChecks,
+    )(target);
+    const finished = expect(old).rejects.toThrow(/superseded this observation/);
+    await entered.promise;
+    try {
+      await assertNewer();
+    } finally {
+      release.resolve();
+      await finished;
+    }
+  }
+
+  it("cannot restore readiness with older passing checks on the same head", async () => {
+    const head = remoteHead();
+    cleanReviewSha = head;
+    const other = new WorkflowStore(fixture.db);
+    try {
+      await delayFinalObservation(
+        other,
+        {
+          ...reader,
+          async readChecks() {
+            return [{ name: "Quality checks", sha: head, outcome: "passed" }];
+          },
+        },
+        async () => {
+          checkOutcome = "failed";
+          await createReconciler(store, reader, () => config.requiredChecks)(target);
+        },
+      );
+      expect(store.getWorkflow(workflowId)).toMatchObject({
+        state: "awaiting_review",
+        headSha: head,
+        checks: [{ name: "Quality checks", sha: head, outcome: "failed" }],
+      });
+    } finally {
+      other.close();
+    }
+  });
+
+  it("cannot apply an older pre-push head after the publication is confirmed", async () => {
+    await validate();
+    await publish();
+    observedHead = fixture.workflow.headSha;
+    const other = new WorkflowStore(fixture.db);
+    try {
+      await delayFinalObservation(other, reader, async () => {
+        observedHead = undefined;
+        await controller().advance();
+        expect(current().push).toBe("confirmed");
+      });
+      expect(store.getWorkflow(workflowId)).toMatchObject({
+        state: "awaiting_review",
+        headSha: current().commit,
+        escalationReason: null,
+      });
+    } finally {
+      other.close();
+    }
+  });
+
+  it("applies new required checks at confirmation and retains them in polling and CLI advances", async () => {
+    await validate();
+    await publish();
+    cleanReviewSha = remoteHead();
+    checkOutcome = "passed";
+    const configured = ["Quality checks", "Integration"];
+    const first = await controller(store, repository, undefined, configured).advance();
+    expect(first.cycles.at(-1)?.push).toBe("confirmed");
+    expect(first.workflow).toMatchObject({ state: "awaiting_review", requiredChecks: configured });
+    const polling = createReconciler(store, reader, () =>
+      requiredChecksForCycle(current(), configured),
+    );
+    await polling(target);
+    expect(store.getWorkflow(workflowId)).toMatchObject({
+      state: "awaiting_review",
+      requiredChecks: configured,
+    });
+    await controller(store, repository, undefined, configured).advance();
+    expect(store.getWorkflow(workflowId)).toMatchObject({
+      state: "awaiting_review",
+      requiredChecks: configured,
+    });
+  });
+
+  it.each(["created", "modified", "unchanged"] as const)(
+    "checks %s ignored inputs against the pre-turn checkout",
+    async (change) => {
+      const excludes = join(fixture.root, "fixture-excludes");
+      writeFileSync(excludes, "dependencies/\n");
+      git(fixture.repo, "config", "core.excludesFile", excludes);
+      config.validation = [
+        {
+          id: "has-local-input",
+          argv: [process.execPath, "-e", 'require("node:fs").accessSync("dependencies/input")'],
+        },
+      ];
+      review("review-1", "accepted");
+      await authorize();
+      const reconcile = createReconciler(store, reader, () => config.requiredChecks);
+      let refreshes = 0;
+      if (change !== "unchanged") {
+        onTurn = async (path) => {
+          const directory = join(path, "dependencies");
+          mkdirSync(directory, { recursive: true });
+          writeFileSync(join(directory, "input"), "agent output");
+        };
+      }
+      const result = await controller(store, repository, async () => {
+        await reconcile(target);
+        if (++refreshes === 2 && change !== "created") {
+          const directory = join(
+            store.agentOperations().get(current().operationId)!.evidence!.worktree!.path,
+            "dependencies",
+          );
+          mkdirSync(directory);
+          writeFileSync(join(directory, "input"), "preinstalled");
+        }
+      }).advance();
+      if (change === "unchanged") {
+        expect(result.cycles.at(-1)).toMatchObject({
+          phase: "validated",
+          validation: [{ status: "passed" }],
+        });
+      } else {
+        expect(result.workflow.escalationReason).toMatch(/changed ignored inputs/i);
+        expect(current().validation).toEqual([]);
+        expect(remoteHead()).toBe(fixture.workflow.headSha);
+      }
+    },
+  );
 
   it("holds an otherwise successful agent result that exceeds measured token limits", async () => {
     config.maxTotalTokens = 16;

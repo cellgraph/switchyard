@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { runAgentCommand } from "./agent-command.ts";
 import { createController, createGitHubRetryOwnerCheck, describeError } from "./controller.ts";
+import { requiredChecksForCycle } from "./fix-store.ts";
 import { parseFixConfig, runFixCommand } from "./fix-command.ts";
 import { createGitHubReader, type PullRequestTarget } from "./github-api.ts";
 import { createGitHubAppClient, resumeGitHubAfterSecondaryLimit } from "./github-app.ts";
@@ -124,14 +125,11 @@ async function main(): Promise<void> {
     const controller = createController({
       ...config,
       store,
-      reconcile: createReconciler(
-        store,
-        reader,
-        (target) =>
-          store.fixes(`${target.repository}#${target.pullRequest}`).read().at(-1)?.config
-            .requiredChecks ??
-          config.fix?.requiredChecks ??
-          null,
+      reconcile: createReconciler(store, reader, (target) =>
+        requiredChecksForCycle(
+          store.fixes(`${target.repository}#${target.pullRequest}`).read().at(-1),
+          config.fix?.requiredChecks ?? null,
+        ),
       ),
       reportError,
       reportDeferred: onceOnly,

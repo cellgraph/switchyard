@@ -149,6 +149,7 @@ const codexReviewer = JSON.stringify({
 
 type StoreContext = {
   transaction<T>(run: () => T): T;
+  assertDispositionAllowed(workflowId: string, runId: string): void;
   getWorkflow(id: string): Workflow | null;
   transition(id: string, command: WorkflowCommand): Workflow;
 };
@@ -580,6 +581,7 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
           FindingRow | undefined;
         if (!finding) throw new Error("Review finding does not exist.");
         const current = workflow(run(finding.run_id)!.workflow_id);
+        context.assertDispositionAllowed(current.id, finding.run_id);
         if (current.headSha !== sha)
           throw new Error("Finding action must use the current workflow head.");
         const status = summarize(finding);

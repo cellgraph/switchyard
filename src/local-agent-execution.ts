@@ -31,6 +31,12 @@ export function createLocalAgentExecution(
     }) {
       recordExpectedWorktree(worktrees.locate(target));
       let source: AgentSessionCheckpoint | undefined;
+      let ignoredBaseline: string | undefined;
+      const authorize = () => {
+        if (fixFindingIds)
+          ignoredBaseline = worktrees.ignoredCheckpoint(session.worktree, target.expectedHead);
+        authorizeLaunch();
+      };
       const saved = previous?.reference;
       if (previous) {
         if (!saved || !previous.checkpoint) throw new Error("Agent session binding is incomplete.");
@@ -51,9 +57,9 @@ export function createLocalAgentExecution(
             source = sessionCheckpoint(saved.agent.id, saved.worktree.path);
             if (!isDeepStrictEqual(source, previous?.checkpoint?.session))
               throw new Error("Agent session changed since the previous operation.");
-            authorizeLaunch();
+            authorize();
           })
-        : worker.startSession(target, true, authorizeLaunch);
+        : worker.startSession(target, true, authorize);
       recordWorkspace(session.worktree);
       if (refreshLaunch) await refreshLaunch();
       if (
@@ -128,6 +134,14 @@ export function createLocalAgentExecution(
       if (reference) evidence.reference = reference;
       if (reference && result.agent.outcome === "completed" && "head" in result.workspace) {
         try {
+          if (fixFindingIds) {
+            const ignored = worktrees.ignoredCheckpoint(reference.worktree, result.workspace.head);
+            if (ignoredBaseline === undefined || ignored !== ignoredBaseline)
+              throw new Error(
+                "The agent changed ignored inputs. Validation would not reflect the published tree.",
+              );
+            evidence.ignoredCheckpoint = ignored;
+          }
           const workspace = worktrees.checkpoint(reference.worktree, result.workspace.head);
           const session = sessionCheckpoint(reference.agent.id, reference.worktree.path);
           if (source && source.identity !== session.identity)

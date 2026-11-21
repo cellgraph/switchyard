@@ -50,6 +50,7 @@ export type AgentTurnEvidence = {
   checkpoint?: { workspace: string; session: AgentSessionCheckpoint };
   error?: string;
   addressedFindings?: string[];
+  ignoredCheckpoint?: string;
   usage?: { inputTokens: number; outputTokens: number };
 };
 

@@ -87,7 +87,11 @@ export function createFixGit(worktrees: WorktreeManager, remote: string) {
   }
 
   return {
-    stage(cycle: FixCycle, agentCheckpoint: string): NonNullable<FixCycle["candidate"]> {
+    stage(
+      cycle: FixCycle,
+      agentCheckpoint: string,
+      ignoredCheckpoint: string,
+    ): NonNullable<FixCycle["candidate"]> {
       const worktree = cycle.worktree!;
       const { changedPaths } = worktrees.validate(worktree, cycle.head);
       if (worktrees.checkpoint(worktree, cycle.head) !== agentCheckpoint)
@@ -96,6 +100,8 @@ export function createFixGit(worktrees: WorktreeManager, remote: string) {
       const content = worktrees.contentCheckpoint(worktree, cycle.head);
       git(worktree.path, "add", "-A", "--");
       const tree = stagedTree(cycle);
+      if (worktrees.ignoredCheckpoint(worktree, cycle.head) !== ignoredCheckpoint)
+        throw new Error("Ignored inputs changed before validation. Verify the checkout setup.");
       if (worktrees.contentCheckpoint(worktree, cycle.head) !== content)
         throw new Error("Checkout content changed during staging.");
       return { tree, content, checkpoint: worktrees.checkpoint(worktree, cycle.head) };
@@ -156,7 +162,7 @@ export function createFixGit(worktrees: WorktreeManager, remote: string) {
         throw new Error("Remote branch lookup returned unexpected evidence.");
       return sha;
     },
-    push(cycle: FixCycle) {
+    push(cycle: FixCycle, authorizeDispatch: () => void) {
       this.verifyCheckout(cycle);
       const ref = destination(cycle);
       const hooksPath = mkdtempSync(join(tmpdir(), "switchyard-push-"));
@@ -175,6 +181,7 @@ exit 0
 `,
           { mode: 0o700 },
         );
+        authorizeDispatch();
         runGit(
           cycle.worktree!.path,
           [

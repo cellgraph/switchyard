@@ -87,6 +87,12 @@ export type FixCycle = {
   updatedAt: string;
 };
 
+export function requiredChecksForCycle(cycle: FixCycle | undefined, configured: string[] | null) {
+  return cycle && !["proposed", "finished", "escalated"].includes(cycle.phase)
+    ? cycle.config.requiredChecks
+    : configured;
+}
+
 export function workflowAuthorizationRevision(db: DatabaseSync, id: string): number {
   return (
     db
