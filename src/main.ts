@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { runAgentCommand } from "./agent-command.ts";
 import { createController, createGitHubRetryOwnerCheck, describeError } from "./controller.ts";
+import { parseFixConfig, runFixCommand } from "./fix-command.ts";
 import { createGitHubReader, type PullRequestTarget } from "./github-api.ts";
 import { createGitHubAppClient, resumeGitHubAfterSecondaryLimit } from "./github-app.ts";
 import { object, positiveInteger, repositoryName } from "./github-data.ts";
@@ -11,7 +12,7 @@ import { runReviewCommand } from "./review-command.ts";
 import { WorkflowStore } from "./store.ts";
 import { createWebhookServer } from "./webhook.ts";
 
-function loadConfig(path: string): { targets: PullRequestTarget[]; reconcileIntervalMs: number } {
+function loadConfig(path: string) {
   const raw = readFileSync(path, "utf8");
   let config: Record<string, unknown> | undefined;
   try {
@@ -48,7 +49,28 @@ function loadConfig(path: string): { targets: PullRequestTarget[]; reconcileInte
   const interval = config.reconcileIntervalMs ?? 60_000;
   if (interval !== 0 && !positiveInteger(interval))
     throw new Error("reconcileIntervalMs must be a non-negative integer.");
-  return { targets, reconcileIntervalMs: interval };
+  const fix = config.fix === undefined ? undefined : parseFixConfig(config.fix);
+  if (fix && targets.length !== 1)
+    throw new Error("Fix orchestration requires exactly one configured pull request.");
+  return { targets, reconcileIntervalMs: interval, fix };
+}
+
+function makeReader(store: WorkflowStore, targets: PullRequestTarget[]) {
+  const clientId = process.env.GITHUB_APP_CLIENT_ID;
+  const keyPath = process.env.GITHUB_APP_PRIVATE_KEY_PATH;
+  if (!clientId || !keyPath)
+    throw new Error("Set GITHUB_APP_CLIENT_ID and GITHUB_APP_PRIVATE_KEY_PATH.");
+  return createGitHubReader(
+    createGitHubAppClient({
+      clientId,
+      privateKey: readFileSync(keyPath, "utf8"),
+      rateLimits: store.githubRateLimits(),
+      retryDeadlines: store.reconciliationRetries(),
+      isRetryOwnerActive: createGitHubRetryOwnerCheck(store, targets),
+      canReadPullRequest: (target, pullRequest) =>
+        canReconcilePullRequest(store, target.repository, pullRequest),
+    }),
+  );
 }
 
 async function main(): Promise<void> {
@@ -57,6 +79,7 @@ async function main(): Promise<void> {
   process.umask(0o077);
   if (await runReviewCommand(args, dbPath, (path) => loadConfig(path).targets)) return;
   if (await runAgentCommand(args, dbPath)) return;
+  if (await runFixCommand(args, dbPath, (path) => loadConfig(path).targets, makeReader)) return;
   if (args.length === 1 && args[0] === "--resume-github") {
     const store = new WorkflowStore(dbPath);
     try {
@@ -79,12 +102,6 @@ async function main(): Promise<void> {
     );
 
   const config = loadConfig(configPath);
-  const clientId = process.env.GITHUB_APP_CLIENT_ID;
-  const keyPath = process.env.GITHUB_APP_PRIVATE_KEY_PATH;
-  if (!clientId || !keyPath)
-    throw new Error("Set GITHUB_APP_CLIENT_ID and GITHUB_APP_PRIVATE_KEY_PATH.");
-  const privateKey = readFileSync(keyPath, "utf8");
-
   const store = new WorkflowStore(dbPath);
   const secret = process.env.GITHUB_WEBHOOK_SECRET;
   const reportError = (message: string) => console.error(message);
@@ -96,17 +113,7 @@ async function main(): Promise<void> {
 
   try {
     const isRetryOwnerActive = createGitHubRetryOwnerCheck(store, config.targets);
-    const reader = createGitHubReader(
-      createGitHubAppClient({
-        clientId,
-        privateKey,
-        rateLimits: store.githubRateLimits(),
-        retryDeadlines: store.reconciliationRetries(),
-        isRetryOwnerActive,
-        canReadPullRequest: (target, pullRequest) =>
-          canReconcilePullRequest(store, target.repository, pullRequest),
-      }),
-    );
+    const reader = makeReader(store, config.targets);
     const recovered = store.recover();
     if (
       recovered.deliveries ||
@@ -117,7 +124,15 @@ async function main(): Promise<void> {
     const controller = createController({
       ...config,
       store,
-      reconcile: createReconciler(store, reader),
+      reconcile: createReconciler(
+        store,
+        reader,
+        (target) =>
+          store.fixes(`${target.repository}#${target.pullRequest}`).read().at(-1)?.config
+            .requiredChecks ??
+          config.fix?.requiredChecks ??
+          null,
+      ),
       reportError,
       reportDeferred: onceOnly,
       isRetryOwnerActive,

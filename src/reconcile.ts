@@ -24,7 +24,11 @@ export function canReconcilePullRequest(
   return !isReconciliationTerminal(store.findWorkflow(repository, pullRequest));
 }
 
-export function createReconciler(store: WorkflowStore, github: GitHubReader) {
+export function createReconciler(
+  store: WorkflowStore,
+  github: GitHubReader,
+  requiredChecks: (target: PullRequestTarget) => string[] | null = () => null,
+) {
   return async (target: PullRequestTarget): Promise<void> => {
     const existing = store.findWorkflow(target.repository, target.pullRequest);
     if (isReconciliationTerminal(existing)) return;
@@ -59,8 +63,11 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
     function recordChecks(evidence: CheckEvidence[]): void {
       const current = id === undefined ? null : store.getWorkflow(id);
       if (current && current.state !== "stopped" && current.state !== "escalated") {
-        // Required check discovery remains in Phase 5.
-        store.transition(current.id, { type: "checks_received", evidence, configuredNames: null });
+        store.transition(current.id, {
+          type: "checks_received",
+          evidence,
+          configuredNames: requiredChecks(target),
+        });
       }
     }
 
@@ -109,6 +116,10 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
       const retry = githubRetryError(readErrors);
       if (latest.headSha !== start.headSha) throw retry ?? new PullRequestHeadChangedError();
 
+      if (id !== undefined) {
+        const current = store.getWorkflow(id);
+        if (current?.headSha !== latest.headSha) throw new PullRequestHeadChangedError();
+      }
       recordChecks(checks.status === "fulfilled" ? checks.value : []);
       if (id !== undefined && review !== undefined)
         store.reviews().observeCodex(id, latest.headSha, review);

@@ -9,7 +9,11 @@ import type {
 import { describeError } from "./controller.ts";
 import type { WorkflowStore } from "./store.ts";
 
-export function createAgentController(store: WorkflowStore, worker: AgentOperationWorker) {
+export function createAgentController(
+  store: WorkflowStore,
+  worker: AgentOperationWorker,
+  refreshLaunch?: () => Promise<void>,
+) {
   const operations = store.agentOperations();
 
   function request({
@@ -19,6 +23,7 @@ export function createAgentController(store: WorkflowStore, worker: AgentOperati
     expectedPullRequestHead,
     expectedHead,
     prompt,
+    fix,
   }: AgentTurnRequest) {
     if (
       ![operationId, workflowId, branch, expectedPullRequestHead, expectedHead, prompt].every(
@@ -34,12 +39,15 @@ export function createAgentController(store: WorkflowStore, worker: AgentOperati
       )
     )
       throw new Error("Agent turns require full Git commit SHAs.");
+    if (fix && !refreshLaunch)
+      throw new Error("Fix turns require controller-owned GitHub preflight.");
     return operations.request({
       operationId,
       workflowId,
       branch,
       expectedPullRequestHead,
       expectedHead,
+      ...(fix ? { fix } : {}),
       configurationId: worker.configurationId,
       promptDigest: createHash("sha256").update(prompt).digest("hex"),
     });
@@ -80,6 +88,8 @@ export function createAgentController(store: WorkflowStore, worker: AgentOperati
           previous,
           ...(signal === undefined ? {} : { signal }),
           authorizeLaunch: () => operations.authorizeLaunch(operationId),
+          ...(refreshLaunch ? { refreshLaunch } : {}),
+          ...(input.fix ? { fixFindingIds: input.fix.findingIds } : {}),
           recordExpectedWorktree: (expectedWorktree) =>
             operations.progress(operationId, { expectedWorktree }),
           recordWorkspace: (worktree) => operations.progress(operationId, { worktree }),

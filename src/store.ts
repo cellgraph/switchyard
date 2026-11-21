@@ -1,5 +1,12 @@
 import { DatabaseSync } from "node:sqlite";
 import { createAgentOperationStore, recoverAgentOperations } from "./agent-store.ts";
+import {
+  fixMigration,
+  readFixCycles,
+  readFixReview,
+  workflowAuthorizationRevision,
+  type FixCycle,
+} from "./fix-store.ts";
 import type { GitHubRateLimits, GitHubRateLimitState } from "./github-app.ts";
 import { createReviewPublications } from "./review-publications.ts";
 import { createReviewStore, reviewMigration } from "./review-store.ts";
@@ -15,6 +22,16 @@ export type DeliveryStatus = "pending" | "processing" | "processed" | "failed";
 type InboxDelivery = { deliveryId: string; payload: unknown; workflowId: string | null };
 type DeliveryRow = { delivery_id: string; payload: string; workflow_id: string | null };
 export type OperationStatus = "pending" | "completed" | "failed" | "ambiguous";
+
+export type FixStoreState = {
+  workflow: Workflow;
+  cycles: FixCycle[];
+  review: ReturnType<typeof readFixReview>;
+  revision: number;
+  save(cycle: FixCycle): FixCycle;
+  transition(command: WorkflowCommand): Workflow;
+  reanchor(cycle: FixCycle, workspace: string): void;
+};
 
 const migrations = [
   `CREATE TABLE workflows (
@@ -78,6 +95,7 @@ const migrations = [
   "ALTER TABLE operations ADD COLUMN owner_pid INTEGER;",
   reviewMigration,
   "ALTER TABLE review_runs ADD COLUMN latest_summary TEXT;",
+  fixMigration,
 ];
 
 export class WorkflowStore {
@@ -196,6 +214,66 @@ export class WorkflowStore {
     });
   }
 
+  fixes(workflowId: string) {
+    return {
+      read: () => readFixCycles(this.#db, workflowId),
+      edit: <T>(run: (state: FixStoreState) => T): T =>
+        this.#transaction(() => {
+          const workflow = this.getWorkflow(workflowId);
+          if (!workflow) throw new Error("Workflow does not exist. Reconcile GitHub first.");
+          return run({
+            workflow,
+            cycles: readFixCycles(this.#db, workflowId),
+            review: readFixReview(this.#db, workflow),
+            revision: workflowAuthorizationRevision(this.#db, workflowId),
+            save: (cycle) => this.#saveFix(cycle),
+            transition: (command) => this.#transition(workflowId, command),
+            reanchor: (cycle, workspace) => {
+              const result = this.#db
+                .prepare(
+                  `
+              UPDATE agent_sessions SET execution=json_set(execution, '$.head', ?, '$.checkpoint.workspace', ?, '$.updatedAt', ?)
+              WHERE workflow_id=? AND json_extract(execution, '$.status')='active'
+              AND json_extract(execution, '$.head')=? AND json_extract(execution, '$.lastOperationId')=?
+            `,
+                )
+                .run(
+                  cycle.commit!,
+                  workspace,
+                  new Date().toISOString(),
+                  workflowId,
+                  cycle.head,
+                  cycle.operationId,
+                );
+              if (result.changes !== 1)
+                throw new Error("Fix session changed before publication confirmation.");
+            },
+          });
+        }),
+    };
+  }
+
+  #saveFix(cycle: FixCycle): FixCycle {
+    cycle = { ...cycle, version: cycle.version + 1, updatedAt: new Date().toISOString() };
+    this.#db
+      .prepare(
+        `
+      DELETE FROM fix_cycles WHERE workflow_id=? AND head_sha=? AND id<>?
+      AND json_extract(record, '$.phase')='proposed'
+    `,
+      )
+      .run(cycle.workflowId, cycle.head, cycle.id);
+    this.#db
+      .prepare(
+        `
+      INSERT INTO fix_cycles(id, workflow_id, head_sha, record) VALUES (?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET record=excluded.record
+    `,
+      )
+      .run(cycle.id, cycle.workflowId, cycle.head, JSON.stringify(cycle));
+    return cycle;
+  }
+
   #transition(id: string, command: WorkflowCommand): Workflow {
     const current = this.getWorkflow(id);
     if (!current) throw new Error(`Workflow ${id} does not exist.`);
@@ -223,6 +301,44 @@ export class WorkflowStore {
         throw new Error(
           "Cannot resume a reopened pull request while an external operation is pending.",
         );
+      }
+    }
+    const cycle = readFixCycles(this.#db, id).at(-1);
+    if (cycle && !["proposed", "finished", "escalated"].includes(cycle.phase)) {
+      const observed =
+        command.type === "github_pull_request" || command.type === "head_changed"
+          ? command.sha
+          : undefined;
+      const expectedPublication =
+        cycle.commit &&
+        ["pushing", "confirming"].includes(cycle.phase) &&
+        (current.headSha === cycle.head || current.headSha === cycle.commit);
+      const expectedHead = observed && expectedPublication && observed === cycle.commit;
+      const invalidHead = observed && observed !== current.headSha && !expectedHead;
+      const closed = command.type === "github_pull_request" && command.state === "closed";
+      const invalidReview =
+        current.headSha === cycle.head &&
+        (command.type === "review_invalidated" ||
+          (command.type === "review_received" &&
+            (command.evidence.runId !== cycle.review.id ||
+              command.evidence.outcome !== "completed_with_findings")));
+      if (invalidHead || closed || invalidReview) {
+        const reason = closed
+          ? "The pull request closed during an authorized fix."
+          : invalidHead
+            ? "The pull request head changed outside the authorized publication."
+            : "The review authorizing this fix changed. Inspect the retained worktree and review evidence.";
+        command = { type: "escalate", reason, ...(observed ? { observedHeadSha: observed } : {}) };
+      }
+      if (command.type === "escalate") {
+        this.#saveFix({
+          ...cycle,
+          phase: "escalated",
+          reason: command.reason,
+          validation: cycle.validation.map((attempt) =>
+            attempt.status === "running" ? { ...attempt, status: "unknown" } : attempt,
+          ),
+        });
       }
     }
     const result = transitionWorkflow(current, command);

@@ -31,6 +31,10 @@ The GitHub controller automatically checks recovery when it starts. For a CLI-on
 
 Use the workflow checkout and Codex thread exclusively through Switchyard. The checkout checkpoint supports up to 10,000 entries and 64 MiB of content, including ignored files. The rollout checkpoint supports files up to 64 MiB. Codex must have an active rollout indexed in the state database in the configured Codex home. A managed override for the SQLite location requires inspection. Exceeding either limit or changing the checkout, thread, runtime configuration, or SDK/CLI version requires inspection. The evidence check is local and assumes the checkout and Codex home are on a trusted filesystem.
 
+## Bounded PR fixes
+
+Use the [bounded fix controller](fix-loop.md) to start a turn from durable, accepted review findings. Direct agent turn requests do not authorize fixes for durable review runs. The fix controller requires a clean exact-head checkout, uses a compatible recorded session when available, and updates the session checkpoint after Git and GitHub confirm publication.
+
 ## Upgrading Phase 3B preview databases
 
 If you used the preview before rollout selection was verified, finish any planned turns while still on that version and stop its agent processes before upgrading. The current release requires new checkout and rollout checkpoints. It holds preview sessions if a continuation is requested because their records cannot identify the provider-selected rollout. Keep the old database and worktrees for inspection.

@@ -6,6 +6,7 @@ import type {
   AgentTurnEvidence,
 } from "./agent-operation.ts";
 import { describeError } from "./controller.ts";
+import { object } from "./github-data.ts";
 import { createLocalWorker } from "./local-worker.ts";
 import type { WorktreeManager } from "./worktree.ts";
 
@@ -22,6 +23,8 @@ export function createLocalAgentExecution(
       prompt,
       signal,
       authorizeLaunch,
+      refreshLaunch,
+      fixFindingIds,
       recordExpectedWorktree,
       recordWorkspace,
       recordSession,
@@ -39,6 +42,12 @@ export function createLocalAgentExecution(
       }
       const session = saved
         ? worker.resumeSession(target, saved, () => {
+            if (
+              refreshLaunch &&
+              worktrees.checkpoint(saved.worktree, target.expectedHead) !==
+                previous?.checkpoint?.workspace
+            )
+              throw new Error("Worktree changed during dispatch preflight.");
             source = sessionCheckpoint(saved.agent.id, saved.worktree.path);
             if (!isDeepStrictEqual(source, previous?.checkpoint?.session))
               throw new Error("Agent session changed since the previous operation.");
@@ -46,12 +55,49 @@ export function createLocalAgentExecution(
           })
         : worker.startSession(target, true, authorizeLaunch);
       recordWorkspace(session.worktree);
+      if (refreshLaunch) await refreshLaunch();
+      if (
+        fixFindingIds &&
+        worktrees.validate(session.worktree, target.expectedHead).changedPaths.length
+      )
+        throw new Error("A bounded fix requires a clean starting checkout.");
+      const outputSchema = fixFindingIds
+        ? {
+            type: "object",
+            additionalProperties: false,
+            required: ["status", "addressedFindingIds"],
+            properties: {
+              status: { type: "string", enum: ["addressed", "needs_operator"] },
+              addressedFindingIds: {
+                type: "array",
+                items: { type: "string", enum: fixFindingIds },
+              },
+            },
+          }
+        : undefined;
+      let usage: AgentTurnEvidence["usage"];
       const result = await session.runTurn(target.expectedHead, {
         prompt,
+        ...(outputSchema ? { outputSchema } : {}),
         ...(signal === undefined ? {} : { signal }),
         onEvent(event) {
           if (event.kind === "session_started" && session.reference)
             recordSession(session.reference);
+          if (fixFindingIds && event.provider === "codex" && event.kind === "turn_completed") {
+            const reported = object(object(event.data)?.usage);
+            const input = reported?.input_tokens;
+            const output = reported?.output_tokens;
+            if (
+              typeof input === "number" &&
+              typeof output === "number" &&
+              input >= 0 &&
+              output >= 0 &&
+              Number.isSafeInteger(input + output) &&
+              Number.isInteger(input) &&
+              Number.isInteger(output)
+            )
+              usage = { inputTokens: input, outputTokens: output };
+          }
         },
       });
       const reference = session.reference;
@@ -61,7 +107,24 @@ export function createLocalAgentExecution(
           ...("reason" in result.agent ? { reason: result.agent.reason } : {}),
         },
         workspace: result.workspace,
+        ...(usage ? { usage } : {}),
       };
+      if (fixFindingIds && result.agent.outcome === "completed") {
+        const report = result.agent.structuredOutput as
+          { status?: unknown; addressedFindingIds?: unknown } | null | undefined;
+        const addressed = report?.addressedFindingIds;
+        if (
+          report?.status === "addressed" &&
+          Array.isArray(addressed) &&
+          addressed.length === fixFindingIds.length &&
+          fixFindingIds.every((id) => addressed.includes(id))
+        ) {
+          evidence.addressedFindings = fixFindingIds;
+        } else {
+          evidence.error =
+            "Agent requested operator judgment or did not report addressing every accepted finding. Inspect the Codex session.";
+        }
+      }
       if (reference) evidence.reference = reference;
       if (reference && result.agent.outcome === "completed" && "head" in result.workspace) {
         try {

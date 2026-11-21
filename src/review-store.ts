@@ -252,6 +252,17 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
   }
 
   return {
+    latestIndeterminate(workflowId: string, head: string): boolean {
+      const latest = db
+        .prepare(
+          `
+        SELECT status FROM review_runs WHERE workflow_id=? AND head_sha=? ORDER BY rowid DESC LIMIT 1
+      `,
+        )
+        .get(workflowId, head);
+      return ["indeterminate", "unknown", "failed", "interrupted"].includes(String(latest?.status));
+    },
+
     start(input: unknown) {
       const row = record(input);
       const id = identifier(row.id, "review ID");

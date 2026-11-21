@@ -38,3 +38,5 @@ See the [GitHub App setup guide](docs/github-app.md) for the permissions, webhoo
 Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) before making changes. Use semantic commit messages, work on feature branches, and submit pull requests to `main`. Implementation pull requests should receive an independent automated Codex review and pass formatting, lint, type, and test checks. Human approval is not required by default; repository settings should preserve the intended independent review workflow.
 
 Switchyard is licensed under the [MIT License](LICENSE).
+
+For the controller-owned review, validation, and publication workflow, see [Bounded PR fixes](docs/fix-loop.md).

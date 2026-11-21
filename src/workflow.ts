@@ -41,6 +41,7 @@ export type WorkflowCommand =
   | { type: "review_invalidated"; reason: string }
   | { type: "review_received"; evidence: ReviewEvidence }
   | { type: "checks_received"; evidence: CheckEvidence[]; configuredNames: string[] | null }
+  | { type: "fix_attention"; reason: string | null }
   | { type: "fix_started" }
   | { type: "validation_started" }
   | { type: "cycle_finished"; outcome: CycleOutcome }
@@ -127,6 +128,7 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
           headSha: current.headSha,
         };
       next.review = command.evidence;
+      next.escalationReason = null;
       if (command.evidence.outcome === "completed_with_findings") {
         if (current.state !== "validating") {
           if (current.cycleAwaitingReview) next.fixCycles += 1;
@@ -164,6 +166,9 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
             : current.state === "ready_for_human"
               ? "awaiting_review"
               : current.state;
+      break;
+    case "fix_attention":
+      next.escalationReason = command.reason;
       break;
     case "fix_started":
       requireState(current, ["fixing"]);
@@ -218,7 +223,8 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
         next.state = "fixing";
       } else {
         next.cycleAwaitingReview = true;
-        next.state = "awaiting_review";
+        next.state =
+          current.review?.outcome === "in_progress" ? "review_running" : "awaiting_review";
       }
       break;
     case "escalate":
@@ -274,6 +280,7 @@ function setHead(workflow: Workflow, sha: string): void {
   workflow.headSha = sha;
   workflow.review = null;
   workflow.checks = [];
+  workflow.escalationReason = null;
   if (workflow.state !== "validating") workflow.state = "awaiting_review";
 }
 

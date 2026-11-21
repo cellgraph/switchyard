@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createAgentController } from "./agent-controller.ts";
-import type { AgentRuntime, AgentTurnRequest } from "./agent-operation.ts";
+import type { AgentOperationWorker, AgentRuntime, AgentTurnRequest } from "./agent-operation.ts";
 import { createCodexAgent } from "./codex-agent.ts";
 import { codexRuntime, codexSessionCheckpoint } from "./codex-runtime.ts";
 import { object } from "./github-data.ts";
@@ -58,26 +58,10 @@ export async function runAgentCommand(args: string[], dbPath: string): Promise<b
       (typeof fields)[number],
       string
     >;
-    const apiKey = process.env.OPENAI_API_KEY?.trim();
-    let identity: AgentRuntime;
-    const configurationId = createHash("sha256")
-      .update(JSON.stringify([repositoryDirectory, worktreeRoot, codexHome, model]))
-      .digest("hex");
-    const controller = createAgentController(store, {
-      configurationId,
-      runtime: () => (identity = codexRuntime(model, codexHome, apiKey)),
-      execute: (input) => {
-        const worktrees = createWorktreeManager({ repositoryDirectory, worktreeRoot });
-        const agent = createCodexAgent({
-          model,
-          codexHome: identity.home,
-          ...(apiKey ? { apiKey } : {}),
-        });
-        return createLocalAgentExecution(worktrees, agent, (id, path) =>
-          codexSessionCheckpoint(identity.home, id, path),
-        ).execute(input);
-      },
-    });
+    const controller = createAgentController(
+      store,
+      localCodexWorker({ repositoryDirectory, worktreeRoot, codexHome, model }),
+    );
     const abort = new AbortController();
     const stop = () => abort.abort();
     process.once("SIGINT", stop);
@@ -94,4 +78,37 @@ export async function runAgentCommand(args: string[], dbPath: string): Promise<b
   } finally {
     store.close();
   }
+}
+
+export function localCodexWorker({
+  repositoryDirectory,
+  worktreeRoot,
+  codexHome,
+  model,
+}: {
+  repositoryDirectory: string;
+  worktreeRoot: string;
+  codexHome: string;
+  model: string;
+}): AgentOperationWorker {
+  const apiKey = process.env.OPENAI_API_KEY?.trim();
+  let identity: AgentRuntime;
+  const configurationId = createHash("sha256")
+    .update(JSON.stringify([repositoryDirectory, worktreeRoot, codexHome, model]))
+    .digest("hex");
+  return {
+    configurationId,
+    runtime: () => (identity = codexRuntime(model, codexHome, apiKey)),
+    execute: (input) => {
+      const worktrees = createWorktreeManager({ repositoryDirectory, worktreeRoot });
+      const agent = createCodexAgent({
+        model,
+        codexHome: identity.home,
+        ...(apiKey ? { apiKey } : {}),
+      });
+      return createLocalAgentExecution(worktrees, agent, (id, path) =>
+        codexSessionCheckpoint(identity.home, id, path),
+      ).execute(input);
+    },
+  };
 }
