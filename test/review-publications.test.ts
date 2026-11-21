@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createGitHubReader } from "../src/github-api.ts";
 import {
   createGitHubAppClient,
   GitHubTransientError,
@@ -91,7 +92,7 @@ afterEach(() => {
 });
 
 function sync(
-  github: ReturnType<typeof createGitHub>,
+  github: Parameters<typeof syncReviewPublication>[1],
   options: { findingId?: string; mode?: "publish" | "reconcile"; actionId?: string } = {},
 ) {
   return syncReviewPublication(store.reviewPublications(), github, [target], {
@@ -317,6 +318,75 @@ describe("GitHub review publication", () => {
 });
 
 describe("GitHub App review transport", () => {
+  it("reconciles and retries a real client’s throttled publication after restart", async () => {
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const key = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    const { comments, add } = createGitHub();
+    const calls: string[] = [];
+    let now = Date.now();
+    let firstWrite = true;
+    function clientForStore() {
+      const client = createGitHubAppClient({
+        clientId: "client",
+        privateKey: key,
+        reviewWrites: true,
+        now: () => now,
+        rateLimits: store.githubRateLimits(),
+        retryDeadlines: store.reconciliationRetries(),
+        fetcher: async (input, init) => {
+          const request = new Request(input, init);
+          const path = new URL(request.url).pathname;
+          if (path === "/app") return Response.json({ slug: "switchyard-test" });
+          if (path === "/app/installations/5/access_tokens")
+            return Response.json({
+              token: "fixture-token",
+              expires_at: new Date(now + 120_000).toISOString(),
+            });
+          calls.push(`${request.method} ${path}`);
+          if (path === "/repos/owner/repo/pulls/1")
+            return Response.json({ number: 1, head: { sha: head }, state: "open" });
+          expect(path).toBe("/repos/owner/repo/pulls/1/comments");
+          if (request.method === "GET") return Response.json(comments);
+          expect(request.method).toBe("POST");
+          if (firstWrite) {
+            firstWrite = false;
+            return new Response(null, { status: 429, headers: { "retry-after": "60" } });
+          }
+          const body = (await request.json()) as Record<string, unknown>;
+          return Response.json(add(null, body), { status: 201 });
+        },
+      });
+      return { ...createGitHubReader(client), ...client };
+    }
+
+    await expect(sync(clientForStore())).rejects.toThrow(/HTTP 429/);
+    expect(status()[0]!.publications).toMatchObject([{ state: "rejected", attempts: 1 }]);
+    expect(comments).toHaveLength(0);
+
+    store.close();
+    store = new WorkflowStore(path);
+    const github = clientForStore();
+    calls.length = 0;
+    await expect(sync(github)).rejects.toThrow(/rate limit/);
+    expect(calls).toEqual([]);
+    expect(status()[0]!.publications).toMatchObject([{ state: "rejected", attempts: 1 }]);
+
+    now += 60_001;
+    await expect(sync(github)).resolves.toMatchObject({
+      state: "published",
+      attempts: 2,
+      comment_id: 100,
+    });
+    await expect(sync(github)).resolves.toMatchObject({ state: "published", attempts: 2 });
+    expect(calls).toEqual([
+      "GET /repos/owner/repo/pulls/1/comments",
+      "GET /repos/owner/repo/pulls/1",
+      "POST /repos/owner/repo/pulls/1/comments",
+      "GET /repos/owner/repo/pulls/1/comments",
+    ]);
+    expect(comments).toHaveLength(1);
+  });
+
   it("reads the matching review thread through paginated GraphQL with a read token", async () => {
     const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
     const cursors: unknown[] = [];
