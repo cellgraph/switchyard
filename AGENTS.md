@@ -39,3 +39,13 @@ Use semantic branch names with the following prefixes:
 
 Do not use the default `codex/` prefix.
 Follow these conventions when creating branches in worktrees.
+
+## Self-hosting fixture on this branch
+
+The only intended fix concerns `docs/phase5-acceptance-fixture.md`. For this
+controlled acceptance fixture, leave dependency installation and the full test
+suite to GitHub CI. Do not run npm, npx, or install dependencies. The controller
+will run a built-in Node assertion and Git diff integrity check. A targeted
+regression check may use the built-in Node standard library under
+`test/fixtures/phase5-live-doc-check.mjs`. Keep the candidate worktree small and
+leave no generated files.
