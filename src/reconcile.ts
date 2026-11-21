@@ -89,11 +89,10 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
       try {
         latest = await github.readPullRequest(target);
       } catch (error) {
-        // A CI throttle can also block the final head read. Revoke contradicted local
-        // authorization without granting a completed verdict on an unconfirmed head.
+        // Contradicting evidence can revoke local authorization even when the final
+        // head is unconfirmed. A completed verdict still needs head confirmation.
         if (
           id !== undefined &&
-          checks.status === "rejected" &&
           review !== undefined &&
           (review === null || "error" in review || review.status === "running")
         ) {

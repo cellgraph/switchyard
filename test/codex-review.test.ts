@@ -251,46 +251,69 @@ describe("Codex review marker evidence", () => {
     }
   });
 
-  it.each(["failure", "throttled head read"])("revokes fixing after a CI %s", async (mode) => {
+  it.each(["CI failure", "CI throttle", "final head read failure"])(
+    "revokes fixing after a %s",
+    async (mode) => {
+      const store = new WorkflowStore();
+      try {
+        createWorkflow(store);
+        const reader = readerFor(reviewed, inputs);
+        const reconcile = createReconciler(store, reader);
+        await reconcile(target);
+        expect(store.getWorkflow(workflowId)).toMatchObject({
+          state: "fixing",
+          review: { outcome: "completed_with_findings" },
+        });
+        const error =
+          mode === "CI throttle" ? new GitHubRateLimitError(60_000, 429) : new Error(mode);
+        if (mode !== "final head read failure")
+          vi.mocked(reader.readChecks).mockRejectedValueOnce(error);
+        vi.mocked(reader.readReviewInputs).mockResolvedValueOnce({
+          ...inputs,
+          issueComments: [runningMarker(reviewed, "2026-01-02T00:02:00Z")],
+        });
+        if (mode !== "CI failure") {
+          vi.mocked(reader.readPullRequest)
+            .mockResolvedValueOnce({ state: "open", headSha: reviewed })
+            .mockRejectedValueOnce(error);
+        }
+        await expect(reconcile(target)).rejects.toBe(error);
+        expect(store.getWorkflow(workflowId)).toMatchObject({
+          state: "review_running",
+          review: { outcome: "in_progress" },
+          checks: [],
+        });
+        expect(() =>
+          store.agentOperations().request({
+            operationId: "stale-fix",
+            workflowId,
+            branch: "fix/fixture",
+            expectedHead: reviewed,
+            expectedPullRequestHead: reviewed,
+            promptDigest: "prompt",
+            configurationId: "config",
+          }),
+        ).toThrow(/not eligible/);
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  it("withholds a completed verdict when the final head read fails", async () => {
     const store = new WorkflowStore();
     try {
       createWorkflow(store);
-      const reader = readerFor(reviewed, inputs);
-      const reconcile = createReconciler(store, reader);
-      await reconcile(target);
-      expect(store.getWorkflow(workflowId)).toMatchObject({
-        state: "fixing",
-        review: { outcome: "completed_with_findings" },
+      const reader = readerFor(clean, inputs);
+      const failure = new Error("Final head read failed.");
+      vi.mocked(reader.readPullRequest)
+        .mockResolvedValueOnce({ state: "open", headSha: clean })
+        .mockRejectedValueOnce(failure);
+      await expect(createReconciler(store, reader)(target)).rejects.toBe(failure);
+      expect(store.reviews().inspect(workflowId)).toMatchObject({
+        projectedReview: null,
+        runs: [],
       });
-      const error =
-        mode === "failure" ? new Error("CI read failed") : new GitHubRateLimitError(60_000, 429);
-      vi.mocked(reader.readChecks).mockRejectedValueOnce(error);
-      vi.mocked(reader.readReviewInputs).mockResolvedValueOnce({
-        ...inputs,
-        issueComments: [runningMarker(reviewed, "2026-01-02T00:02:00Z")],
-      });
-      if (mode !== "failure") {
-        vi.mocked(reader.readPullRequest)
-          .mockResolvedValueOnce({ state: "open", headSha: reviewed })
-          .mockRejectedValueOnce(error);
-      }
-      await expect(reconcile(target)).rejects.toBe(error);
-      expect(store.getWorkflow(workflowId)).toMatchObject({
-        state: "review_running",
-        review: { outcome: "in_progress" },
-        checks: [],
-      });
-      expect(() =>
-        store.agentOperations().request({
-          operationId: "stale-fix",
-          workflowId,
-          branch: "fix/fixture",
-          expectedHead: reviewed,
-          expectedPullRequestHead: reviewed,
-          promptDigest: "prompt",
-          configurationId: "config",
-        }),
-      ).toThrow(/not eligible/);
     } finally {
       store.close();
     }

@@ -12,7 +12,7 @@ An operator can explicitly open a run for an independent reviewer and import a s
 
 ## Operator commands
 
-Use the same `SWITCHYARD_DB_PATH` as the controller. All commands return JSON on success. Refresh the workflow with `--once` or the running controller before starting a run or recording a finding action. These local commands check against the latest PR head recorded in SQLite. Reconciliation applies confirmed review evidence even if the checks request fails. If a CI failure also blocks the final head read, reconciliation can revoke local review authorization and waits for head confirmation before applying a completed verdict.
+Use the same `SWITCHYARD_DB_PATH` as the controller. All commands return JSON on success. Refresh the workflow with `--once` or the running controller before starting a run or recording a finding action. These local commands check against the latest PR head recorded in SQLite. Reconciliation applies confirmed review evidence even if the checks request fails. If the final head read fails, reconciliation can revoke local review authorization and waits for head confirmation before applying a completed verdict.
 
 | Command after `npm start --`          | Purpose                                                                                                             |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
