@@ -37,14 +37,14 @@ describe("durable review runs", () => {
     raw.exec(`
       DROP TABLE review_publications; DROP TABLE finding_actions;
       DROP TABLE review_findings; DROP TABLE review_runs;
-      DELETE FROM schema_migrations WHERE version=10;
+      DELETE FROM schema_migrations WHERE version>=10;
     `);
     store = new WorkflowStore(path);
     expect(store.getWorkflow(workflowId)?.state).toBe("review_running");
     expect(store.reviews().inspect(workflowId).runs).toEqual([]);
     expect(store.reviews().start(reviewStart).status).toBe("running");
     expect(raw.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({
-      version: 10,
+      version: 11,
     });
   });
 
@@ -148,6 +148,31 @@ describe("durable review runs", () => {
       expect(() => store.reviews().finish(reviewStart.id, input)).toThrow();
     }
     expect(store.getWorkflow(workflowId)?.review?.outcome).toBe("in_progress");
+  });
+
+  it("leaves a contradictory terminal result open for a later confirmed outcome", () => {
+    const reviews = store.reviews();
+    reviews.start(reviewStart);
+    expect(() =>
+      reviews.finish(reviewStart.id, {
+        ...clean,
+        error: "Reviewer process timed out before returning a result.",
+      }),
+    ).toThrow(/completed review cannot attach an execution error/);
+    expect(() =>
+      reviews.finish(reviewStart.id, {
+        status: "unknown",
+        headSha: head,
+        error: "Timed out.",
+        evidence: "Finished.",
+      }),
+    ).toThrow(/completion evidence/);
+    expect(reviews.inspect(workflowId)).toMatchObject({
+      projectedReview: { outcome: "in_progress" },
+      runs: [{ status: "running", completed_at: null, findings: [] }],
+    });
+    expect(reviews.finish(reviewStart.id, clean).status).toBe("completed");
+    expect(store.getWorkflow(workflowId)?.review?.outcome).toBe("completed_clean");
   });
 
   it("rolls back the run, first finding, and verdict if inserting a later finding fails", () => {

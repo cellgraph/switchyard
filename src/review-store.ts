@@ -55,6 +55,7 @@ type ReviewRun = {
   started_at: string;
   completed_at: string | null;
   start_evidence: string | null;
+  latest_summary: string | null;
   evidence: string | null;
   error: string | null;
   result_digest: string | null;
@@ -111,13 +112,32 @@ function summaryEdits(evidence: string | null): CodexSummary[] {
   return evidence ? (JSON.parse(evidence) as { summaries: CodexSummary[] }).summaries : [];
 }
 
-function confirmsLaterEdit(before: CodexSummary, after: CodexSummary): boolean {
-  return (
-    before.id === after.id && Date.parse(after.updatedAt ?? "") > Date.parse(before.updatedAt ?? "")
-  );
+type SummaryRevision = { summaries: CodexSummary[]; conflicted: boolean };
+
+function compareSummaries(saved: CodexSummary[], incoming: CodexSummary[]) {
+  if (!saved.length) return incoming.length ? "newer" : "same";
+  if (saved.length !== incoming.length) return "uncertain";
+  let older = false;
+  let newer = false;
+  for (const before of saved) {
+    const after = incoming.find(({ id }) => id === before.id);
+    if (!after) return "uncertain";
+    const change = Date.parse(after.updatedAt ?? "") - Date.parse(before.updatedAt ?? "");
+    if (!Number.isFinite(change)) return "uncertain";
+    if (change < 0) older = true;
+    else if (change > 0) newer = true;
+    else if (
+      after.status !== before.status ||
+      after.any !== before.any ||
+      after.unresolved !== before.unresolved
+    )
+      return "uncertain";
+  }
+  if (older) return newer ? "uncertain" : "stale";
+  return newer ? "newer" : "same";
 }
 
-export type CodexParseFailure = { error: string; evidence: string };
+export type CodexParseFailure = { error: string; evidence: string; summaries?: CodexSummary[] };
 
 const codexReviewer = JSON.stringify({
   agent: "chatgpt-codex-connector[bot]",
@@ -384,25 +404,44 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
           invalidate("Codex review evidence is no longer visible.");
           return;
         }
+        function saveSummary(id: string, summaries: CodexSummary[], conflicted = false) {
+          const revision: SummaryRevision = { summaries, conflicted };
+          db.prepare("UPDATE review_runs SET latest_summary=? WHERE id=?").run(
+            JSON.stringify(revision),
+            id,
+          );
+        }
+        const saved: SummaryRevision = previous?.latest_summary
+          ? (JSON.parse(previous.latest_summary) as SummaryRevision)
+          : {
+              summaries: summaryEdits(previous?.evidence ?? previous?.start_evidence ?? null),
+              conflicted: false,
+            };
+        const order = observation.summaries
+          ? compareSummaries(saved.summaries, observation.summaries)
+          : "unavailable";
+        if (order === "stale") return;
+        if (previous && (order === "uncertain" || (saved.conflicted && order === "same"))) {
+          saveSummary(previous.id, saved.summaries, true);
+          if ("error" in observation) recordParseFailure(observation);
+          invalidate("Codex summary revision order is uncertain.");
+          return;
+        }
+
         if ("error" in observation) {
+          if (previous && observation.summaries && order === "newer")
+            saveSummary(previous.id, observation.summaries);
           recordParseFailure(observation);
           invalidate("Codex review evidence became indeterminate.");
           return;
         }
+
         if (observation.status === "running") {
           if (previous?.status === "running") {
+            if (order === "newer") saveSummary(previous.id, observation.summaries);
             if (!current.review) project(previous, "in_progress");
             return;
           }
-          if (
-            previous &&
-            summaryEdits(previous.evidence).some((saved) =>
-              observation.summaries.some(
-                (incoming) => saved.id === incoming.id && !confirmsLaterEdit(saved, incoming),
-              ),
-            )
-          )
-            return;
           const id = `github:${randomUUID()}`;
           db.prepare("UPDATE review_runs SET eligible=0 WHERE workflow_id=? AND eligible=1").run(
             workflowId,
@@ -412,19 +451,18 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
             observation.evidence,
             id,
           );
+          saveSummary(id, observation.summaries);
           project(run(id)!, "in_progress");
           return;
         }
 
         if (previous?.status === "running") {
           const started = summaryEdits(previous.start_evidence);
-          const updated = observation.summaries.some((summary) =>
-            started.some((source) => confirmsLaterEdit(source, summary)),
-          );
-          if (!updated) {
+          if (!started.length || compareSummaries(started, observation.summaries) !== "newer") {
             invalidate("Codex did not confirm completion of the observed running review.");
             return;
           }
+          if (order === "newer") saveSummary(previous.id, observation.summaries);
           // Receipts and inline comments for a previous review of this SHA can still be visible.
           const existingFindings = db
             .prepare(
@@ -449,6 +487,7 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
         // An edited source finding requires operator review. Existing findings retain their IDs.
         const resultDigest = digest(observation.findings);
         if (previous && previous.status !== "running") {
+          if (order === "newer") saveSummary(previous.id, observation.summaries);
           if (previous.result_digest !== resultDigest) {
             recordParseFailure({
               error: "Codex review source findings changed.",
@@ -473,6 +512,7 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
             .get(workflowId, sha, resultDigest) as ReviewRun | undefined);
         if (priorCapture) {
           db.prepare("UPDATE review_runs SET eligible=1 WHERE id=?").run(priorCapture.id);
+          saveSummary(priorCapture.id, observation.summaries);
           project(
             priorCapture,
             observation.findings.length ? "completed_with_findings" : "completed_clean",
@@ -485,6 +525,7 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
         db.prepare(
           "UPDATE review_runs SET status='completed', completed_at=?, evidence=?, result_digest=? WHERE id=?",
         ).run(now, observation.evidence, resultDigest, id);
+        saveSummary(id, observation.summaries);
         for (const finding of observation.findings) {
           const content = parseFinding(finding.content);
           insertFinding(id, content, finding.commentId, finding.nodeId);

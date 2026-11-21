@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { observeCodexReview } from "../src/codex-review.ts";
 import type { GitHubReader, PullRequestState } from "../src/github-api.ts";
+import { GitHubRateLimitError } from "../src/github-app.ts";
 import { createReconciler } from "../src/reconcile.ts";
 import { WorkflowStore } from "../src/store.ts";
 import fixture from "./fixtures/codex-pr51.json" with { type: "json" };
@@ -18,6 +19,28 @@ const withCode = (code_review: unknown) => ({
   ...summary,
   body: `<!-- codex-review-state:v1 ${JSON.stringify({ code_review, security_review: code(clean, true) })} -->`,
 });
+
+const runningMarker = (sha: string, updated_at: string) => ({
+  ...withCode({
+    commit_sha: sha,
+    status: "running",
+    has_any_findings: null,
+    has_unresolved_findings: null,
+  }),
+  updated_at,
+});
+
+function readerFor(
+  headSha: string,
+  evidence: Awaited<ReturnType<GitHubReader["readReviewInputs"]>>,
+): GitHubReader {
+  return {
+    readPullRequest: vi.fn(async () => ({ state: "open" as const, headSha })),
+    readChecks: vi.fn(async () => []),
+    readReviewInputs: vi.fn(async () => evidence),
+    completeReconciliation: vi.fn(),
+  };
+}
 
 describe("Codex review marker evidence", () => {
   it("detects the edited exact-head clean summary without adopting old line comments", () => {
@@ -173,6 +196,157 @@ describe("Codex review marker evidence", () => {
       store.close();
     }
   });
+
+  it("ignores a delayed completion after a newer running edit on the same head", async () => {
+    const store = new WorkflowStore();
+    const delayedChecks = Promise.withResolvers<[]>();
+    try {
+      createWorkflow(store);
+      const initial = { ...inputs, issueComments: [runningMarker(clean, "2026-01-02T00:00:00Z")] };
+      const reader = readerFor(clean, initial);
+      const reconcile = createReconciler(store, reader);
+      await reconcile(target);
+      const runId = store.getWorkflow(workflowId)?.review?.runId;
+      const readCompletion = Promise.withResolvers<void>();
+      vi.mocked(reader.readChecks).mockReturnValueOnce(delayedChecks.promise);
+      vi.mocked(reader.readReviewInputs).mockImplementationOnce(async () => {
+        readCompletion.resolve();
+        return { ...inputs, issueComments: [{ ...summary, updated_at: "2026-01-02T00:01:00Z" }] };
+      });
+      const delayed = reconcile(target);
+      await readCompletion.promise;
+      vi.mocked(reader.readReviewInputs).mockResolvedValueOnce({
+        ...inputs,
+        issueComments: [runningMarker(clean, "2026-01-02T00:02:00Z")],
+      });
+      await reconcile(target);
+      delayedChecks.resolve([]);
+      await delayed;
+
+      expect(store.reviews().inspect(workflowId)).toMatchObject({
+        projectedReview: { runId, outcome: "in_progress" },
+        runs: [{ id: runId, status: "running" }],
+      });
+      vi.mocked(reader.readReviewInputs).mockResolvedValueOnce({
+        ...inputs,
+        issueComments: [{ ...withCode(code(clean, true)), updated_at: "2026-01-02T00:01:00Z" }],
+      });
+      await reconcile(target);
+      expect(store.getWorkflow(workflowId)?.review).toMatchObject({
+        runId,
+        outcome: "in_progress",
+      });
+      vi.mocked(reader.readReviewInputs).mockResolvedValueOnce({
+        ...inputs,
+        issueComments: [{ ...summary, updated_at: "2026-01-02T00:03:00Z" }],
+      });
+      await reconcile(target);
+      expect(store.getWorkflow(workflowId)?.review).toMatchObject({
+        runId,
+        outcome: "completed_clean",
+      });
+    } finally {
+      delayedChecks.resolve([]);
+      store.close();
+    }
+  });
+
+  it.each(["failure", "throttled head read"])("revokes fixing after a CI %s", async (mode) => {
+    const store = new WorkflowStore();
+    try {
+      createWorkflow(store);
+      const reader = readerFor(reviewed, inputs);
+      const reconcile = createReconciler(store, reader);
+      await reconcile(target);
+      expect(store.getWorkflow(workflowId)).toMatchObject({
+        state: "fixing",
+        review: { outcome: "completed_with_findings" },
+      });
+      const error =
+        mode === "failure" ? new Error("CI read failed") : new GitHubRateLimitError(60_000, 429);
+      vi.mocked(reader.readChecks).mockRejectedValueOnce(error);
+      vi.mocked(reader.readReviewInputs).mockResolvedValueOnce({
+        ...inputs,
+        issueComments: [runningMarker(reviewed, "2026-01-02T00:02:00Z")],
+      });
+      if (mode !== "failure") {
+        vi.mocked(reader.readPullRequest)
+          .mockResolvedValueOnce({ state: "open", headSha: reviewed })
+          .mockRejectedValueOnce(error);
+      }
+      await expect(reconcile(target)).rejects.toBe(error);
+      expect(store.getWorkflow(workflowId)).toMatchObject({
+        state: "review_running",
+        review: { outcome: "in_progress" },
+        checks: [],
+      });
+      expect(() =>
+        store.agentOperations().request({
+          operationId: "stale-fix",
+          workflowId,
+          branch: "fix/fixture",
+          expectedHead: reviewed,
+          expectedPullRequestHead: reviewed,
+          promptDigest: "prompt",
+          configurationId: "config",
+        }),
+      ).toThrow(/not eligible/);
+    } finally {
+      store.close();
+    }
+  });
+
+  it.each([false, true])(
+    "retains separate receipt associations with a prior capture of %s",
+    async (alreadyCaptured) => {
+      const store = new WorkflowStore();
+      try {
+        createWorkflow(store);
+        const conflicting = {
+          issueComments: [],
+          reviews: [inputs.reviews[0], { ...inputs.reviews[0], id: 3 }],
+          reviewComments: [
+            inputs.reviewComments[0],
+            { ...inputs.reviewComments[1], pull_request_review_id: 3 },
+          ],
+        };
+        const reader = readerFor(reviewed, conflicting);
+        const reconcile = createReconciler(store, reader);
+        if (alreadyCaptured) {
+          vi.mocked(reader.readReviewInputs).mockResolvedValueOnce({
+            ...inputs,
+            issueComments: [],
+            reviewComments: [inputs.reviewComments[0]],
+          });
+          await reconcile(target);
+          expect(store.getWorkflow(workflowId)?.review?.outcome).toBe("completed_with_findings");
+        }
+        await reconcile(target);
+        const view = store.reviews().inspect(workflowId);
+        expect(view.projectedReview).toBeNull();
+        expect(view.runs).toHaveLength(alreadyCaptured ? 2 : 1);
+        if (alreadyCaptured)
+          expect(view.runs[0]).toMatchObject({
+            status: "completed",
+            findings: [{ root_comment_id: 10 }],
+          });
+        const ambiguous = view.runs.at(-1)!;
+        expect(ambiguous).toMatchObject({
+          status: "indeterminate",
+          findings: [],
+          error: expect.stringContaining("multiple receipts"),
+        });
+        expect(JSON.parse(ambiguous.evidence!)).toMatchObject({
+          receipts: [
+            { reviewId: 2, commentIds: [10] },
+            { reviewId: 3, commentIds: [11] },
+          ],
+        });
+      } finally {
+        store.close();
+      }
+    },
+  );
 
   it("discards old-head evidence when GitHub changes during reconciliation", async () => {
     const store = new WorkflowStore();

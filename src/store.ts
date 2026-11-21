@@ -77,6 +77,7 @@ const migrations = [
     WHERE kind='durable_agent_turn' AND status IN ('requested','dispatching','running','unknown','interrupted','manual_reconciliation');`,
   "ALTER TABLE operations ADD COLUMN owner_pid INTEGER;",
   reviewMigration,
+  "ALTER TABLE review_runs ADD COLUMN latest_summary TEXT;",
 ];
 
 export class WorkflowStore {

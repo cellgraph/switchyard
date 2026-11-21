@@ -24,14 +24,26 @@ export function observeCodexReview(
 ): CodexObservation | CodexParseFailure | null {
   const summaries = new Map<number, CodexSummary>();
   const receipts = new Set<number>();
-  const findings = new Map<number, ImportedFinding>();
+  const findings = new Map<number, ImportedFinding & { reviewId: number }>();
+  const orderedSummaries: CodexSummary[] = [];
+  const receiptSources = () =>
+    [...receipts]
+      .sort((a, b) => a - b)
+      .map((reviewId) => ({
+        reviewId,
+        commentIds: [...findings.values()]
+          .filter((finding) => finding.reviewId === reviewId)
+          .map(({ commentId }) => commentId)
+          .sort((a, b) => a - b),
+      }));
   function indeterminate(error: string, source?: string, id?: unknown): CodexParseFailure {
     return {
       error,
+      ...(orderedSummaries.length ? { summaries: orderedSummaries } : {}),
       evidence: JSON.stringify({
         adapter: "codex-review-v1",
-        summaries: [...summaries.keys()],
-        receipts: [...receipts],
+        summaries: orderedSummaries.length ? orderedSummaries : [...summaries.keys()],
+        receipts: receiptSources(),
         findings: [...findings.keys()],
         source: source ?? null,
         sourceId: positiveInteger(id) ? id : null,
@@ -84,10 +96,15 @@ export function observeCodexReview(
         "issue_comment",
         comment.row.id,
       );
+    const updatedAt =
+      typeof comment.row.updated_at === "string" ? comment.row.updated_at.slice(0, 30) : null;
     const earlier = summaries.get(comment.row.id);
     if (
       earlier &&
-      (earlier.status !== status || earlier.any !== any || earlier.unresolved !== unresolved)
+      (earlier.status !== status ||
+        earlier.any !== any ||
+        earlier.unresolved !== unresolved ||
+        earlier.updatedAt !== updatedAt)
     )
       return indeterminate(
         "Conflicting copies of a Codex summary.",
@@ -100,8 +117,7 @@ export function observeCodexReview(
       status,
       any,
       unresolved,
-      updatedAt:
-        typeof comment.row.updated_at === "string" ? comment.row.updated_at.slice(0, 30) : null,
+      updatedAt,
     });
   }
 
@@ -114,9 +130,10 @@ export function observeCodexReview(
     )
   )
     return indeterminate("Codex summaries disagree.");
+  if (flags.some(({ updatedAt }) => !Number.isFinite(Date.parse(updatedAt ?? ""))))
+    return indeterminate("Codex summary lacks a valid edit timestamp.");
+  orderedSummaries.push(...flags);
   if (summary?.status === "running") {
-    if (flags.some(({ updatedAt }) => !Number.isFinite(Date.parse(updatedAt ?? ""))))
-      return indeterminate("Running Codex summary lacks an edit timestamp.");
     return {
       status: "running",
       summaries: flags,
@@ -196,6 +213,7 @@ export function observeCodexReview(
     try {
       const finding = {
         commentId: row.id,
+        reviewId: row.pull_request_review_id,
         nodeId: typeof row.node_id === "string" ? row.node_id : null,
         content: parseFinding({
           title: title[2],
@@ -218,6 +236,8 @@ export function observeCodexReview(
       return indeterminate("Codex review exceeded the finding limit.", "review_comment", row.id);
   }
 
+  if (receipts.size > 1 && findings.size)
+    return indeterminate("Codex findings cannot identify one execution among multiple receipts.");
   if (!summary && !findings.size)
     return receipts.size ? indeterminate("Receipt alone cannot prove a clean review.") : null;
   if (summary && summary.any !== findings.size > 0)
@@ -228,8 +248,10 @@ export function observeCodexReview(
     evidence: JSON.stringify({
       adapter: "codex-review-v1",
       summaries: flags,
-      receipts: [...receipts].sort((a, b) => a - b),
+      receipts: receiptSources(),
     }),
-    findings: [...findings.values()].sort((a, b) => a.commentId - b.commentId),
+    findings: [...findings.values()]
+      .sort((a, b) => a.commentId - b.commentId)
+      .map(({ commentId, nodeId, content }) => ({ commentId, nodeId, content })),
   };
 }

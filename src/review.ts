@@ -103,6 +103,8 @@ export function parseFinding(value: unknown): FindingInput {
 export function parseReviewResult(value: unknown): ReviewResult {
   const row = record(value);
   if (row.status === "completed") {
+    if (Object.hasOwn(row, "error"))
+      throw new Error("A completed review cannot attach an execution error.");
     if (!Array.isArray(row.findings) || row.findings.length > 100)
       throw new Error("Completed review requires an explicit findings array (maximum 100).");
     const findings = Array.from(row.findings, parseFinding);
@@ -115,7 +117,8 @@ export function parseReviewResult(value: unknown): ReviewResult {
     };
   }
   if (row.status === "failed" || row.status === "interrupted" || row.status === "unknown") {
-    if (row.findings !== undefined) throw new Error("An incomplete result cannot attach findings.");
+    if (Object.hasOwn(row, "findings") || Object.hasOwn(row, "evidence"))
+      throw new Error("An incomplete result cannot attach findings or completion evidence.");
     return { status: row.status, error: boundedText(row.error, "review error") };
   }
   throw new Error("Invalid review outcome.");

@@ -81,10 +81,24 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
       const readErrors = [checks, reviewInputs].flatMap((read) =>
         read.status === "rejected" ? [read.reason as unknown] : [],
       );
+      const review =
+        reviewInputs.status === "fulfilled"
+          ? observeCodexReview(start.headSha, reviewInputs.value)
+          : undefined;
       let latest: PullRequestState;
       try {
         latest = await github.readPullRequest(target);
       } catch (error) {
+        // A CI throttle can also block the final head read. Revoke contradicted local
+        // authorization without granting a completed verdict on an unconfirmed head.
+        if (
+          id !== undefined &&
+          checks.status === "rejected" &&
+          review !== undefined &&
+          (review === null || "error" in review || review.status === "running")
+        ) {
+          store.reviews().observeCodex(id, start.headSha, review);
+        }
         throw githubRetryError([...readErrors, error]) ?? error;
       }
       if (terminal()) return;
@@ -94,16 +108,15 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
         return;
       }
       const retry = githubRetryError(readErrors);
-      if (retry) throw retry;
-      if (latest.headSha !== start.headSha) throw new PullRequestHeadChangedError();
+      if (latest.headSha !== start.headSha) throw retry ?? new PullRequestHeadChangedError();
 
+      recordChecks(checks.status === "fulfilled" ? checks.value : []);
+      if (id !== undefined && review !== undefined)
+        store.reviews().observeCodex(id, latest.headSha, review);
+
+      if (retry) throw retry;
       if (reviewInputs.status === "rejected") throw reviewInputs.reason;
       if (checks.status === "rejected") throw checks.reason;
-      recordChecks(checks.value);
-      if (id !== undefined)
-        store
-          .reviews()
-          .observeCodex(id, latest.headSha, observeCodexReview(latest.headSha, reviewInputs.value));
       github.completeReconciliation(target);
     } catch (error) {
       if (terminal()) return;
