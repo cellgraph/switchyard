@@ -4,4 +4,4 @@ This pull request serves as a controlled live test against Switchyard itself. Th
 controller will import a deliberately seeded documentation finding, run one fix
 turn, validate the exact candidate, and publish a regular follow-up commit.
 
-The required check name for Switchyard is `CI`.
+The required check name for Switchyard is `Quality checks`.
