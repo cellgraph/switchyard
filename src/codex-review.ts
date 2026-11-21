@@ -1,7 +1,12 @@
 import { commitSha, object, positiveInteger } from "./github-data.ts";
 import type { GitHubReader } from "./github-api.ts";
 import { parseFinding } from "./review.ts";
-import type { CodexObservation, CodexParseFailure, ImportedFinding } from "./review-store.ts";
+import type {
+  CodexObservation,
+  CodexParseFailure,
+  CodexSummary,
+  ImportedFinding,
+} from "./review-store.ts";
 
 const bot = "chatgpt-codex-connector[bot]";
 const marker = "<!-- codex-code-review-finding:v1 -->";
@@ -17,10 +22,7 @@ export function observeCodexReview(
   sha: string,
   inputs: Awaited<ReturnType<GitHubReader["readReviewInputs"]>>,
 ): CodexObservation | CodexParseFailure | null {
-  const summaries = new Map<
-    number,
-    { any: boolean; unresolved: boolean; updatedAt: string | null }
-  >();
+  const summaries = new Map<number, CodexSummary>();
   const receipts = new Set<number>();
   const findings = new Map<number, ImportedFinding>();
   function indeterminate(error: string, source?: string, id?: unknown): CodexParseFailure {
@@ -69,19 +71,24 @@ export function observeCodexReview(
     if (reviewed !== sha) continue;
     const any = code?.has_any_findings;
     const unresolved = code?.has_unresolved_findings;
-    if (
-      code?.status !== "completed" ||
-      typeof any !== "boolean" ||
-      typeof unresolved !== "boolean" ||
-      (!any && unresolved)
-    )
+    const status = code?.status;
+    const running = status === "running" && any === null && unresolved === null;
+    const completed =
+      status === "completed" &&
+      typeof any === "boolean" &&
+      typeof unresolved === "boolean" &&
+      (any || !unresolved);
+    if (!running && !completed)
       return indeterminate(
         "Codex summary lacks consistent completion flags.",
         "issue_comment",
         comment.row.id,
       );
     const earlier = summaries.get(comment.row.id);
-    if (earlier && (earlier.any !== any || earlier.unresolved !== unresolved))
+    if (
+      earlier &&
+      (earlier.status !== status || earlier.any !== any || earlier.unresolved !== unresolved)
+    )
       return indeterminate(
         "Conflicting copies of a Codex summary.",
         "issue_comment",
@@ -89,11 +96,32 @@ export function observeCodexReview(
       );
     if (summaries.size >= 100 && !earlier) return indeterminate("Too many Codex summaries.");
     summaries.set(comment.row.id, {
+      id: comment.row.id,
+      status,
       any,
       unresolved,
       updatedAt:
         typeof comment.row.updated_at === "string" ? comment.row.updated_at.slice(0, 30) : null,
     });
+  }
+
+  const flags = [...summaries.values()].sort((a, b) => a.id - b.id);
+  const summary = flags[0];
+  if (
+    flags.some(
+      ({ status, any, unresolved }) =>
+        status !== summary?.status || any !== summary?.any || unresolved !== summary?.unresolved,
+    )
+  )
+    return indeterminate("Codex summaries disagree.");
+  if (summary?.status === "running") {
+    if (flags.some(({ updatedAt }) => !Number.isFinite(Date.parse(updatedAt ?? ""))))
+      return indeterminate("Running Codex summary lacks an edit timestamp.");
+    return {
+      status: "running",
+      summaries: flags,
+      evidence: JSON.stringify({ adapter: "codex-review-v1", summaries: flags }),
+    };
   }
 
   for (const value of inputs.reviews) {
@@ -190,20 +218,16 @@ export function observeCodexReview(
       return indeterminate("Codex review exceeded the finding limit.", "review_comment", row.id);
   }
 
-  const flags = [...summaries.values()];
-  const summary = flags[0];
-  if (
-    flags.some(({ any, unresolved }) => any !== summary?.any || unresolved !== summary?.unresolved)
-  )
-    return indeterminate("Codex summaries disagree.");
   if (!summary && !findings.size)
     return receipts.size ? indeterminate("Receipt alone cannot prove a clean review.") : null;
   if (summary && summary.any !== findings.size > 0)
     return indeterminate("Codex summary and source findings disagree.");
   return {
+    status: "completed",
+    summaries: flags,
     evidence: JSON.stringify({
       adapter: "codex-review-v1",
-      summaries: [...summaries.entries()],
+      summaries: flags,
       receipts: [...receipts].sort((a, b) => a - b),
     }),
     findings: [...findings.values()].sort((a, b) => a.commentId - b.commentId),

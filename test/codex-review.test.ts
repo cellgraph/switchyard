@@ -125,6 +125,55 @@ describe("Codex review marker evidence", () => {
     }
   });
 
+  it("records a running Codex marker and completes that run only after a newer edit", async () => {
+    const store = new WorkflowStore();
+    try {
+      createWorkflow(store);
+      const running = withCode({
+        ...code(clean, false),
+        status: "running",
+        has_any_findings: null,
+        has_unresolved_findings: null,
+      });
+      const reader: GitHubReader = {
+        readPullRequest: vi.fn(async () => ({ state: "open" as const, headSha: clean })),
+        readChecks: vi.fn(async () => []),
+        readReviewInputs: vi.fn(async () => ({ ...inputs, issueComments: [running] })),
+        completeReconciliation: vi.fn(),
+      };
+      const reconcile = createReconciler(store, reader);
+      await reconcile(target);
+      const first = store.reviews().inspect(workflowId);
+      const runId = first.runs[0]!.id;
+      expect(first).toMatchObject({
+        state: "review_running",
+        projectedReview: { runId, outcome: "in_progress" },
+        runs: [{ id: runId, status: "running", completed_at: null }],
+      });
+      vi.mocked(reader.readReviewInputs).mockResolvedValueOnce(inputs);
+      await reconcile(target);
+      expect(store.reviews().inspect(workflowId).projectedReview).toBeNull();
+      vi.mocked(reader.readReviewInputs).mockResolvedValueOnce({
+        ...inputs,
+        issueComments: [{ ...summary, updated_at: "2026-01-02T00:01:00Z" }],
+      });
+      await reconcile(target);
+      expect(store.reviews().inspect(workflowId)).toMatchObject({
+        projectedReview: { runId, outcome: "completed_clean" },
+        runs: [
+          { id: runId, status: "completed", findings: [], start_evidence: expect.any(String) },
+        ],
+      });
+      await reconcile(target);
+      expect(store.reviews().inspect(workflowId).projectedReview).toMatchObject({
+        runId,
+        outcome: "completed_clean",
+      });
+    } finally {
+      store.close();
+    }
+  });
+
   it("discards old-head evidence when GitHub changes during reconciliation", async () => {
     const store = new WorkflowStore();
     try {

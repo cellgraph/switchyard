@@ -18,7 +18,7 @@ export const reviewMigration = `
     id TEXT PRIMARY KEY NOT NULL, workflow_id TEXT NOT NULL REFERENCES workflows(id),
     head_sha TEXT NOT NULL, source TEXT NOT NULL, purpose TEXT NOT NULL, reviewer TEXT NOT NULL,
     status TEXT NOT NULL, eligible INTEGER NOT NULL DEFAULT 1,
-    started_at TEXT NOT NULL, completed_at TEXT, evidence TEXT, error TEXT, result_digest TEXT
+    started_at TEXT NOT NULL, completed_at TEXT, start_evidence TEXT, evidence TEXT, error TEXT, result_digest TEXT
   );
   CREATE INDEX review_runs_by_workflow ON review_runs(workflow_id, head_sha);
   CREATE UNIQUE INDEX one_active_review ON review_runs(workflow_id)
@@ -54,6 +54,7 @@ type ReviewRun = {
   eligible: number;
   started_at: string;
   completed_at: string | null;
+  start_evidence: string | null;
   evidence: string | null;
   error: string | null;
   result_digest: string | null;
@@ -89,10 +90,32 @@ export type ImportedFinding = {
   nodeId: string | null;
 };
 
-export type CodexObservation = {
-  evidence: string;
-  findings: ImportedFinding[];
+export type CodexSummary = {
+  id: number;
+  status: "running" | "completed";
+  any: boolean | null;
+  unresolved: boolean | null;
+  updatedAt: string | null;
 };
+
+export type CodexObservation =
+  | { evidence: string; status: "running"; summaries: CodexSummary[] }
+  | {
+      evidence: string;
+      status: "completed";
+      summaries: CodexSummary[];
+      findings: ImportedFinding[];
+    };
+
+function summaryEdits(evidence: string | null): CodexSummary[] {
+  return evidence ? (JSON.parse(evidence) as { summaries: CodexSummary[] }).summaries : [];
+}
+
+function confirmsLaterEdit(before: CodexSummary, after: CodexSummary): boolean {
+  return (
+    before.id === after.id && Date.parse(after.updatedAt ?? "") > Date.parse(before.updatedAt ?? "")
+  );
+}
 
 export type CodexParseFailure = { error: string; evidence: string };
 
@@ -248,7 +271,8 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
           throw new Error(
             "Review start requires the current head of an active workflow outside validation.",
           );
-        if (activeRun(workflowId)?.status === "running")
+        const active = activeRun(workflowId);
+        if (active?.status === "running" && active.source === "operator")
           throw new Error("A review run already awaits an outcome for this workflow.");
         if (
           db
@@ -365,9 +389,66 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
           invalidate("Codex review evidence became indeterminate.");
           return;
         }
+        if (observation.status === "running") {
+          if (previous?.status === "running") {
+            if (!current.review) project(previous, "in_progress");
+            return;
+          }
+          if (
+            previous &&
+            summaryEdits(previous.evidence).some((saved) =>
+              observation.summaries.some(
+                (incoming) => saved.id === incoming.id && !confirmsLaterEdit(saved, incoming),
+              ),
+            )
+          )
+            return;
+          const id = `github:${randomUUID()}`;
+          db.prepare("UPDATE review_runs SET eligible=0 WHERE workflow_id=? AND eligible=1").run(
+            workflowId,
+          );
+          insertRun(id, workflowId, sha, "github", "code", codexReviewer);
+          db.prepare("UPDATE review_runs SET start_evidence=? WHERE id=?").run(
+            observation.evidence,
+            id,
+          );
+          project(run(id)!, "in_progress");
+          return;
+        }
+
+        if (previous?.status === "running") {
+          const started = summaryEdits(previous.start_evidence);
+          const updated = observation.summaries.some((summary) =>
+            started.some((source) => confirmsLaterEdit(source, summary)),
+          );
+          if (!updated) {
+            invalidate("Codex did not confirm completion of the observed running review.");
+            return;
+          }
+          // Receipts and inline comments for a previous review of this SHA can still be visible.
+          const existingFindings = db
+            .prepare(
+              `SELECT f.root_comment_id AS id FROM review_findings f
+            JOIN review_runs r ON f.run_id=r.id
+            WHERE r.workflow_id=? AND r.head_sha=? AND r.source='github'`,
+            )
+            .all(workflowId, sha);
+          if (
+            observation.findings.some(({ commentId }) =>
+              existingFindings.some(({ id }) => id === commentId),
+            )
+          ) {
+            recordParseFailure({
+              error: "Codex findings overlap an earlier run on this head.",
+              evidence: observation.evidence,
+            });
+            invalidate("Codex findings overlap an earlier run on this head.");
+            return;
+          }
+        }
         // An edited source finding requires operator review. Existing findings retain their IDs.
         const resultDigest = digest(observation.findings);
-        if (previous) {
+        if (previous && previous.status !== "running") {
           if (previous.result_digest !== resultDigest) {
             recordParseFailure({
               error: "Codex review source findings changed.",
@@ -382,12 +463,14 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
           }
           return;
         }
-        const priorCapture = db
-          .prepare(
-            `SELECT * FROM review_runs WHERE workflow_id=? AND head_sha=?
+        const priorCapture =
+          !previous &&
+          (db
+            .prepare(
+              `SELECT * FROM review_runs WHERE workflow_id=? AND head_sha=?
           AND source='github' AND result_digest=? ORDER BY rowid DESC LIMIT 1`,
-          )
-          .get(workflowId, sha, resultDigest) as ReviewRun | undefined;
+            )
+            .get(workflowId, sha, resultDigest) as ReviewRun | undefined);
         if (priorCapture) {
           db.prepare("UPDATE review_runs SET eligible=1 WHERE id=?").run(priorCapture.id);
           project(
@@ -396,12 +479,9 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
           );
           return;
         }
-        const id = `github:${randomUUID()}`;
+        const id = previous?.id ?? `github:${randomUUID()}`;
         const now = timestamp();
-        db.prepare("UPDATE review_runs SET eligible=0 WHERE workflow_id=? AND eligible=1").run(
-          workflowId,
-        );
-        insertRun(id, workflowId, sha, "github", "code", codexReviewer);
+        if (!previous) insertRun(id, workflowId, sha, "github", "code", codexReviewer);
         db.prepare(
           "UPDATE review_runs SET status='completed', completed_at=?, evidence=?, result_digest=? WHERE id=?",
         ).run(now, observation.evidence, resultDigest, id);
