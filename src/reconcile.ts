@@ -1,3 +1,4 @@
+import { observeCodexReview } from "./codex-review.ts";
 import type { GitHubReader, PullRequestState, PullRequestTarget } from "./github-api.ts";
 import { GitHubRateLimitError, githubRetryError } from "./github-app.ts";
 import type { WorkflowStore } from "./store.ts";
@@ -58,7 +59,7 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
     function recordChecks(evidence: CheckEvidence[]): void {
       const current = id === undefined ? null : store.getWorkflow(id);
       if (current && current.state !== "stopped" && current.state !== "escalated") {
-        // Required check discovery and review interpretation are later phases.
+        // Required check discovery remains in Phase 5.
         store.transition(current.id, { type: "checks_received", evidence, configuredNames: null });
       }
     }
@@ -99,6 +100,10 @@ export function createReconciler(store: WorkflowStore, github: GitHubReader) {
       if (reviewInputs.status === "rejected") throw reviewInputs.reason;
       if (checks.status === "rejected") throw checks.reason;
       recordChecks(checks.value);
+      if (id !== undefined)
+        store
+          .reviews()
+          .observeCodex(id, latest.headSha, observeCodexReview(latest.headSha, reviewInputs.value));
       github.completeReconciliation(target);
     } catch (error) {
       if (terminal()) return;

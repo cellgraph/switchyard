@@ -47,6 +47,8 @@ export class GitHubRateLimitError extends Error {
   }
 }
 
+export class GitHubWriteRejected extends Error {}
+
 export class GitHubTransientError extends Error {
   readonly retryAt: number | undefined;
 
@@ -144,6 +146,7 @@ export function createGitHubAppClient({
   retryDeadlines = memoryRetryDeadlines(),
   isRetryOwnerActive = () => true,
   canReadPullRequest = () => true,
+  reviewWrites = false,
 }: {
   clientId: string;
   privateKey: string;
@@ -153,6 +156,7 @@ export function createGitHubAppClient({
   retryDeadlines?: GitHubRetryDeadlines;
   isRetryOwnerActive?: (key: string) => boolean;
   canReadPullRequest?: (target: GitHubRepository, pullRequest: number) => boolean;
+  reviewWrites?: boolean;
 }) {
   const key = createPrivateKey(privateKey);
   if (key.asymmetricKeyType !== "rsa") throw new Error("GitHub App requires an RSA private key.");
@@ -225,13 +229,13 @@ export function createGitHubAppClient({
       reconcilePullRequest === undefined
         ? undefined
         : pullRequestRetryKey(target, reconcilePullRequest);
-    const requestKey =
-      method === "POST"
-        ? tokenRetryKey(target)
-        : pullRequestKey !== undefined
-          ? `pr:${pullRequestKey}`
-          : `${target.installationId}:GET:${path}`;
-    const deadlineKey = method === "POST" ? requestKey : pullRequestKey;
+    const tokenRequest = method === "POST" && path.startsWith("/app/installations/");
+    const requestKey = tokenRequest
+      ? tokenRetryKey(target)
+      : pullRequestKey !== undefined
+        ? `pr:${pullRequestKey}`
+        : `${target.installationId}:GET:${path}`;
+    const deadlineKey = tokenRequest ? requestKey : pullRequestKey;
     const startedAt = now();
     const limit = limitsFor(scope);
     const paused = limit.throttledAttempts >= maxSecondaryAttempts;
@@ -259,7 +263,7 @@ export function createGitHubAppClient({
     const reset = primaryLimited
       ? headerMilliseconds(response.headers.get("x-ratelimit-reset"))
       : undefined;
-    if (response.ok && method === undefined && reset !== undefined && reset > now())
+    if (response.ok && !tokenRequest && reset !== undefined && reset > now())
       rememberPrimaryReset(scope, reset);
 
     let responseError: GitHubRateLimitError | GitHubTransientError | undefined;
@@ -314,8 +318,9 @@ export function createGitHubAppClient({
         const keys = [deadlineKey, commitRetryKey].filter((key) => key !== undefined);
         if (keys.length > 0) retryDeadlines.extend(keys, retryAt);
       }
-      const operation =
-        method === "POST" ? "GitHub installation token request" : `GitHub API GET ${path}`;
+      const operation = tokenRequest
+        ? "GitHub installation token request"
+        : `GitHub API ${method ?? "GET"} ${path}`;
       responseError = new GitHubTransientError(`${operation} failed (HTTP ${response.status}).`, {
         retryAt,
       });
@@ -353,7 +358,10 @@ export function createGitHubAppClient({
         path: `/app/installations/${target.installationId}/access_tokens`,
         method: "POST",
         reconcilePullRequest,
-        body: JSON.stringify({ repositories: [target.repository.split("/")[1]], permissions }),
+        body: JSON.stringify({
+          repositories: [target.repository.split("/")[1]],
+          permissions: reviewWrites ? { ...permissions, pull_requests: "write" } : permissions,
+        }),
       },
       appJwt(),
     );
@@ -371,6 +379,121 @@ export function createGitHubAppClient({
   return {
     completeReconciliation(target: GitHubRepository, pullRequest: number): void {
       clearSecondaryAttempts(now(), (key) => belongsToReconciliation(key, target, pullRequest));
+    },
+
+    async readAppBot(target: GitHubRepository): Promise<string> {
+      const response = await request(target, { path: "/app" }, appJwt());
+      if (response.status !== 200)
+        throw new Error(`GitHub App identity lookup failed (HTTP ${response.status}).`);
+      const slug = object(await readJson(response))?.slug;
+      if (typeof slug !== "string" || !/^[a-z0-9-]+$/i.test(slug))
+        throw new Error("GitHub returned an invalid App slug.");
+      return `${slug.toLowerCase()}[bot]`;
+    },
+
+    readReviewThread(
+      target: GitHubRepository & { pullRequest: number },
+      rootCommentId: number,
+    ): Promise<{ id: string; resolved: boolean; outdated: boolean } | null> {
+      const query = `query SwitchyardReviewThread($owner: String!, $repo: String!, $pr: Int!, $after: String) {
+        repository(owner: $owner, name: $repo) {
+          pullRequest(number: $pr) {
+            reviewThreads(first: 100, after: $after) {
+              nodes { id isResolved isOutdated comments(first: 1) { nodes { fullDatabaseId } } }
+              pageInfo { hasNextPage endCursor }
+            }
+          }
+        }
+      }`;
+      const [owner, repo] = target.repository.split("/");
+      return queueRead(target.installationId, async () => {
+        let after: string | null = null;
+        for (let page = 1; page <= 100; page += 1) {
+          checkRetryDeadline(pullRequestRetryKey(target, target.pullRequest));
+          const cacheKey = `${target.installationId}:${target.repository}`;
+          const token = await tokenFor(target, cacheKey, target.pullRequest);
+          const response = await request(
+            target,
+            {
+              path: "/graphql",
+              method: "POST",
+              reconcilePullRequest: target.pullRequest,
+              body: JSON.stringify({
+                query,
+                variables: { owner, repo, pr: target.pullRequest, after },
+              }),
+            },
+            token.value,
+          );
+          if (!response.ok)
+            throw new Error(`GitHub thread query failed (HTTP ${response.status}).`);
+          const payload = object(await readJson(response));
+          if (Array.isArray(payload?.errors) && payload.errors.length)
+            throw new Error("GitHub returned errors for the review thread query.");
+          const pullRequest = object(object(object(payload?.data)?.repository)?.pullRequest);
+          const threads = object(pullRequest?.reviewThreads);
+          const pageInfo = object(threads?.pageInfo);
+          if (!Array.isArray(threads?.nodes) || typeof pageInfo?.hasNextPage !== "boolean")
+            throw new Error("GitHub returned an incomplete review thread page.");
+          for (const value of threads.nodes as unknown[]) {
+            const thread = object(value);
+            const roots = object(thread?.comments)?.nodes;
+            const rootId = Array.isArray(roots) ? object(roots[0])?.fullDatabaseId : null;
+            if (rootId !== rootCommentId && rootId !== String(rootCommentId)) continue;
+            if (
+              typeof thread?.id !== "string" ||
+              !thread.id ||
+              typeof thread.isResolved !== "boolean" ||
+              typeof thread.isOutdated !== "boolean"
+            )
+              throw new Error("GitHub returned incomplete review thread state.");
+            return { id: thread.id, resolved: thread.isResolved, outdated: thread.isOutdated };
+          }
+          if (!pageInfo.hasNextPage) return null;
+          if (
+            typeof pageInfo.endCursor !== "string" ||
+            !pageInfo.endCursor ||
+            after === pageInfo.endCursor
+          )
+            throw new Error("GitHub returned an invalid review thread cursor.");
+          after = pageInfo.endCursor;
+        }
+        throw new Error("GitHub review thread pagination limit exceeded.");
+      });
+    },
+
+    postReviewComment(
+      target: GitHubRepository & { pullRequest: number },
+      parentId: number | null,
+      body: Record<string, unknown>,
+    ): Promise<unknown> {
+      if (!reviewWrites)
+        throw new Error("Review publication requires a write-enabled GitHub client.");
+      const comments = `/repos/${target.repository}/pulls/${target.pullRequest}/comments`;
+      const path = parentId === null ? comments : `${comments}/${parentId}/replies`;
+      return queueRead(target.installationId, async () => {
+        checkRetryDeadline(pullRequestRetryKey(target, target.pullRequest));
+        const cacheKey = `${target.installationId}:${target.repository}`;
+        const token = await tokenFor(target, cacheKey, target.pullRequest);
+        const response = await request(
+          target,
+          {
+            path,
+            method: "POST",
+            body: JSON.stringify(body),
+            reconcilePullRequest: target.pullRequest,
+          },
+          token.value,
+        );
+        if (response.status === 401) tokens.delete(cacheKey);
+        if ([400, 401, 403, 404, 422].includes(response.status))
+          throw new GitHubWriteRejected(
+            `GitHub rejected the review comment (HTTP ${response.status}).`,
+          );
+        if (response.status !== 201)
+          throw new Error(`GitHub review comment outcome is unknown (HTTP ${response.status}).`);
+        return readJson(response);
+      });
     },
 
     get(

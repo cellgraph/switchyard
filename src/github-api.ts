@@ -16,7 +16,9 @@ export interface GitHubReader {
   readChecks(target: PullRequestTarget, headSha: string): Promise<CheckEvidence[]>;
 }
 
-export function createGitHubReader(client: GitHubAppClient): GitHubReader {
+export function createGitHubReader(
+  client: Pick<GitHubAppClient, "get" | "completeReconciliation">,
+) {
   async function list(
     target: PullRequestTarget,
     path: string,
@@ -38,12 +40,16 @@ export function createGitHubReader(client: GitHubAppClient): GitHubReader {
     throw new Error(`GitHub pagination limit exceeded for ${path}.`);
   }
 
+  const readReviewComments = (target: PullRequestTarget) =>
+    list(target, `/pulls/${target.pullRequest}/comments`);
+
   return {
-    completeReconciliation(target) {
+    readReviewComments,
+    completeReconciliation(target: PullRequestTarget) {
       client.completeReconciliation(target, target.pullRequest);
     },
 
-    async readPullRequest(target) {
+    async readPullRequest(target: PullRequestTarget): Promise<PullRequestState> {
       const { data } = await client.get(target, `/pulls/${target.pullRequest}`, target.pullRequest);
       const pullRequest = object(data);
       const headSha = commitSha(object(pullRequest?.head)?.sha);
@@ -57,16 +63,16 @@ export function createGitHubReader(client: GitHubAppClient): GitHubReader {
       return { headSha, state };
     },
 
-    async readReviewInputs(target) {
+    async readReviewInputs(target: PullRequestTarget) {
       const [reviews, reviewComments, issueComments] = await readAll(
         list(target, `/pulls/${target.pullRequest}/reviews`),
-        list(target, `/pulls/${target.pullRequest}/comments`),
+        readReviewComments(target),
         list(target, `/issues/${target.pullRequest}/comments`),
       );
       return { reviews, reviewComments, issueComments };
     },
 
-    async readChecks(target, headSha) {
+    async readChecks(target: PullRequestTarget, headSha: string) {
       const [runs, statuses] = await readAll(
         list(
           target,
@@ -102,7 +108,7 @@ export function createGitHubReader(client: GitHubAppClient): GitHubReader {
       }
       return [...checks.values()].sort((left, right) => left.name.localeCompare(right.name, "en"));
     },
-  };
+  } satisfies GitHubReader & { readReviewComments: typeof readReviewComments };
 }
 
 async function readAll<T extends unknown[]>(

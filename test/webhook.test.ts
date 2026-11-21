@@ -12,6 +12,7 @@ import { createReconciler } from "../src/reconcile.ts";
 import { WorkflowStore } from "../src/store.ts";
 import { createWebhookServer } from "../src/webhook.ts";
 import type { CheckEvidence } from "../src/workflow.ts";
+import codexReview from "./fixtures/codex-pr51.json" with { type: "json" };
 import { removeDurableAgentMigration } from "./fixtures/legacy-schema.ts";
 
 type Fixture = { id: string; event: string; payload: Record<string, unknown> };
@@ -220,6 +221,23 @@ describe("GitHub webhook intake and reconciliation", () => {
       });
     },
   );
+
+  it("converges on durable review evidence after a summary edit and a poll", async () => {
+    const { runPass } = controller(1000);
+    await runPass();
+    vi.mocked(github.readReviewInputs).mockResolvedValue(codexReview);
+    const payload = { ...fixtures.issueComment!.payload, action: "edited" };
+    expect((await send("issueComment", { body: JSON.stringify(payload) })).status).toBe(202);
+    await runPass();
+    const captured = store.reviews().inspect(workflow()!.id);
+    expect(captured).toMatchObject({
+      projectedReview: { sha: headA, outcome: "completed_clean", runId: expect.any(String) },
+      runs: [{ status: "completed", findings: [] }],
+    });
+    now += 1000;
+    await runPass();
+    expect(store.reviews().inspect(workflow()!.id)).toEqual(captured);
+  });
 
   it("ignores ordinary issues, untracked PRs, and unexpected installations", async () => {
     const { runPass } = controller();

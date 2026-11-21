@@ -1,6 +1,8 @@
 import { DatabaseSync } from "node:sqlite";
 import { createAgentOperationStore, recoverAgentOperations } from "./agent-store.ts";
 import type { GitHubRateLimits, GitHubRateLimitState } from "./github-app.ts";
+import { createReviewPublications } from "./review-publications.ts";
+import { createReviewStore, reviewMigration } from "./review-store.ts";
 import {
   transitionWorkflow,
   type CheckEvidence,
@@ -74,6 +76,7 @@ const migrations = [
   CREATE UNIQUE INDEX one_unresolved_agent_operation ON operations(workflow_id)
     WHERE kind='durable_agent_turn' AND status IN ('requested','dispatching','running','unknown','interrupted','manual_reconciliation');`,
   "ALTER TABLE operations ADD COLUMN owner_pid INTEGER;",
+  reviewMigration,
 ];
 
 export class WorkflowStore {
@@ -172,6 +175,18 @@ export class WorkflowStore {
     return this.#transaction(() => this.#transition(id, command));
   }
 
+  reviewPublications() {
+    return createReviewPublications(this.#db, (run) => this.#transaction(run));
+  }
+
+  reviews() {
+    return createReviewStore(this.#db, {
+      transaction: (run) => this.#transaction(run),
+      getWorkflow: (id) => this.getWorkflow(id),
+      transition: (id, command) => this.#transition(id, command),
+    });
+  }
+
   agentOperations() {
     return createAgentOperationStore(this.#db, {
       transaction: (run) => this.#transaction(run),
@@ -236,6 +251,10 @@ export class WorkflowStore {
         "INSERT INTO transitions (workflow_id, from_state, to_state, reason, head_sha, created_at) VALUES (?, ?, ?, ?, ?, ?)",
       )
       .run(id, result.from, result.to, result.reason, result.headSha, now);
+    if (w.headSha !== current.headSha || w.state === "stopped" || w.state === "escalated")
+      this.#db
+        .prepare("UPDATE review_runs SET eligible=0 WHERE workflow_id=? AND eligible=1")
+        .run(id);
     if (command.type === "review_received")
       this.#db
         .prepare(

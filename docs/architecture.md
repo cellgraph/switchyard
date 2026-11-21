@@ -17,10 +17,10 @@ GitHub App webhook ──▶ webhook inbox ──▶ SQLite workflow controller
 
 - **Controller:** owns workflow state, policy, timers/reconciliation, cycle limits, and decisions about whether to resume, wait, escalate, or mark ready for human review. It is a single local Node.js process in the first version.
 - **Webhook receiver:** validates the signature over raw bytes and records the delivery ID and routing hint in the SQLite inbox before responding.
-- **GitHub adapter:** reads current PR, review, comment, check run, and status data through read-only GitHub App credentials. It provides the GitHub-specific inputs for the future review adapter.
+- **GitHub adapter:** reads current PR, review, comment, check run, and status data through read-only GitHub App credentials. It provides the inputs for the versioned review adapter. An explicit operator command also publishes and reconciles finding comments and disposition replies.
 - **Worker:** checks out and manages a dedicated Git worktree and invokes Codex. It reports progress/results to the controller. In the first version it runs in process on the same macOS machine; the interface will not assume that forever.
 - **Agent adapter:** starts or resumes an implementation session and streams its turn result. Codex is the only implementation. Keep the session ID opaque and vendor-specific in storage. A future Claude Code adapter may implement the same narrow capabilities without shaping the first version around a lowest common denominator.
-- **SQLite:** stores workflow state, inbound webhook receipts, external operation records, session identifiers, cycle counts, head SHAs, review snapshots, and CI status snapshots. WAL mode and bounded transactions are appropriate for a single controller.
+- **SQLite:** stores workflow state, inbound webhook receipts, external operation records, session identifiers, cycle counts, head SHAs, review runs, finding actions, publication intents, and CI status snapshots. WAL mode and bounded transactions are appropriate for a single controller.
 
 The controller claims agent operations through SQLite and calls the local worker in process. The worker receives one operation ID and checkout target, and returns evidence through a provider-neutral interface.
 
@@ -41,6 +41,8 @@ One workflow row has one of these states:
 State transitions are performed by controller code and recorded with the triggering event/reason. Reconciliation after a `synchronize` event reads the current GitHub head. A changed head invalidates prior review and CI evidence before returning to `awaiting_review`. If a head-change notification arrives while validation is active, preserve `validating` until the controller records that cycle's outcome, then wait for review of the new head. Persist the validation-start SHA to order review and push events safely. An agent cannot set `ready_for_human`; only controller policy can.
 
 ## Review completion and findings
+
+Phase 4 stores review runs, findings, and operator action history in SQLite. The workflow projection names the selected run, and the completion transaction persists the findings and exact-head verdict together. The GitHub adapter supplies evidence and tracks external publication. See the [review operations guide](reviews.md) and [ADR-0003](adr/0003-durable-review-evidence-and-publication.md).
 
 ### Observed Codex behavior
 
@@ -99,7 +101,7 @@ The controller checks the process ID recorded with each agent claim at startup a
 
 Phase 2 uses the Phase 1 SQLite inbox and workflow store. The receiver checks the request, stores a minimal reconciliation hint, and returns after the durable insert. A serial controller pass claims due rows and processes them independently of HTTP. Webhook and periodic triggers both use the same reconciler and can share one observation of a PR within a pass. If the PR head moves during the evidence reads, the reconciler records the newly observed head and retries without saving stale evidence.
 
-The local configuration selects the PRs to track under each App installation. See the [GitHub App setup guide](github-app.md) for the read-only permission set, subscriptions, optional webhook delivery, fixture tests, and polling/manual refresh. Phase 2 reads review inputs and collects exact-head check evidence. The review parser and required-check discovery are deferred to their planned phases.
+The local configuration selects the PRs to track under each App installation. See the [GitHub App setup guide](github-app.md) for the read-only permission set, subscriptions, optional webhook delivery, fixture tests, and polling/manual refresh. Phase 2 reads review inputs and collects exact-head check evidence. Phase 4 uses those review inputs for exact-head run capture. Required-check discovery remains in Phase 5.
 
 ## Branch policy and human handoff
 
