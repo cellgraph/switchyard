@@ -284,6 +284,7 @@ function threadObservation(comment: RemoteComment): string {
 }
 
 type ReviewGitHub = {
+  completeReconciliation(target: PullRequestTarget): void;
   readAppBot(target: PullRequestTarget): Promise<string>;
   readReviewThread(target: PullRequestTarget, rootId: number): Promise<Thread | null>;
   readPullRequest(target: PullRequestTarget): Promise<PullRequestState>;
@@ -312,6 +313,10 @@ export async function syncReviewPublication(
       entry.pullRequest === finding.pullRequest,
   );
   if (!target) throw new Error("Review PR is missing from the configured GitHub App targets.");
+  function complete<T>(result: T): T {
+    github.completeReconciliation(target!);
+    return result;
+  }
   const publish = input.mode === "publish";
   const botLogin = await github.readAppBot(target);
   const publication = publications.prepare(findingId, actionId, botLogin, publish);
@@ -359,14 +364,14 @@ export async function syncReviewPublication(
 
   if (!publication) {
     await reconcileThread(root);
-    return {
+    return complete({
       rootCommentId: finding.rootCommentId,
       observation: root
         ? threadObservation(root)
         : finding.rootCommentId === null
           ? "unpublished"
           : "missing",
-    };
+    });
   }
 
   const content = JSON.parse(finding.content) as FindingInput;
@@ -400,7 +405,7 @@ export async function syncReviewPublication(
   if (found[0]) {
     publications.recordComment(publication, findingId, actionId, found[0]);
     await reconcileThread(actionId === null ? found[0] : root);
-    return publications.get(publication.id)!;
+    return complete(publications.get(publication.id)!);
   }
 
   const observed =
@@ -410,7 +415,7 @@ export async function syncReviewPublication(
   publications.observe(publication, observed);
   if (!publish || publication.state === "published" || publication.state === "writing") {
     await reconcileThread(root);
-    return publications.get(publication.id)!;
+    return complete(publications.get(publication.id)!);
   }
   if (actionId !== null && !root)
     throw new Error(
@@ -419,7 +424,7 @@ export async function syncReviewPublication(
   const latest = await github.readPullRequest(target);
   if (latest.state !== "open") throw new Error("Review publication requires an open pull request.");
   if (!publications.claim(findingId, publication, latest.headSha, actionId))
-    return publications.get(publication.id)!;
+    return complete(publications.get(publication.id)!);
 
   const { path, startLine, endLine, side } = content;
   const body =
@@ -443,5 +448,5 @@ export async function syncReviewPublication(
     publications.fail(publication, error);
     throw error;
   }
-  return publications.get(publication.id)!;
+  return complete(publications.get(publication.id)!);
 }
