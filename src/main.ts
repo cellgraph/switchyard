@@ -30,7 +30,7 @@ function makeReader(store: WorkflowStore, targets: PullRequestTarget[]) {
       retryDeadlines: store.reconciliationRetries(),
       isRetryOwnerActive: createGitHubRetryOwnerCheck(store, targets),
       canReadPullRequest: (target, pullRequest) =>
-        canReconcilePullRequest(store, target.repository, pullRequest),
+        canReconcilePullRequest(store, target.repository, pullRequest, true),
     }),
   );
 }

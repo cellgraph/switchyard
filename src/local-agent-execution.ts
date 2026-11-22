@@ -24,6 +24,7 @@ export function createLocalAgentExecution(
       signal,
       authorizeLaunch,
       refreshLaunch,
+      preflight,
       fixFindingIds,
       recordExpectedWorktree,
       recordWorkspace,
@@ -59,9 +60,22 @@ export function createLocalAgentExecution(
               throw new Error("Agent session changed since the previous operation.");
             authorize();
           })
-        : worker.startSession(target, true, authorize);
-      recordWorkspace(session.worktree);
-      if (refreshLaunch) await refreshLaunch();
+        : worker.startSession(target, true, authorize, preflight?.worktree);
+      const checkpoint = refreshLaunch
+        ? worktrees.checkpoint(session.worktree, target.expectedHead)
+        : undefined;
+      if (
+        preflight &&
+        (!isDeepStrictEqual(preflight.worktree, session.worktree) ||
+          preflight.checkpoint !== checkpoint)
+      )
+        throw new Error("Worktree changed since the deferred agent preflight.");
+      recordWorkspace(session.worktree, checkpoint);
+      if (refreshLaunch) {
+        await refreshLaunch();
+        if (preflight && worktrees.checkpoint(session.worktree, target.expectedHead) !== checkpoint)
+          throw new Error("Worktree changed during agent preflight.");
+      }
       if (
         fixFindingIds &&
         worktrees.validate(session.worktree, target.expectedHead).changedPaths.length

@@ -434,6 +434,14 @@ export class WorkflowStore {
       }
     }
     const cycle = readFixCycles(this.#db, id).at(-1);
+    if (
+      command.type === "late_publication_confirmed" &&
+      (cycle?.phase !== "escalated" ||
+        cycle.push !== "confirmed" ||
+        cycle.interruptedPushDeadline === undefined ||
+        cycle.commit !== command.sha)
+    )
+      throw new Error("Late publication does not match the recorded interrupted push.");
     if (cycle && !["proposed", "finished", "escalated"].includes(cycle.phase)) {
       const observed =
         command.type === "github_pull_request" || command.type === "head_changed"

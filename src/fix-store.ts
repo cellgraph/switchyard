@@ -81,11 +81,20 @@ export type FixCycle = {
   }>;
   commit?: string;
   confirmationReads?: number;
+  interruptedPushDeadline?: number;
   push?: "intent" | "returned" | "unknown" | "confirmed";
   reason?: string;
   createdAt: string;
   updatedAt: string;
 };
+
+export function canConfirmLatePush(cycle: FixCycle | undefined): cycle is FixCycle {
+  return (
+    cycle?.phase === "escalated" &&
+    cycle.push === "unknown" &&
+    cycle.interruptedPushDeadline !== undefined
+  );
+}
 
 export function requiredChecksForCycle(cycle: FixCycle | undefined, configured: string[] | null) {
   return cycle && !["proposed", "finished", "escalated"].includes(cycle.phase)

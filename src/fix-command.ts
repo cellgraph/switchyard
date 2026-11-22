@@ -2,7 +2,7 @@ import { loadConfig, workflowKey } from "./config.ts";
 import { localCodexWorker } from "./agent-command.ts";
 import { authorizeFix, createFixController, fixStatus } from "./fix-controller.ts";
 import { createFixGit, runValidation } from "./fix-git.ts";
-import { requiredChecksForCycle, type FixConfig } from "./fix-store.ts";
+import { canConfirmLatePush, requiredChecksForCycle, type FixConfig } from "./fix-store.ts";
 import type { GitHubReader, PullRequestTarget } from "./github-api.ts";
 import { createReconciler } from "./reconcile.ts";
 import { WorkflowStore } from "./store.ts";
@@ -15,7 +15,10 @@ export function advanceReconciledFix(
   configured: FixConfig,
   reader: GitHubReader,
   refresh: () => Promise<void>,
-  options: Pick<Parameters<typeof createFixController>[0], "signal" | "drainSignal" | "report">,
+  options: Pick<
+    Parameters<typeof createFixController>[0],
+    "signal" | "drainSignal" | "report" | "now"
+  >,
 ) {
   const latest = store.fixes(workflowId).read().at(-1);
   const config =
@@ -29,7 +32,7 @@ export function advanceReconciledFix(
     worker: localCodexWorker(config),
     git: createFixGit(worktrees, `git@github.com:${target.repository}.git`),
     validate: runValidation,
-    readPullRequest: () => reader.readPullRequest(target),
+    readPullRequest: () => reader.readPullRequest(target, options.drainSignal),
     refresh,
     ...options,
   }).advanceReconciled();
@@ -72,7 +75,10 @@ export async function runFixCommand(
         store.recoverAgentClaims();
         const refresh = () => reconcile(target);
         await refresh();
-        if (store.getWorkflow(workflowId)?.state !== "escalated")
+        if (
+          store.getWorkflow(workflowId)?.state !== "escalated" ||
+          canConfirmLatePush(store.fixes(workflowId).read().at(-1))
+        )
           await advanceReconciledFix(store, workflowId, target, configured, reader, refresh, {
             signal: abort.signal,
           });

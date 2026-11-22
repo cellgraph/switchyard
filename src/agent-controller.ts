@@ -6,6 +6,8 @@ import type {
   AgentTurnEvidence,
   AgentTurnRequest,
 } from "./agent-operation.ts";
+import { GitHubDrainError, GitHubTransientError, GitHubRateLimitError } from "./github-app.ts";
+import { PullRequestHeadChangedError } from "./reconcile.ts";
 import { describeError } from "./controller.ts";
 import type { WorkflowStore } from "./store.ts";
 
@@ -63,6 +65,7 @@ export function createAgentController(
       if (!claim) return operations.get(operationId)!;
 
       let evidence: AgentTurnEvidence;
+      let deferredPreflight: Error | undefined;
       try {
         const { previous } = claim;
         if (typeof previous?.checkpoint?.session === "string")
@@ -79,6 +82,8 @@ export function createAgentController(
             !isDeepStrictEqual(previous.runtime, runtime))
         )
           throw new Error("Recorded agent runtime or session is incompatible with continuation.");
+        if (operation.evidence?.runtime && !isDeepStrictEqual(operation.evidence.runtime, runtime))
+          throw new Error("Recorded prelaunch runtime changed.");
         if (!operations.start(operationId, runtime))
           throw new Error("Workflow authorization changed before the worker started.");
         evidence = await worker.execute({
@@ -88,14 +93,49 @@ export function createAgentController(
           previous,
           ...(signal === undefined ? {} : { signal }),
           authorizeLaunch: () => operations.authorizeLaunch(operationId),
-          ...(refreshLaunch ? { refreshLaunch } : {}),
+          ...(refreshLaunch
+            ? {
+                async refreshLaunch() {
+                  try {
+                    await refreshLaunch();
+                  } catch (error) {
+                    if (
+                      error instanceof GitHubTransientError ||
+                      error instanceof GitHubRateLimitError ||
+                      error instanceof PullRequestHeadChangedError ||
+                      error instanceof GitHubDrainError
+                    )
+                      deferredPreflight = error;
+                    throw error;
+                  }
+                },
+              }
+            : {}),
+          ...(operation.evidence?.worktree && operation.evidence.prelaunchCheckpoint
+            ? {
+                preflight: {
+                  worktree: operation.evidence.worktree,
+                  checkpoint: operation.evidence.prelaunchCheckpoint,
+                },
+              }
+            : {}),
           ...(input.fix ? { fixFindingIds: input.fix.findingIds } : {}),
           recordExpectedWorktree: (expectedWorktree) =>
             operations.progress(operationId, { expectedWorktree }),
-          recordWorkspace: (worktree) => operations.progress(operationId, { worktree }),
+          recordWorkspace: (worktree, checkpoint) =>
+            operations.progress(operationId, {
+              worktree,
+              ...(checkpoint ? { prelaunchCheckpoint: checkpoint } : {}),
+            }),
           recordSession: (reference) => operations.progress(operationId, { reference }),
         });
       } catch (error) {
+        if (
+          error === deferredPreflight &&
+          deferredPreflight &&
+          operations.deferPrelaunch(operationId)
+        )
+          throw deferredPreflight;
         evidence = { error: describeError(error) };
       }
       // If this write fails, keep the existing intent so restart recovery holds the workflow.

@@ -158,7 +158,7 @@ describe("bounded single-PR fixes", () => {
     refresh?: () => Promise<void>,
     configuredRequiredChecks = config.requiredChecks,
     options?: Partial<
-      Pick<Parameters<typeof createFixController>[0], "drainSignal" | "report" | "validate">
+      Pick<Parameters<typeof createFixController>[0], "drainSignal" | "report" | "validate" | "now">
     >,
   ) {
     const reconcile = createReconciler(db, reader, () =>
@@ -582,6 +582,100 @@ describe("bounded single-PR fixes", () => {
     expect(current()).toMatchObject({ phase: "finished", push: "confirmed" });
     expect(push).toHaveBeenCalledTimes(1);
   });
+
+  it.each([false, true])(
+    "confirms a late detached push without redispatch after owner death (expired: %s)",
+    async (expired) => {
+      await validate();
+      authorizeFix(store, workflowId, current().id, true);
+      const commit = repository.createCommit(current());
+      const base = current().head;
+      store.fixes(workflowId).edit(({ cycles, save }) =>
+        save({
+          ...cycles.at(-1)!,
+          commit,
+          phase: "pushing",
+          owner: 2_147_483_647,
+          push: "intent",
+        }),
+      );
+      repository.attachCommit(current());
+
+      // Hold the original transport at its dispatch boundary while a new owner reads the remote.
+      const transport = Promise.withResolvers<void>();
+      const original = transport.promise.then(() => repository.push(current(), () => {}));
+      const unexpectedDispatch = vi.fn<typeof repository.push>();
+      const gitBoundary = { ...repository, push: unexpectedDispatch };
+      let now = 100_000;
+      const advance = () =>
+        controller(store, gitBoundary, undefined, config.requiredChecks, {
+          now: () => now,
+        }).advance();
+      try {
+        restart();
+        await advance();
+        expect(current()).toMatchObject({
+          phase: "confirming",
+          push: "unknown",
+          interruptedPushDeadline: 160_000,
+        });
+        expect(remoteHead()).toBe(base);
+        restart();
+        now += expired ? 60_000 : 1_000;
+        await advance();
+        expect(current().phase).toBe(expired ? "escalated" : "confirming");
+      } finally {
+        transport.resolve();
+        await original;
+      }
+
+      await advance();
+      expect(remoteHead()).toBe(commit);
+      expect(current()).toMatchObject({
+        phase: expired ? "escalated" : "finished",
+        push: "confirmed",
+      });
+      expect(store.getWorkflow(workflowId)).toMatchObject({
+        state: expired ? "escalated" : "awaiting_review",
+        headSha: commit,
+        review: null,
+        checks: [],
+      });
+      expect(unexpectedDispatch).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["unchanged", "changed"])(
+    "retries proven prelaunch failures only for the recorded checkout (%s)",
+    async (checkout) => {
+      review("review-1", "accepted");
+      await authorize();
+      const transient = new GitHubTransientError("Preflight transport failed.");
+      const reconcile = createReconciler(store, reader, () => config.requiredChecks);
+      const refresh = vi.fn(() => reconcile(target)).mockRejectedValueOnce(transient);
+      await expect(controller(store, repository, refresh).advanceReconciled()).rejects.toBe(
+        transient,
+      );
+      const operationId = current().operationId;
+      const before = store.agentOperations().get(operationId)!;
+      expect(before).toMatchObject({
+        status: "requested",
+        evidence: { prelaunchCheckpoint: expect.any(String) },
+      });
+      expect(before.evidence?.launchAuthorizedAt).toBeUndefined();
+      expect(current()).toMatchObject({ phase: "agent", owner: null });
+      expect(launches).toBe(0);
+      if (checkout === "changed")
+        writeFileSync(
+          join(before.evidence!.worktree!.path, "tracked.txt"),
+          "Changed outside the controller.\n",
+        );
+      restart();
+      await controller().advance();
+      expect(launches, current().reason).toBe(checkout === "changed" ? 0 : 1);
+      expect(current().phase).toBe(checkout === "changed" ? "escalated" : "validated");
+    },
+  );
 
   it("never replays an ambiguous push with the original ref still visible", async () => {
     await validate();

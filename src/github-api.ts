@@ -1,4 +1,9 @@
-import { githubRetryError, type GitHubAppClient, type GitHubRepository } from "./github-app.ts";
+import {
+  checkGitHubDrain,
+  githubRetryError,
+  type GitHubAppClient,
+  type GitHubRepository,
+} from "./github-app.ts";
 import { commitSha, object, repositoryName } from "./github-data.ts";
 import type { CheckEvidence, CheckOutcome } from "./workflow.ts";
 
@@ -13,13 +18,20 @@ export type PullRequestState = {
 
 export interface GitHubReader {
   completeReconciliation(target: PullRequestTarget): void;
-  readPullRequest(target: PullRequestTarget): Promise<PullRequestState>;
-  readReviewInputs(target: PullRequestTarget): Promise<{
+  readPullRequest(target: PullRequestTarget, signal?: AbortSignal): Promise<PullRequestState>;
+  readReviewInputs(
+    target: PullRequestTarget,
+    signal?: AbortSignal,
+  ): Promise<{
     reviews: unknown[];
     reviewComments: unknown[];
     issueComments: unknown[];
   }>;
-  readChecks(target: PullRequestTarget, headSha: string): Promise<CheckEvidence[]>;
+  readChecks(
+    target: PullRequestTarget,
+    headSha: string,
+    signal?: AbortSignal,
+  ): Promise<CheckEvidence[]>;
 }
 
 export function createGitHubReader(
@@ -28,15 +40,18 @@ export function createGitHubReader(
   async function list(
     target: PullRequestTarget,
     path: string,
+    signal?: AbortSignal,
     select: (data: unknown) => unknown = (data) => data,
   ): Promise<unknown[]> {
     const results: unknown[] = [];
     const separator = path.includes("?") ? "&" : "?";
     for (let page = 1; page <= 100; page += 1) {
+      checkGitHubDrain(signal);
       const { data, hasNext } = await client.get(
         target,
         `${path}${separator}per_page=100&page=${page}`,
         target.pullRequest,
+        signal,
       );
       const items = select(data);
       if (!Array.isArray(items)) throw new Error(`Invalid GitHub response for ${path}.`);
@@ -46,8 +61,8 @@ export function createGitHubReader(
     throw new Error(`GitHub pagination limit exceeded for ${path}.`);
   }
 
-  const readReviewComments = (target: PullRequestTarget) =>
-    list(target, `/pulls/${target.pullRequest}/comments`);
+  const readReviewComments = (target: PullRequestTarget, signal?: AbortSignal) =>
+    list(target, `/pulls/${target.pullRequest}/comments`, signal);
 
   return {
     readReviewComments,
@@ -55,8 +70,16 @@ export function createGitHubReader(
       client.completeReconciliation(target, target.pullRequest);
     },
 
-    async readPullRequest(target: PullRequestTarget): Promise<PullRequestState> {
-      const { data } = await client.get(target, `/pulls/${target.pullRequest}`, target.pullRequest);
+    async readPullRequest(
+      target: PullRequestTarget,
+      signal?: AbortSignal,
+    ): Promise<PullRequestState> {
+      const { data } = await client.get(
+        target,
+        `/pulls/${target.pullRequest}`,
+        target.pullRequest,
+        signal,
+      );
       const pullRequest = object(data);
       const head = object(pullRequest?.head);
       const headSha = commitSha(head?.sha);
@@ -80,23 +103,24 @@ export function createGitHubReader(
       };
     },
 
-    async readReviewInputs(target: PullRequestTarget) {
+    async readReviewInputs(target: PullRequestTarget, signal?: AbortSignal) {
       const [reviews, reviewComments, issueComments] = await readAll(
-        list(target, `/pulls/${target.pullRequest}/reviews`),
-        readReviewComments(target),
-        list(target, `/issues/${target.pullRequest}/comments`),
+        list(target, `/pulls/${target.pullRequest}/reviews`, signal),
+        readReviewComments(target, signal),
+        list(target, `/issues/${target.pullRequest}/comments`, signal),
       );
       return { reviews, reviewComments, issueComments };
     },
 
-    async readChecks(target: PullRequestTarget, headSha: string) {
+    async readChecks(target: PullRequestTarget, headSha: string, signal?: AbortSignal) {
       const [runs, statuses] = await readAll(
         list(
           target,
           `/commits/${headSha}/check-runs?filter=latest`,
+          signal,
           (data) => object(data)?.check_runs,
         ),
-        list(target, `/commits/${headSha}/status`, (data) => {
+        list(target, `/commits/${headSha}/status`, signal, (data) => {
           const combined = object(data);
           if (commitSha(combined?.sha) !== headSha)
             throw new Error("GitHub returned commit statuses for a different SHA.");

@@ -7,8 +7,8 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig, parseFixConfig } from "../src/config.ts";
-import type { GitHubReader } from "../src/github-api.ts";
-import { GitHubTransientError } from "../src/github-app.ts";
+import { createGitHubReader, type GitHubReader } from "../src/github-api.ts";
+import { createGitHubAppClient, GitHubTransientError } from "../src/github-app.ts";
 import { WorkflowStore } from "../src/store.ts";
 import { runUnattended, workerStatus } from "../src/unattended.ts";
 
@@ -170,12 +170,105 @@ describe("unattended polling", () => {
       },
     );
     expect(advance).not.toHaveBeenCalled();
-    expect(reader.completeReconciliation).toHaveBeenCalledWith(first);
-    expect(reader.completeReconciliation).not.toHaveBeenCalledWith(second);
+    expect(reader.readChecks).not.toHaveBeenCalled();
+    expect(reader.readReviewInputs).not.toHaveBeenCalled();
+    expect(reader.completeReconciliation).not.toHaveBeenCalled();
     expect(workerStatus(store)).toMatchObject({
       state: "stopped",
-      pullRequests: [{ state: "awaiting_review" }, { state: "unobserved" }],
+      pullRequests: [{ state: "unobserved" }, { state: "unobserved" }],
     });
+  });
+
+  function app(fetcher: typeof fetch) {
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    return createGitHubReader(
+      createGitHubAppClient({
+        clientId: "test",
+        privateKey: privateKey.export({ format: "pem", type: "pkcs8" }),
+        fetcher,
+        now: () => now,
+        retryDeadlines: store.reconciliationRetries(),
+      }),
+    );
+  }
+
+  it.each(["initial read", "first page"])(
+    "drains the real REST queue during the %s",
+    async (point) => {
+      const reads: string[] = [];
+      reader = app(async (input, options) => {
+        const url = new URL(String(input));
+        reads.push(url.pathname + url.search);
+        if (options?.method === "POST")
+          return Response.json({ token: "fixture", expires_at: new Date(now + 3_600_000) });
+        if (url.pathname.endsWith("/pulls/1")) {
+          if (point === "initial read") stop.abort();
+          return Response.json({ number: 1, head: { sha: oldHead }, state: "open" });
+        }
+        stop.abort();
+        return Response.json(
+          { check_runs: [] },
+          {
+            headers: { link: '<https://api.github.com/next>; rel="next"' },
+          },
+        );
+      });
+      await worker(() => {
+        throw new Error("Unexpected wait.");
+      });
+      expect(reads).toHaveLength(point === "initial read" ? 2 : 3);
+      expect(reads).not.toContainEqual(expect.stringMatching(/page=2|pulls\/2/));
+      expect(workerStatus(store)).toMatchObject({
+        lastPollFinishedAt: null,
+        pullRequests: [{ state: "unobserved" }, { state: "unobserved" }],
+      });
+      expect(log).toHaveBeenCalledWith(expect.objectContaining({ event: "poll_interrupted" }));
+    },
+  );
+
+  it("backs off repeated token 401s across repositories in the installation and across restarts", async () => {
+    const requests: string[] = [];
+    const shared = { ...second, installationId: first.installationId };
+    const unaffected = { repository: "owner/three", pullRequest: 3, installationId: 3 };
+    const fetcher: typeof fetch = async (input) => {
+      const path = new URL(String(input)).pathname;
+      requests.push(path);
+      if (path.includes("/installations/1/"))
+        return new Response("sensitive response", { status: 401 });
+      if (path.includes("/installations/3/"))
+        return Response.json({ token: "redacted", expires_at: new Date(now + 3_600_000) });
+      return Response.json({ number: 3, head: { sha: oldHead }, state: "closed" });
+    };
+    const config = {
+      targets: [first, shared, unaffected],
+      fixes: new Map(),
+      reconcileIntervalMs: interval,
+    };
+    reader = app(fetcher);
+    await worker(() => stop.abort(), { config });
+    expect(requests.filter((request) => request.includes("/installations/1/"))).toHaveLength(1);
+    expect(log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "target_failed",
+        outcome: "github_authentication",
+        httpStatus: 401,
+        installationId: 1,
+        retryAt: 301_000,
+      }),
+    );
+    expect(JSON.stringify(log.mock.calls)).not.toMatch(/sensitive response|redacted/);
+    expect(store.findWorkflow(unaffected.repository, 3)).not.toBeNull();
+
+    store.close();
+    store = new WorkflowStore(path);
+    stop = new AbortController();
+    reader = app(fetcher);
+    await worker(() => stop.abort(), { config });
+    expect(requests.filter((request) => request.includes("/installations/1/"))).toHaveLength(1);
+    now = 301_000;
+    stop = new AbortController();
+    await worker(() => stop.abort(), { config });
+    expect(requests.filter((request) => request.includes("/installations/1/"))).toHaveLength(2);
   });
 
   it("identifies invalid checkout configuration and keeps polling the other PRs", async () => {

@@ -2,6 +2,8 @@ import type { PullRequestTarget } from "./github-api.ts";
 import {
   belongsToReconciliation,
   GitHubRateLimitError,
+  GitHubDrainError,
+  installationAuthRetryKey,
   GitHubTransientError,
   isSecondaryLimitPaused,
   pullRequestRetryKey,
@@ -71,6 +73,7 @@ export function createController({
     return Math.max(
       retryStore.get(pullRequestRetryKey(target, target.pullRequest)) ?? 0,
       retryStore.get(tokenRetryKey(target)) ?? 0,
+      retryStore.get(installationAuthRetryKey(target)) ?? 0,
     );
   }
 
@@ -141,6 +144,7 @@ export function createController({
           }
           await observation;
         } catch (error) {
+          if (error instanceof GitHubDrainError && signal?.aborted) break;
           failures.push(`${target.repository}#${target.pullRequest}: ${describeError(error)}`);
           if (error instanceof GitHubRateLimitError) deadline = error.retryAt;
           else if (error instanceof GitHubTransientError)

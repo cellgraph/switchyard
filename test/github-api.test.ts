@@ -115,7 +115,7 @@ describe("GitHub App and REST adapter", () => {
     const client = createGitHubAppClient({ clientId: "fixture-client-id", privateKey, fetcher });
     await expect(client.get(target, "/pulls/7")).resolves.toMatchObject({ data: [] });
     await expect(client.get(target, "/pulls/7")).rejects.toThrow(
-      /^GitHub API GET \/repos\/owner\/repo\/pulls\/7 failed \(HTTP 401\)\.$/,
+      /^GitHub rejected credentials \(HTTP 401\)/,
     );
     expect(exchanges).toBe(3);
   });

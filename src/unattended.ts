@@ -5,7 +5,12 @@ import { advanceReconciledFix } from "./fix-command.ts";
 import { fixStatus } from "./fix-controller.ts";
 import { requiredChecksForCycle } from "./fix-store.ts";
 import type { GitHubReader, PullRequestTarget } from "./github-api.ts";
-import { GitHubRateLimitError, GitHubTransientError } from "./github-app.ts";
+import {
+  GitHubAuthenticationError,
+  GitHubDrainError,
+  GitHubRateLimitError,
+  GitHubTransientError,
+} from "./github-app.ts";
 import { createReconciler, PullRequestHeadChangedError } from "./reconcile.ts";
 import { localProcessAlive, type WorkflowStore } from "./store.ts";
 import { WorktreeSetupError } from "./worktree.ts";
@@ -55,6 +60,8 @@ export function workerStatus(store: WorkflowStore) {
 }
 
 function failureKind(error: unknown) {
+  if (error instanceof GitHubAuthenticationError) return "github_authentication";
+  if (error instanceof GitHubDrainError) return "interrupted";
   if (error instanceof WorktreeSetupError) return error.code;
   if (error instanceof PullRequestHeadChangedError) return "observation_changed";
   if (error instanceof GitHubRateLimitError) return "github_rate_limited";
@@ -120,7 +127,7 @@ export async function runUnattended({
         let stage = "reconciliation";
         async function refresh() {
           try {
-            await reconcile(target);
+            await reconcile(target, signal);
             report("reconciliation", { ...context, outcome: "completed" });
           } catch (error) {
             report("reconciliation", { ...context, outcome: failureKind(error) });
@@ -141,13 +148,19 @@ export async function runUnattended({
             stage = "fix_advance";
             await advance(store, workflow.id, target, configured, reader, refresh, {
               drainSignal: signal,
+              now,
               report: (operation) => report("fix_operation", { ...context, ...operation }),
             });
           }
         } catch (error) {
+          if (error instanceof GitHubDrainError && signal.aborted) throw error;
           report("target_failed", {
             ...context,
             ...prStatus(store, target),
+            installationId: target.installationId,
+            ...(error instanceof GitHubAuthenticationError
+              ? { httpStatus: error.status, retryAt: error.retryAt }
+              : {}),
             stage,
             outcome: failureKind(error),
             ...(error instanceof WorktreeSetupError ? { detail: error.message } : {}),
