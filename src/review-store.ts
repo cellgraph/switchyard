@@ -149,6 +149,7 @@ const codexReviewer = JSON.stringify({
 
 type StoreContext = {
   transaction<T>(run: () => T): T;
+  assertDispositionAllowed(workflowId: string, runId: string): void;
   getWorkflow(id: string): Workflow | null;
   transition(id: string, command: WorkflowCommand): Workflow;
 };
@@ -252,6 +253,17 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
   }
 
   return {
+    latestIndeterminate(workflowId: string, head: string): boolean {
+      const latest = db
+        .prepare(
+          `
+        SELECT status FROM review_runs WHERE workflow_id=? AND head_sha=? ORDER BY rowid DESC LIMIT 1
+      `,
+        )
+        .get(workflowId, head);
+      return ["indeterminate", "unknown", "failed", "interrupted"].includes(String(latest?.status));
+    },
+
     start(input: unknown) {
       const row = record(input);
       const id = identifier(row.id, "review ID");
@@ -569,6 +581,7 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
           FindingRow | undefined;
         if (!finding) throw new Error("Review finding does not exist.");
         const current = workflow(run(finding.run_id)!.workflow_id);
+        context.assertDispositionAllowed(current.id, finding.run_id);
         if (current.headSha !== sha)
           throw new Error("Finding action must use the current workflow head.");
         const status = summarize(finding);

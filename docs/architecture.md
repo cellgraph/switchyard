@@ -97,6 +97,12 @@ The local worker checks the Git common directory, registered checkout, branch an
 
 The controller checks the process ID recorded with each agent claim at startup and during polling. Live owners retain their claims through outcome commit. Recovery holds a claim for inspection after the OS confirms its owner has exited. An interrupted claim can leave a Codex subprocess or Git effects for an operator to inspect. Phase 3B does not guess the result, adopt an unproven session, reset a held session, or clean up its worktree. See the [local operations guide](agent-sessions.md) for commands and verification.
 
+## Bounded review and fix cycles
+
+Phase 5 adds cycle records to the workflow database. The controller uses the existing workflow transitions for fixing, validating, awaiting review, and human handoff. A cycle binds the selected review and finding actions to the PR head, the Codex operation, the worktree, and an immutable candidate tree. The normal reconciler observes GitHub. Explicit CLI advances claim agent, validation, commit, and push work using SQLite. The agent leaves an uncommitted candidate in a dedicated checkout. Local validation checks the captured candidate, and publication requires a second operator approval.
+
+The workflow stays in validation while publication is uncertain. The Git remote and GitHub PR must confirm the same expected commit before the controller reanchors the session to the clean new checkout. Review and CI evidence are scoped to the newly observed head. Required check names are configured locally. New findings require operator triage. A clean review and passing checks reach human handoff. See [bounded fix operations](fix-loop.md).
+
 ## GitHub integration
 
 Phase 2 uses the Phase 1 SQLite inbox and workflow store. The receiver checks the request, stores a minimal reconciliation hint, and returns after the durable insert. A serial controller pass claims due rows and processes them independently of HTTP. Webhook and periodic triggers both use the same reconciler and can share one observation of a PR within a pass. If the PR head moves during the evidence reads, the reconciler records the newly observed head and retries without saving stale evidence.

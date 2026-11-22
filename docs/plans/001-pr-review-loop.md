@@ -94,22 +94,20 @@ GitHub is the collaboration interface. Switchyard is the workflow authority. Per
 
 ## Phase 5: Review/fix loop, checks, and escalation
 
-1. On a completed finding review, persist the exact findings and a fix-cycle record before resuming the original session.
-2. Prompt the session to assess each finding, implement valid corrections, run repository-appropriate tests, commit, and push. It must report invalid findings or judgment calls for escalation.
-3. Inspect the resulting diff and Git state. Reject unsafe changes, wrong branch/head, failed validation, or push errors; do not begin another review wait until push is confirmed and the new SHA is known.
-4. Wait for review and required checks for the new head. Fetch current reviews, check runs, legacy statuses, and repository protection/ruleset requirements. A missing configured check set is an error/indeterminate state.
-5. Increment a bounded cycle count. On three unsuccessful cycles, repeated infrastructure failure, ambiguous review, or human judgment request, transition to `escalated` with reason and evidence.
-6. Mark `ready_for_human` only when exact-head review is explicitly clean and every configured required check has passed for that SHA. Do not call a merge API.
+1. Reconcile a completed exact-head review and propose a cycle using accepted, open findings and the current action history. New findings require operator disposition.
+2. Record approval for the proposal before dispatch. The controller rechecks GitHub, the selected review, the finding history, and the checkout at launch. The Codex implementation session leaves an uncommitted candidate and reports the findings it addressed.
+3. Stage the authorized paths, record the exact candidate and validation results, and require separate publication approval. The controller creates a single-parent commit and publishes it through an explicitly claimed, fast-forward Git operation.
+4. Reconcile the Git ref and GitHub PR head before completing publication. Wait for a new exact-head completed review and the locally configured required check names.
+5. Bound authorized cycles, time out agent execution, limit validation retries, and retain durable reasons for triage and unsafe or uncertain outcomes.
+6. Hand the PR to a human only when the current head has a clean review and passing required checks. See the [operating guide](../fix-loop.md).
 
 ### Acceptance criteria
 
-- The same finding delivered twice triggers at most one cycle for that reviewed SHA.
-- Invalid findings can be rejected by the agent but cause escalation with explanation, not a silent no-op.
-- Three unsuccessful cycles stop further automatic agent invocation.
-- New head commit immediately invalidates old review/check evidence.
-- Missing checks, no check data, pending checks, and failed checks all prevent readiness.
-- A clean exact-head review with passing required checks reaches `ready_for_human`; no automatic merge or PR approval occurs.
-- Manual stop, PR close, agent error, push failure, merge conflict, and explicit human-judgment escalation are observable and recoverable.
+- One authorized cycle per reviewed head, with a bounded total per PR.
+- Stale verdicts, unresolved triage, unsafe checkout changes, and uncertain operations hold dispatch or publication.
+- Restart recovers a confirmed local commit or remote publication without replaying uncertain writes.
+- A new head invalidates old review and check evidence. Missing, pending, failed, and ambiguous required checks prevent merge readiness.
+- The controller stays isolated from the candidate worktree and preserves the history needed for operator inspection.
 
 ## Phase 6: Operations, security, and release checklist
 

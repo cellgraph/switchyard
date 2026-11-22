@@ -34,12 +34,22 @@ const operations = [
   "index.lock",
 ];
 
-function git(cwd: string, ...args: string[]): string {
+export function git(cwd: string, ...args: string[]): string {
+  return runGit(cwd, args);
+}
+
+export function runGit(
+  cwd: string,
+  args: string[],
+  options?: { hooksPath?: string; env?: Record<string, string> },
+): string {
   // Git's environment overrides can redirect even commands explicitly given a working directory.
   const env = Object.fromEntries(
     Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")),
   );
+  Object.assign(env, options?.env);
   env.GIT_NO_LAZY_FETCH = "1";
+  env.GIT_TERMINAL_PROMPT = "0";
   try {
     return execFileSync(
       "git",
@@ -47,14 +57,22 @@ function git(cwd: string, ...args: string[]): string {
         "--no-optional-locks",
         "--no-replace-objects",
         "-c",
-        "core.hooksPath=/dev/null",
+        `core.hooksPath=${options?.hooksPath ?? "/dev/null"}`,
         "-c",
         "core.fsmonitor=false",
         "-c",
         "submodule.recurse=false",
         ...args,
       ],
-      { cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 8 * 1024 * 1024 },
+      {
+        cwd,
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        maxBuffer: 8 * 1024 * 1024,
+        timeout: 60_000,
+        killSignal: "SIGKILL",
+      },
     );
   } catch (cause) {
     throw new Error(`Git command failed (${args[0]}).`, { cause });
@@ -122,6 +140,39 @@ function checkoutStatus(path: string) {
       return entry.slice(3);
     });
   return { status, changedPaths };
+}
+
+function contentCheckpoint(
+  pathRoot: string,
+  hash = createHash("sha256"),
+  entries?: string[],
+): string {
+  // Include raw bytes, since Git status can report the same paths after edits.
+  let remainingBytes = 64 * 1024 * 1024;
+  let remainingEntries = 10_000;
+  function visit(path: string): void {
+    const stat = lstatSync(path);
+    if (--remainingEntries < 0 || (remainingBytes -= stat.size) < 0)
+      throw new Error("Worktree exceeds the bounds for a durable checkout checkpoint.");
+    hash.update(JSON.stringify([relative(pathRoot, path), stat.mode]));
+    if (stat.isDirectory()) {
+      for (const name of readdirSync(path).sort()) visit(join(path, name));
+    } else if (stat.isSymbolicLink()) {
+      hash.update(
+        createHash("sha256")
+          .update(readlinkSync(path, { encoding: "buffer" }))
+          .digest(),
+      );
+    } else if (stat.isFile()) {
+      hash.update(createHash("sha256").update(readFileSync(path)).digest());
+    } else throw new Error("Worktree contains an unsupported file type.");
+  }
+  for (const entry of entries ??
+    readdirSync(pathRoot)
+      .sort()
+      .filter((name) => name !== ".git"))
+    visit(join(pathRoot, entry.replace(/\/$/, "")));
+  return hash.digest("hex");
 }
 
 export function createWorktreeManager({
@@ -289,31 +340,30 @@ export function createWorktreeManager({
       const hash = createHash("sha256").update(
         JSON.stringify([status, git(worktree.path, "ls-files", "--stage", "-z")]),
       );
-      // Include ignored files and raw bytes, since Git status can report the same paths after edits.
-      let remainingBytes = 64 * 1024 * 1024;
-      let remainingEntries = 10_000;
-      function visit(directory: string): void {
-        for (const name of readdirSync(directory).sort()) {
-          if (directory === worktree.path && name === ".git") continue;
-          const path = join(directory, name);
-          const stat = lstatSync(path);
-          if (--remainingEntries < 0 || (remainingBytes -= stat.size) < 0)
-            throw new Error("Worktree exceeds the bounds for a durable checkout checkpoint.");
-          hash.update(JSON.stringify([relative(worktree.path, path), stat.mode]));
-          if (stat.isDirectory()) visit(path);
-          else if (stat.isSymbolicLink())
-            hash.update(
-              createHash("sha256")
-                .update(readlinkSync(path, { encoding: "buffer" }))
-                .digest(),
-            );
-          else if (stat.isFile())
-            hash.update(createHash("sha256").update(readFileSync(path)).digest());
-          else throw new Error("Worktree contains an unsupported file type.");
-        }
-      }
-      visit(worktree.path);
-      return hash.digest("hex");
+      return contentCheckpoint(worktree.path, hash);
+    },
+
+    contentCheckpoint(worktree: Worktree, expectedHead: string): string {
+      validate(worktree, expectedHead);
+      return contentCheckpoint(worktree.path);
+    },
+
+    ignoredCheckpoint(worktree: Worktree, expectedHead: string): string {
+      validate(worktree, expectedHead);
+      const ignored = git(
+        worktree.path,
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+        "-z",
+      );
+      return contentCheckpoint(
+        worktree.path,
+        undefined,
+        ignored.split("\0").filter(Boolean).sort(),
+      );
     },
 
     observe(worktree: Worktree, beforeHead: string) {

@@ -221,7 +221,7 @@ describe("Codex review marker evidence", () => {
       });
       await reconcile(target);
       delayedChecks.resolve([]);
-      await delayed;
+      await expect(delayed).rejects.toThrow(/superseded this observation/);
 
       expect(store.reviews().inspect(workflowId)).toMatchObject({
         projectedReview: { runId, outcome: "in_progress" },

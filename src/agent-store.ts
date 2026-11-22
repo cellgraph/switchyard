@@ -8,6 +8,7 @@ import type {
   AgentTurnEvidence,
   AgentTurnIntent,
 } from "./agent-operation.ts";
+import { fixAgentAuthorized } from "./fix-store.ts";
 import type { Worktree } from "./worktree.ts";
 import type { Workflow, WorkflowCommand } from "./workflow.ts";
 
@@ -185,13 +186,29 @@ export function createAgentOperationStore(
 
   function authorized(workflow: Workflow | null, intent: AgentTurnIntent): boolean {
     return (
-      eligible(workflow, intent) && workflowRevision(intent.workflowId) === intent.workflowRevision
+      eligible(workflow, intent) &&
+      workflow !== null &&
+      fixAgentAuthorized(db, workflow, intent) &&
+      workflowRevision(intent.workflowId) === intent.workflowRevision
     );
   }
 
   return {
     get,
     session,
+    hasUnresolved(workflowId: string): boolean {
+      return Boolean(
+        db
+          .prepare(
+            `
+        SELECT 1 FROM operations WHERE workflow_id=? AND (
+          (kind='durable_agent_turn' AND status<>'completed') OR status IN ('pending','ambiguous')
+        ) LIMIT 1
+      `,
+          )
+          .get(workflowId),
+      );
+    },
 
     request(input: Omit<AgentTurnIntent, "mode" | "workflowRevision">): AgentOperation {
       return transaction(() => {
@@ -217,7 +234,7 @@ export function createAgentOperationStore(
           mode: workflow.state,
           workflowRevision: workflowRevision(workflow.id),
         };
-        if (!eligible(workflow, intent))
+        if (!eligible(workflow, intent) || !fixAgentAuthorized(db, workflow, intent))
           throw new Error("Workflow head or fix authorization does not match the request.");
         assertNoLegacyOperation(workflow.id);
         if (
@@ -241,7 +258,7 @@ export function createAgentOperationStore(
           throw new Error("Legacy agent session or worktree requires inspection before dispatch.");
         if (previous?.status === "held" || previous?.status === "starting")
           throw new Error("Agent session requires manual reconciliation.");
-        if (!previous && intent.mode === "fixing")
+        if (!previous && intent.mode === "fixing" && !workflow.review?.runId)
           throw new Error("A fix requires an active implementation session.");
         if (!previous && intent.expectedHead !== workflow.headSha)
           throw new Error("The first agent turn must start at the recorded pull request head.");
@@ -370,6 +387,9 @@ export function createAgentOperationStore(
             evidence.reference.worktree.branch !== intent.branch ||
             !isDeepStrictEqual(evidence.reference.worktree, evidence.worktree))
             ? "Worker returned conflicting session and checkout evidence."
+            : undefined) ??
+          (intent.fix && !isDeepStrictEqual(evidence.addressedFindings, intent.fix.findingIds)
+            ? "Agent did not confirm addressing every accepted finding."
             : undefined) ??
           (!evidence.runtime || !evidence.reference || !evidence.checkpoint || !evidence.workspace
             ? "Agent did not return the session and checkout evidence needed for continuation."

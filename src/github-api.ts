@@ -1,9 +1,15 @@
 import { githubRetryError, type GitHubAppClient, type GitHubRepository } from "./github-app.ts";
-import { commitSha, object } from "./github-data.ts";
+import { commitSha, object, repositoryName } from "./github-data.ts";
 import type { CheckEvidence, CheckOutcome } from "./workflow.ts";
 
 export type PullRequestTarget = GitHubRepository & { pullRequest: number };
-export type PullRequestState = { headSha: string; state: "open" | "closed" };
+export type PullRequestState = {
+  headSha: string;
+  state: "open" | "closed";
+  headRef?: string;
+  headRepository?: string;
+  headDefaultBranch?: string;
+};
 
 export interface GitHubReader {
   completeReconciliation(target: PullRequestTarget): void;
@@ -52,7 +58,8 @@ export function createGitHubReader(
     async readPullRequest(target: PullRequestTarget): Promise<PullRequestState> {
       const { data } = await client.get(target, `/pulls/${target.pullRequest}`, target.pullRequest);
       const pullRequest = object(data);
-      const headSha = commitSha(object(pullRequest?.head)?.sha);
+      const head = object(pullRequest?.head);
+      const headSha = commitSha(head?.sha);
       const state = pullRequest?.state;
       if (
         pullRequest?.number !== target.pullRequest ||
@@ -60,7 +67,17 @@ export function createGitHubReader(
         (state !== "open" && state !== "closed")
       )
         throw new Error("GitHub returned an invalid pull request response.");
-      return { headSha, state };
+      const repository = object(head?.repo);
+      const headRepository = repositoryName(repository?.full_name);
+      return {
+        headSha,
+        state,
+        ...(typeof head?.ref === "string" ? { headRef: head.ref } : {}),
+        ...(headRepository ? { headRepository } : {}),
+        ...(typeof repository?.default_branch === "string"
+          ? { headDefaultBranch: repository.default_branch }
+          : {}),
+      };
     },
 
     async readReviewInputs(target: PullRequestTarget) {

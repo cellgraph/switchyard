@@ -18,6 +18,7 @@ export type AgentTurnRequest = {
   expectedPullRequestHead: string;
   expectedHead: string;
   prompt: string;
+  fix?: { cycleId: string; findingIds: string[] };
 };
 
 export type AgentTurnIntent = Omit<AgentTurnRequest, "prompt"> & {
@@ -48,6 +49,9 @@ export type AgentTurnEvidence = {
   workspace?: WorkerTurnResult["workspace"];
   checkpoint?: { workspace: string; session: AgentSessionCheckpoint };
   error?: string;
+  addressedFindings?: string[];
+  ignoredCheckpoint?: string;
+  usage?: { inputTokens: number; outputTokens: number };
 };
 
 export type AgentOperation = {
@@ -82,6 +86,8 @@ export interface AgentOperationWorker {
     previous: AgentSessionBinding | null;
     signal?: AbortSignal;
     authorizeLaunch(): void;
+    refreshLaunch?: () => Promise<void>;
+    fixFindingIds?: string[];
     recordExpectedWorktree(worktree: WorktreeLocation): void;
     recordWorkspace(worktree: Worktree): void;
     recordSession(reference: WorkerSessionReference): void;
