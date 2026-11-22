@@ -3,7 +3,7 @@ import { lstatSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FixCycle, ValidationCommand, ValidationResult } from "./fix-store.ts";
-import { git, runGit, type WorktreeManager } from "./worktree.ts";
+import { git, runGitPush, type WorktreeManager } from "./worktree.ts";
 
 function paths(value: string): string[] {
   return value.split("\0").filter(Boolean);
@@ -162,7 +162,7 @@ export function createFixGit(worktrees: WorktreeManager, remote: string) {
         throw new Error("Remote branch lookup returned unexpected evidence.");
       return sha;
     },
-    push(cycle: FixCycle, authorizeDispatch: () => void) {
+    async push(cycle: FixCycle, authorizeDispatch: () => void) {
       this.verifyCheckout(cycle);
       const ref = destination(cycle);
       const hooksPath = mkdtempSync(join(tmpdir(), "switchyard-push-"));
@@ -182,7 +182,7 @@ exit 0
           { mode: 0o700 },
         );
         authorizeDispatch();
-        runGit(
+        await runGitPush(
           cycle.worktree!.path,
           [
             "-c",

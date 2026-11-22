@@ -7,9 +7,11 @@ import { authorizeFix, createFixController } from "../src/fix-controller.ts";
 import { createFixGit, runValidation } from "../src/fix-git.ts";
 import { requiredChecksForCycle, type FixConfig, type FixCycle } from "../src/fix-store.ts";
 import type { GitHubReader, PullRequestState } from "../src/github-api.ts";
+import { GitHubTransientError } from "../src/github-app.ts";
 import { createLocalAgentExecution } from "../src/local-agent-execution.ts";
 import { createReconciler } from "../src/reconcile.ts";
 import { WorkflowStore } from "../src/store.ts";
+import { runUnattended, workerStatus } from "../src/unattended.ts";
 import { createWorktreeManager } from "../src/worktree.ts";
 import { agentRepository, git } from "./fixtures/agent-repository.ts";
 import codexFixture from "./fixtures/codex-pr51.json" with { type: "json" };
@@ -155,6 +157,9 @@ describe("bounded single-PR fixes", () => {
     gitBoundary = repository,
     refresh?: () => Promise<void>,
     configuredRequiredChecks = config.requiredChecks,
+    options?: Partial<
+      Pick<Parameters<typeof createFixController>[0], "drainSignal" | "report" | "validate">
+    >,
   ) {
     const reconcile = createReconciler(db, reader, () =>
       requiredChecksForCycle(current(db), configuredRequiredChecks),
@@ -183,6 +188,7 @@ describe("bounded single-PR fixes", () => {
           digest: "checkpoint",
         })).execute,
       },
+      ...options,
     });
   }
 
@@ -244,6 +250,142 @@ describe("bounded single-PR fixes", () => {
     store = new WorkflowStore(fixture.db);
     store.recover();
   }
+
+  it("waits for both operator approvals and drains claimed operations without replay across worker runs", async () => {
+    const push = vi.fn(repository.push.bind(repository));
+    const gitBoundary = { ...repository, push };
+    const logs = vi.fn();
+    async function poll(stop = new AbortController()) {
+      await runUnattended({
+        store,
+        config: {
+          targets: [target],
+          fixes: new Map([[workflowId, config]]),
+          reconcileIntervalMs: 1_000,
+        },
+        reader,
+        signal: stop.signal,
+        log: logs,
+        wait: async () => stop.abort(),
+        advance: (db, _id, _target, _configured, _reader, refresh, options) =>
+          controller(db, gitBoundary, refresh, config.requiredChecks, options).advanceReconciled(),
+      });
+    }
+
+    const findingId = review();
+    await poll();
+    expect(workerStatus(store)).toMatchObject({
+      pullRequests: [{ attention: "finding_disposition" }],
+    });
+    expect(launches).toBe(0);
+    act(findingId, fixture.workflow.headSha, "accepted", "worker");
+    await poll();
+    expect(workerStatus(store)).toMatchObject({
+      pullRequests: [{ attention: "fix_authorization" }],
+    });
+    await poll();
+    expect(launches).toBe(0);
+
+    const stopAgent = new AbortController();
+    onTurn = async () => stopAgent.abort();
+    authorizeFix(store, workflowId, current().id, false);
+    await poll(stopAgent);
+    expect(current()).toMatchObject({ phase: "agent", validation: [], owner: null });
+    expect(launches).toBe(1);
+
+    restart();
+    await poll();
+    expect(workerStatus(store)).toMatchObject({
+      pullRequests: [{ attention: "publication_authorization" }],
+    });
+    await poll();
+    expect(push).not.toHaveBeenCalled();
+    expect(launches).toBe(1);
+
+    const stopPush = new AbortController();
+    push.mockImplementationOnce((cycle, claim) =>
+      repository.push(cycle, () => {
+        claim();
+        stopPush.abort();
+      }),
+    );
+    authorizeFix(store, workflowId, current().id, true);
+    await poll(stopPush);
+    expect(current()).toMatchObject({ phase: "confirming", push: "returned" });
+    expect(remoteHead()).toBe(current().commit);
+
+    restart();
+    await poll();
+    expect(current()).toMatchObject({ phase: "finished", push: "confirmed" });
+    expect(push).toHaveBeenCalledTimes(1);
+    expect(launches).toBe(1);
+    expect(store.getWorkflow(workflowId)).toMatchObject({ state: "awaiting_review", review: null });
+    expect(logs).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "fix_operation",
+        operation: "validation",
+        outcome: "passed",
+        commandId: "verify",
+      }),
+    );
+  });
+
+  it("reconciles an attached commit after a transient GitHub error before any push intent", async () => {
+    await validate();
+    const push = vi.fn(repository.push.bind(repository));
+    const gitBoundary = { ...repository, push };
+    const reconciliation = createReconciler(store, reader);
+    const refresh = vi.fn(() => reconciliation(target));
+    refresh.mockRejectedValueOnce(new GitHubTransientError("Temporary failure."));
+    authorizeFix(store, workflowId, current().id, true);
+    await expect(controller(store, gitBoundary, refresh).advanceReconciled()).rejects.toThrow(
+      /Temporary/,
+    );
+    expect(current()).toMatchObject({
+      phase: "committing",
+      owner: null,
+      commit: expect.any(String),
+    });
+    expect(current().push).toBeUndefined();
+    expect(push).not.toHaveBeenCalled();
+    await controller(store, gitBoundary, refresh).advance();
+    expect(push).toHaveBeenCalledTimes(1);
+    expect(remoteHead()).toBe(current().commit);
+  });
+
+  it("holds unknown validation outcomes even with retries remaining", async () => {
+    review("review-1", "accepted");
+    await authorize();
+    const validateCommand = vi.fn(async (command: FixConfig["validation"][number]) => ({
+      id: command.id,
+      status: "unknown" as const,
+      exitCode: null,
+      output: "Timed out.",
+    }));
+    const advance = controller(store, repository, undefined, config.requiredChecks, {
+      validate: validateCommand,
+    });
+    await advance.advance();
+    expect(current()).toMatchObject({ phase: "escalated", validation: [{ status: "unknown" }] });
+    await advance.advance();
+    expect(validateCommand).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles a new head after the agent turn before claiming validation", async () => {
+    review("review-1", "accepted");
+    await authorize();
+    onTurn = async () => {
+      observedHead = "b".repeat(40);
+    };
+    const validateCommand = vi.fn(runValidation);
+    await controller(store, repository, undefined, config.requiredChecks, {
+      validate: validateCommand,
+    }).advance();
+    expect(launches).toBe(1);
+    expect(validateCommand).not.toHaveBeenCalled();
+    expect(current()).toMatchObject({ phase: "escalated", validation: [] });
+    expect(store.getWorkflow(workflowId)).toMatchObject({ headSha: observedHead });
+  });
 
   function simulateDeadOwner(phase: FixCycle["phase"]) {
     store.fixes(workflowId).edit(({ cycles, save }) =>
@@ -545,7 +687,7 @@ describe("bounded single-PR fixes", () => {
     await publish({
       ...repository,
       push(cycle, claim) {
-        repository.push(cycle, () => {
+        return repository.push(cycle, () => {
           claim();
           git(remote, "update-ref", "-d", "refs/heads/feat/pr");
         });
@@ -564,7 +706,7 @@ describe("bounded single-PR fixes", () => {
         await publish({
           ...repository,
           push(cycle, claim) {
-            repository.push(cycle, () => {
+            return repository.push(cycle, () => {
               if (writer === "disposition") revoke(other, cycle);
               else
                 other.transition(workflowId, {
@@ -604,7 +746,7 @@ describe("bounded single-PR fixes", () => {
       await publish({
         ...repository,
         push(cycle, claim) {
-          repository.push(cycle, () => {
+          return repository.push(cycle, () => {
             claim();
             expect(current(other).push).toBe("intent");
             expect(() => revoke(other, cycle)).toThrow(/publication has already started/i);

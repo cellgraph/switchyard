@@ -1,60 +1,21 @@
+import { fork } from "node:child_process";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import { runAgentCommand } from "./agent-command.ts";
 import { createController, createGitHubRetryOwnerCheck, describeError } from "./controller.ts";
 import { requiredChecksForCycle } from "./fix-store.ts";
-import { parseFixConfig, runFixCommand } from "./fix-command.ts";
+import { runFixCommand } from "./fix-command.ts";
+import { loadConfig, workflowKey } from "./config.ts";
 import { createGitHubReader, type PullRequestTarget } from "./github-api.ts";
 import { createGitHubAppClient, resumeGitHubAfterSecondaryLimit } from "./github-app.ts";
-import { object, positiveInteger, repositoryName } from "./github-data.ts";
+import { positiveInteger } from "./github-data.ts";
 import { canReconcilePullRequest, createReconciler } from "./reconcile.ts";
 import { runReviewCommand } from "./review-command.ts";
 import { WorkflowStore } from "./store.ts";
+import { runUnattended, workerStatus } from "./unattended.ts";
 import { createWebhookServer } from "./webhook.ts";
-
-function loadConfig(path: string) {
-  const raw = readFileSync(path, "utf8");
-  let config: Record<string, unknown> | undefined;
-  try {
-    config = object(JSON.parse(raw));
-  } catch {
-    throw new Error("Switchyard configuration is not valid JSON.");
-  }
-  if (!Array.isArray(config?.repositories) || !config.repositories.length)
-    throw new Error("Configuration requires a non-empty repositories array.");
-  const targets: PullRequestTarget[] = [];
-  const seen = new Set<string>();
-  for (const value of config.repositories as unknown[]) {
-    const entry = object(value);
-    const repository = repositoryName(entry?.repository);
-    const installationId = entry?.installationId;
-    const pullRequests = entry?.pullRequests;
-    if (
-      !repository ||
-      !positiveInteger(installationId) ||
-      !Array.isArray(pullRequests) ||
-      !pullRequests.length ||
-      !pullRequests.every(positiveInteger)
-    )
-      throw new Error(
-        "Each repository needs an owner/name, installationId, and positive PR numbers.",
-      );
-    for (const pullRequest of pullRequests) {
-      const id = `${repository}#${pullRequest}`;
-      if (seen.has(id)) throw new Error(`Duplicate configured pull request ${id}.`);
-      seen.add(id);
-      targets.push({ repository, installationId, pullRequest });
-    }
-  }
-  const interval = config.reconcileIntervalMs ?? 60_000;
-  if (interval !== 0 && !positiveInteger(interval))
-    throw new Error("reconcileIntervalMs must be a non-negative integer.");
-  const fix = config.fix === undefined ? undefined : parseFixConfig(config.fix);
-  if (fix && targets.length !== 1)
-    throw new Error("Fix orchestration requires exactly one configured pull request.");
-  return { targets, reconcileIntervalMs: interval, fix };
-}
 
 function makeReader(store: WorkflowStore, targets: PullRequestTarget[]) {
   const clientId = process.env.GITHUB_APP_CLIENT_ID;
@@ -74,13 +35,44 @@ function makeReader(store: WorkflowStore, targets: PullRequestTarget[]) {
   );
 }
 
+async function superviseWorker(configPath: string): Promise<void> {
+  // The SDK starts Codex in its caller's process group. Keep the worker and
+  // its children out of the terminal group and translate Ctrl-C into a drain.
+  const child = fork(fileURLToPath(import.meta.url), ["--worker-process", configPath], {
+    detached: true,
+    stdio: ["inherit", "inherit", "inherit", "ipc"],
+  });
+  const stop = () => {
+    if (child.connected) child.disconnect();
+  };
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  try {
+    const [code] = (await once(child, "exit")) as [number | null, NodeJS.Signals | null];
+    if (code !== 0) process.exitCode = code ?? 1;
+  } finally {
+    process.removeListener("SIGINT", stop);
+    process.removeListener("SIGTERM", stop);
+  }
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const dbPath = process.env.SWITCHYARD_DB_PATH ?? "switchyard.sqlite";
   process.umask(0o077);
   if (await runReviewCommand(args, dbPath, (path) => loadConfig(path).targets)) return;
   if (await runAgentCommand(args, dbPath)) return;
-  if (await runFixCommand(args, dbPath, (path) => loadConfig(path).targets, makeReader)) return;
+  if (await runFixCommand(args, dbPath, makeReader)) return;
+  if (args[0] === "--worker-status") {
+    if (args.length !== 1) throw new Error("Usage: --worker-status");
+    const store = new WorkflowStore(dbPath);
+    try {
+      console.info(JSON.stringify(workerStatus(store)));
+    } finally {
+      store.close();
+    }
+    return;
+  }
   if (args.length === 1 && args[0] === "--resume-github") {
     const store = new WorkflowStore(dbPath);
     try {
@@ -96,11 +88,15 @@ async function main(): Promise<void> {
     return;
   }
   const onceOnly = args[0] === "--once";
-  const configPath = args[onceOnly ? 1 : 0];
-  if (!configPath || args.length !== (onceOnly ? 2 : 1))
+  const supervised = args[0] === "--worker-process";
+  const unattended = supervised || args[0] === "--worker";
+  const configPath = args[onceOnly || unattended ? 1 : 0];
+  if (!configPath || args.length !== (onceOnly || unattended ? 2 : 1))
     throw new Error(
-      "Usage: npm start -- [--once] path/to/config.json or npm start -- --resume-github",
+      "Usage: npm start -- [--once | --worker] CONFIG.json or npm start -- --worker-status | --resume-github",
     );
+  if (unattended && !supervised) return superviseWorker(configPath);
+  if (supervised && !process.connected) return;
 
   const config = loadConfig(configPath);
   const store = new WorkflowStore(dbPath);
@@ -108,13 +104,24 @@ async function main(): Promise<void> {
   const reportError = (message: string) => console.error(message);
   const abort = new AbortController();
   const stop = () => abort.abort();
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  if (supervised) process.on("disconnect", stop);
   let server: ReturnType<typeof createWebhookServer> | undefined;
 
   try {
     const isRetryOwnerActive = createGitHubRetryOwnerCheck(store, config.targets);
     const reader = makeReader(store, config.targets);
+    if (unattended) {
+      await runUnattended({
+        store,
+        config,
+        reader,
+        signal: abort.signal,
+        log: (entry) => console.info(JSON.stringify(entry)),
+      });
+      return;
+    }
     const recovered = store.recover();
     if (
       recovered.deliveries ||
@@ -128,7 +135,7 @@ async function main(): Promise<void> {
       reconcile: createReconciler(store, reader, (target) =>
         requiredChecksForCycle(
           store.fixes(`${target.repository}#${target.pullRequest}`).read().at(-1),
-          config.fix?.requiredChecks ?? null,
+          config.fixes.get(workflowKey(target))?.requiredChecks ?? null,
         ),
       ),
       reportError,
@@ -166,6 +173,7 @@ async function main(): Promise<void> {
       store.close();
       process.removeListener("SIGINT", stop);
       process.removeListener("SIGTERM", stop);
+      if (supervised) process.removeListener("disconnect", stop);
     }
   }
 }

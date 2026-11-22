@@ -63,7 +63,7 @@ npm start -- --fix-publish 'owner/repo#42' CYCLE_ID
 npm start -- --fix-advance 'owner/repo#42' /absolute/path/to/config.json
 ```
 
-All fix commands emit JSON containing the workflow, cycle history, active operation and session when available, validation, and next action. `--fix-authorize` and `--fix-publish` only record approvals. Each advance can reconcile and make a bounded step. Polling and CLI advances use the approved check list during an active cycle. Once publication is confirmed, both use the current configured check list. Polling observes GitHub and never launches an agent, pushes, or invokes an independent review. The repository's automatic reviewer or an operator-directed independent reviewer produces the next review. Historical findings keep their decisions and can be marked fixed by the operator after inspecting the publication and subsequent review.
+All fix commands emit JSON containing the workflow, cycle history, active operation and session when available, validation, and next action. `--fix-authorize` and `--fix-publish` only record approvals. Each advance can reconcile and make a bounded step. Polling and CLI advances use the approved check list during an active cycle. Once publication is confirmed, both use the current configured check list. The reconcile-only CLI observes GitHub. The [unattended worker](unattended.md) can also advance explicitly authorized work. An independent reviewer supplies review evidence in both modes. The repository's automatic reviewer or an operator-directed independent reviewer produces the next review. Historical findings keep their decisions and can be marked fixed by the operator after inspecting the publication and subsequent review.
 
 ## Recovery
 

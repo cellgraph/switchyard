@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   lstatSync,
@@ -38,11 +38,10 @@ export function git(cwd: string, ...args: string[]): string {
   return runGit(cwd, args);
 }
 
-export function runGit(
-  cwd: string,
-  args: string[],
-  options?: { hooksPath?: string; env?: Record<string, string> },
-): string {
+type GitOptions = { hooksPath?: string; env?: Record<string, string> };
+const gitTimeoutMs = 60_000;
+
+function gitInvocation(args: string[], options?: GitOptions) {
   // Git's environment overrides can redirect even commands explicitly given a working directory.
   const env = Object.fromEntries(
     Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")),
@@ -50,33 +49,65 @@ export function runGit(
   Object.assign(env, options?.env);
   env.GIT_NO_LAZY_FETCH = "1";
   env.GIT_TERMINAL_PROMPT = "0";
+  return {
+    env,
+    argv: [
+      "--no-optional-locks",
+      "--no-replace-objects",
+      "-c",
+      `core.hooksPath=${options?.hooksPath ?? "/dev/null"}`,
+      "-c",
+      "core.fsmonitor=false",
+      "-c",
+      "submodule.recurse=false",
+      ...args,
+    ],
+  };
+}
+
+export function runGit(cwd: string, args: string[], options?: GitOptions): string {
+  const { env, argv } = gitInvocation(args, options);
   try {
-    return execFileSync(
-      "git",
-      [
-        "--no-optional-locks",
-        "--no-replace-objects",
-        "-c",
-        `core.hooksPath=${options?.hooksPath ?? "/dev/null"}`,
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "submodule.recurse=false",
-        ...args,
-      ],
-      {
-        cwd,
-        env,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-        maxBuffer: 8 * 1024 * 1024,
-        timeout: 60_000,
-        killSignal: "SIGKILL",
-      },
-    );
+    return execFileSync("git", argv, {
+      cwd,
+      env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      maxBuffer: 8 * 1024 * 1024,
+      timeout: gitTimeoutMs,
+      killSignal: "SIGKILL",
+    });
   } catch (cause) {
     throw new Error(`Git command failed (${args[0]}).`, { cause });
   }
+}
+
+export function runGitPush(cwd: string, args: string[], options: GitOptions): Promise<void> {
+  const { env, argv } = gitInvocation(args, options);
+  return new Promise((resolve, reject) => {
+    // A terminal SIGINT to the controller's foreground group must not interrupt a claimed push.
+    const child = spawn("git", argv, { cwd, env, detached: true, stdio: "ignore" });
+    let failure: Error | undefined;
+    const timer = setTimeout(() => {
+      failure = new Error("Git push timed out.");
+      if (child.pid) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch (cause) {
+          if ((cause as NodeJS.ErrnoException).code !== "ESRCH")
+            failure = new Error("Could not stop the timed-out Git push process group.", { cause });
+        }
+      }
+    }, gitTimeoutMs);
+    child.on("error", (cause) => {
+      failure = new Error("Git push could not start.", { cause });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (failure || code !== 0) reject(failure ?? new Error("Git push failed."));
+      else resolve();
+    });
+  });
 }
 
 function gitPath(cwd: string, location: string): string {
@@ -175,6 +206,15 @@ function contentCheckpoint(
   return hash.digest("hex");
 }
 
+export class WorktreeSetupError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string, cause?: unknown) {
+    super(message, { cause });
+    this.code = code;
+  }
+}
+
 export function createWorktreeManager({
   repositoryDirectory,
   worktreeRoot,
@@ -182,14 +222,37 @@ export function createWorktreeManager({
   repositoryDirectory: string;
   worktreeRoot: string;
 }) {
-  const source = realpathSync(repositoryDirectory);
-  const root = realpathSync(worktreeRoot);
-  if (!statSync(root).isDirectory()) throw new Error("Worktree root must be a directory.");
-  if (realpathSync(gitPath(source, "--show-toplevel")) !== source)
-    throw new Error("Repository directory must be a Git checkout root.");
-  const repository = realpathSync(gitPath(source, "--git-common-dir"));
+  let source: string;
+  let repository: string;
+  try {
+    source = realpathSync(repositoryDirectory);
+    if (realpathSync(gitPath(source, "--show-toplevel")) !== source)
+      throw new Error("Repository directory must be a Git checkout root.");
+    repository = realpathSync(gitPath(source, "--git-common-dir"));
+  } catch (error) {
+    throw new WorktreeSetupError(
+      "repository_checkout_unavailable",
+      "repositoryDirectory must name an accessible Git checkout root.",
+      error,
+    );
+  }
+  let root: string;
+  try {
+    root = realpathSync(worktreeRoot);
+    if (!statSync(root).isDirectory()) throw new Error("Worktree root must be a directory.");
+  } catch (error) {
+    throw new WorktreeSetupError(
+      "worktree_root_unavailable",
+      "worktreeRoot must name an accessible directory.",
+      error,
+    );
+  }
   const repositoryStat = statSync(repository, { bigint: true });
-  if (inside(repository, root)) throw new Error("Worktree root overlaps Git metadata.");
+  if (inside(repository, root))
+    throw new WorktreeSetupError(
+      "worktree_root_overlaps_git_metadata",
+      "Worktree root overlaps Git metadata.",
+    );
 
   function locate({ workflowId, branch }: WorktreeTarget): WorktreeLocation {
     if (!semanticBranch.test(branch)) throw new Error("A semantic workflow branch is required.");

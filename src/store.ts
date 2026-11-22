@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
 import { createAgentOperationStore, recoverAgentOperations } from "./agent-store.ts";
 import {
   fixMigration,
@@ -8,6 +9,7 @@ import {
   type FixCycle,
 } from "./fix-store.ts";
 import type { GitHubRateLimits, GitHubRateLimitState } from "./github-app.ts";
+import type { PullRequestTarget } from "./github-api.ts";
 import { createReviewPublications } from "./review-publications.ts";
 import { createReviewStore, reviewMigration } from "./review-store.ts";
 import {
@@ -37,6 +39,31 @@ export type GitHubObservationWriter = {
   transition(id: string, command: WorkflowCommand): Workflow;
   observeCodex: ReturnType<WorkflowStore["reviews"]>["observeCodex"];
 };
+
+type WorkerRecord = {
+  id: string;
+  pid: number;
+  startedAt: string;
+  stoppedAt: string | null;
+  pollIntervalMs: number;
+  targets: PullRequestTarget[];
+  lastPollStartedAt: string | null;
+  lastPollFinishedAt: string | null;
+  lastPollSucceeded: boolean | null;
+};
+
+export function localProcessAlive(pid: number | null): boolean {
+  if (pid === null) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
+    throw error;
+  }
+}
 
 const migrations = [
   `CREATE TABLE workflows (
@@ -105,6 +132,7 @@ const migrations = [
     repository TEXT NOT NULL COLLATE NOCASE, pull_request INTEGER NOT NULL, generation INTEGER NOT NULL,
     PRIMARY KEY (repository, pull_request)
   );`,
+  "CREATE TABLE unattended_worker (slot INTEGER PRIMARY KEY CHECK(slot=1), record TEXT NOT NULL);",
 ];
 
 export class WorkflowStore {
@@ -120,6 +148,50 @@ export class WorkflowStore {
 
   close(): void {
     this.#db.close();
+  }
+
+  workerRecord(): WorkerRecord | null {
+    const row = this.#db.prepare("SELECT record FROM unattended_worker WHERE slot=1").get();
+    return row ? (JSON.parse(String(row.record)) as WorkerRecord) : null;
+  }
+
+  claimWorker(targets: PullRequestTarget[], pollIntervalMs: number, startedAt: string) {
+    return this.#transaction(() => {
+      const previous = this.workerRecord();
+      if (previous && !previous.stoppedAt && localProcessAlive(previous.pid)) return null;
+      const record: WorkerRecord = {
+        id: randomUUID(),
+        pid: process.pid,
+        targets,
+        pollIntervalMs,
+        startedAt,
+        stoppedAt: null,
+        lastPollStartedAt: null,
+        lastPollFinishedAt: null,
+        lastPollSucceeded: null,
+      };
+      this.#db
+        .prepare("INSERT OR REPLACE INTO unattended_worker VALUES (1, ?)")
+        .run(JSON.stringify(record));
+      return { record, interruptedRun: previous && !previous.stoppedAt ? previous.id : null };
+    });
+  }
+
+  updateWorker(
+    id: string,
+    updates: Partial<
+      Pick<
+        WorkerRecord,
+        "stoppedAt" | "lastPollStartedAt" | "lastPollFinishedAt" | "lastPollSucceeded"
+      >
+    >,
+  ): void {
+    const result = this.#db
+      .prepare(
+        "UPDATE unattended_worker SET record=json_patch(record, ?) WHERE slot=1 AND json_extract(record, '$.id')=?",
+      )
+      .run(JSON.stringify(updates), id);
+    if (result.changes !== 1) throw new Error("The unattended worker lost its SQLite claim.");
   }
 
   githubRateLimits(): GitHubRateLimits {
