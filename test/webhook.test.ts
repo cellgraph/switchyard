@@ -210,8 +210,8 @@ describe("GitHub webhook intake and reconciliation", () => {
       vi.clearAllMocks();
       expect((await send(event)).status).toBe(202);
       await runPass();
-      expect(github.readReviewInputs).toHaveBeenCalledWith(target);
-      expect(github.readChecks).toHaveBeenCalledWith(target, headB);
+      expect(github.readReviewInputs).toHaveBeenCalledWith(target, undefined);
+      expect(github.readChecks).toHaveBeenCalledWith(target, headB, undefined);
       expect(workflow()).toMatchObject({
         headSha: headB,
         state: "awaiting_review",

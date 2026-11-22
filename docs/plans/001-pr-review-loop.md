@@ -109,6 +109,12 @@ GitHub is the collaboration interface. Switchyard is the workflow authority. Per
 - A new head invalidates old review and check evidence. Missing, pending, failed, and ambiguous required checks prevent merge readiness.
 - The controller stays isolated from the candidate worktree and preserves the history needed for operator inspection.
 
+## Phase 5.5A: Unattended controller
+
+Use the existing periodic reconciliation and Phase 5 state machine to advance configured PRs from a foreground worker. Keep one worker claim per local SQLite database and use the existing operation claims for agent, validation, and publication recovery. Require explicit dispositions and both existing cycle approvals. Expose persisted status and structured operational logs, and drain safely on SIGINT or SIGTERM.
+
+The [unattended operations guide](../unattended.md) covers configuration, startup, shutdown, inspection, and recovery. Deployment, notifications, and delegated authorization remain separate increments.
+
 ## Phase 6: Operations, security, and release checklist
 
 1. Document configuration, App setup, macOS startup/shutdown, SQLite backup/migration, Codex auth, data retention, troubleshooting, and safe reset/recovery.

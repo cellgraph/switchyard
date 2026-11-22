@@ -295,7 +295,7 @@ export function createAgentOperationStore(
         }
         assertNoLegacyOperation(intent.workflowId);
         const previous = session(intent.workflowId);
-        if (!setStatus(id, "requested", "dispatching", null)) return null;
+        if (!setStatus(id, "requested", "dispatching", operation.evidence)) return null;
         db.prepare("UPDATE operations SET owner_pid=? WHERE operation_id=?").run(process.pid, id);
         if (!previous) {
           const now = new Date().toISOString();
@@ -322,7 +322,7 @@ export function createAgentOperationStore(
         return (
           operation?.status === "dispatching" &&
           authorized(getWorkflow(operation.intent.workflowId), operation.intent) &&
-          setStatus(id, "dispatching", "running", { runtime })
+          setStatus(id, "dispatching", "running", { ...operation.evidence, runtime })
         );
       });
     },
@@ -348,7 +348,10 @@ export function createAgentOperationStore(
 
     progress(
       id: string,
-      evidence: Pick<AgentTurnEvidence, "reference" | "worktree" | "expectedWorktree">,
+      evidence: Pick<
+        AgentTurnEvidence,
+        "reference" | "worktree" | "expectedWorktree" | "prelaunchCheckpoint"
+      >,
     ): void {
       transaction(() => {
         const current = get(id);
@@ -357,6 +360,30 @@ export function createAgentOperationStore(
           !setStatus(id, "running", "running", { ...current.evidence, ...evidence })
         )
           throw new Error("Agent operation lost its dispatch authorization.");
+      });
+    },
+
+    deferPrelaunch(id: string): boolean {
+      return transaction(() => {
+        const operation = get(id);
+        if (operation?.status !== "running" || !operation.intent.fix) return false;
+        const evidence = operation.evidence;
+        if (
+          !evidence?.worktree ||
+          !evidence.prelaunchCheckpoint ||
+          evidence.launchAuthorizedAt ||
+          evidence.reference
+        )
+          return false;
+        if (!authorized(getWorkflow(operation.intent.workflowId), operation.intent)) return false;
+        const binding = session(operation.intent.workflowId);
+        if (!setStatus(id, "running", "requested", evidence)) return false;
+        db.prepare("UPDATE operations SET owner_pid=NULL WHERE operation_id=?").run(id);
+        if (binding?.status === "starting" && binding.initialOperationId === id)
+          db.prepare("DELETE FROM agent_sessions WHERE workflow_id=?").run(
+            operation.intent.workflowId,
+          );
+        return true;
       });
     },
 

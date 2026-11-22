@@ -3,9 +3,21 @@ import { createAgentController } from "./agent-controller.ts";
 import type { AgentOperationWorker } from "./agent-operation.ts";
 import { describeError } from "./controller.ts";
 import type { FixGit } from "./fix-git.ts";
-import type { FixConfig, FixCycle, ValidationResult } from "./fix-store.ts";
+import {
+  canConfirmLatePush,
+  type FixConfig,
+  type FixCycle,
+  type ValidationResult,
+} from "./fix-store.ts";
 import type { PullRequestState } from "./github-api.ts";
-import type { FixStoreState, WorkflowStore } from "./store.ts";
+import {
+  checkGitHubDrain,
+  GitHubDrainError,
+  GitHubRateLimitError,
+  GitHubTransientError,
+} from "./github-app.ts";
+import { PullRequestHeadChangedError } from "./reconcile.ts";
+import { localProcessAlive, type FixStoreState, type WorkflowStore } from "./store.ts";
 import type { Workflow } from "./workflow.ts";
 
 type Dependencies = {
@@ -23,18 +35,23 @@ type Dependencies = {
   config: FixConfig;
   configuredRequiredChecks?: string[];
   signal?: AbortSignal;
+  drainSignal?: AbortSignal;
+  now?: () => number;
+  report?: (event: {
+    operation: "agent" | "validation" | "push";
+    cycleId: string;
+    operationId: string;
+    outcome: string;
+    commandId?: string;
+  }) => void;
 };
 
-function ownerAlive(pid: number | null): boolean {
-  if (pid === null) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
-    if ((error as NodeJS.ErrnoException).code === "EPERM") return true;
-    throw error;
-  }
+function isGitHubRetry(error: unknown): boolean {
+  return (
+    error instanceof GitHubRateLimitError ||
+    error instanceof GitHubTransientError ||
+    error instanceof PullRequestHeadChangedError
+  );
 }
 
 function tokenUsage(store: WorkflowStore, cycles: FixCycle[]): number | null {
@@ -168,6 +185,21 @@ export function authorizeFix(
 export function createFixController(deps: Dependencies) {
   const { store, workflowId, git, config } = deps;
   const fixes = store.fixes(workflowId);
+  const now = deps.now ?? Date.now;
+  function report(
+    cycle: FixCycle,
+    operation: "agent" | "validation" | "push",
+    outcome: string,
+    commandId?: string,
+  ) {
+    deps.report?.({
+      cycleId: cycle.id,
+      operationId: cycle.operationId,
+      operation,
+      outcome,
+      ...(commandId ? { commandId } : {}),
+    });
+  }
 
   function matchesDestination(pr: PullRequestState, branch?: string) {
     return Boolean(
@@ -272,11 +304,24 @@ Review data: ${JSON.stringify(cycle.review)}`,
     };
     const controller = createAgentController(store, deps.worker, async () => {
       await deps.refresh();
-      assertBase(await deps.readPullRequest(), cycle);
+      checkGitHubDrain(deps.drainSignal);
+      const fresh = await deps.readPullRequest();
+      checkGitHubDrain(deps.drainSignal);
+      assertBase(fresh, cycle);
     });
     const timeout = AbortSignal.timeout(cycle.config.agentTimeoutMs);
     const signal = deps.signal ? AbortSignal.any([timeout, deps.signal]) : timeout;
-    await controller.runTurn(input, signal);
+    report(cycle, "agent", "started");
+    try {
+      const result = await controller.runTurn(input, signal);
+      report(cycle, "agent", result.status);
+    } catch (error) {
+      if (store.agentOperations().get(cycle.operationId)?.status === "requested") {
+        edit(cycle, (before) => ({ ...before, owner: null }));
+        report(cycle, "agent", "prelaunch_deferred");
+      }
+      throw error;
+    }
   }
 
   async function validate(cycle: FixCycle, agentCheckpoint: string) {
@@ -295,6 +340,7 @@ Review data: ${JSON.stringify(cycle.review)}`,
       }
       for (const command of current.config.validation) {
         git.assertCandidate(current);
+        report(current, "validation", "started", command.id);
         const result = await deps.validate(
           command,
           current.worktree!.path,
@@ -308,12 +354,14 @@ Review data: ${JSON.stringify(cycle.review)}`,
               : attempt,
           ),
         }));
+        report(current, "validation", result.status, command.id);
         git.assertCandidate(current);
         if (result.status !== "passed") {
           finishValidation(
             current,
             result.status,
             `Validation ${result.status} for ${result.id}. Inspect the saved diagnostics.`,
+            result.status === "failed",
           );
           return;
         }
@@ -373,6 +421,7 @@ Review data: ${JSON.stringify(cycle.review)}`,
 
   async function publish(cycle: FixCycle, pr: PullRequestState) {
     let current = cycle;
+    let refreshing = false;
     try {
       assertBase(pr, current);
       assertReview(current, "validating");
@@ -387,13 +436,19 @@ Review data: ${JSON.stringify(cycle.review)}`,
       }
       assertReview(current, "validating");
       git.attachCommit(current);
+      refreshing = true;
       await deps.refresh();
       const fresh = await deps.readPullRequest();
+      refreshing = false;
       assertBase(fresh, current);
       assertReview(current, "validating");
+      if (deps.drainSignal?.aborted) {
+        edit(current, (before) => ({ ...before, owner: null }));
+        return;
+      }
       let claimed = false;
       try {
-        git.push(current, () => {
+        await git.push(current, () => {
           const pushing = edit(
             current,
             (before) => ({ ...before, phase: "pushing", push: "intent" }),
@@ -402,6 +457,7 @@ Review data: ${JSON.stringify(cycle.review)}`,
           if (!pushing) throw new Error("Publication lost its dispatch claim.");
           current = pushing;
           claimed = true;
+          report(current, "push", "started");
         });
         if (!claimed) throw new Error("Git returned without claiming publication dispatch.");
       } catch (error) {
@@ -413,6 +469,7 @@ Review data: ${JSON.stringify(cycle.review)}`,
           push: "unknown",
           reason: `Push outcome is uncertain. ${describeError(error)}`,
         }));
+        report(current, "push", "unknown");
         return;
       }
       edit(current, (before) => ({
@@ -421,7 +478,13 @@ Review data: ${JSON.stringify(cycle.review)}`,
         owner: null,
         push: "returned",
       }));
+      report(current, "push", "returned");
     } catch (error) {
+      if (refreshing && (isGitHubRetry(error) || error instanceof GitHubDrainError)) {
+        // The next pass can verify the local commit. Push intent has not been claimed.
+        edit(current, (before) => ({ ...before, owner: null }));
+        throw error;
+      }
       fail(current, describeError(error));
     }
   }
@@ -430,6 +493,19 @@ Review data: ${JSON.stringify(cycle.review)}`,
     if (pr.state !== "open" || !matchesDestination(pr, cycle.remoteBranch))
       throw new Error("The PR is closed or its publication destination changed.");
     const remote = git.remoteHead(cycle);
+    if (
+      cycle.interruptedPushDeadline !== undefined &&
+      (pr.headSha === cycle.head || pr.headSha === cycle.commit) &&
+      (remote === cycle.head || remote === cycle.commit) &&
+      (pr.headSha !== cycle.commit || remote !== cycle.commit)
+    ) {
+      if (now() < cycle.interruptedPushDeadline) return;
+      fail(
+        cycle,
+        "The interrupted push could not be confirmed within 60 seconds. Inspect the branch or run --fix-advance to check for a late publication.",
+      );
+      return;
+    }
     if (remote !== cycle.commit)
       throw new Error(
         "The attempted push cannot be confirmed on the remote ref. Inspect the retained commit and GitHub branch before taking manual action.",
@@ -471,19 +547,50 @@ Review data: ${JSON.stringify(cycle.review)}`,
     });
   }
 
-  return {
-    async advance() {
-      store.recoverAgentClaims();
-      if (store.getWorkflow(workflowId)?.state === "escalated") return fixStatus(store, workflowId);
-      await deps.refresh();
-      if (store.getWorkflow(workflowId)?.state === "escalated") return fixStatus(store, workflowId);
+  async function confirmLatePush(cycle: FixCycle) {
+    const pr = await deps.readPullRequest();
+    if (
+      deps.drainSignal?.aborted ||
+      pr.state !== "open" ||
+      !matchesDestination(pr, cycle.remoteBranch) ||
+      pr.headSha !== cycle.commit ||
+      git.remoteHead(cycle) !== cycle.commit
+    )
+      return;
+    const checkpoint = git.verifyCheckout(cycle);
+    fixes.edit(({ workflow, cycles, save, transition, reanchor }) => {
+      const current = cycles.at(-1);
+      if (
+        workflow.state !== "escalated" ||
+        !canConfirmLatePush(current) ||
+        current.id !== cycle.id ||
+        current.version !== cycle.version
+      )
+        return;
+      reanchor(current, checkpoint);
+      save({ ...current, push: "confirmed" });
+      transition({ type: "late_publication_confirmed", sha: pr.headSha });
+    });
+  }
+
+  const controller = {
+    async advanceReconciled() {
+      const state = store.getWorkflow(workflowId)?.state;
+      if (state === "escalated" && !deps.drainSignal?.aborted) {
+        const cycle = fixes.read().at(-1);
+        if (canConfirmLatePush(cycle)) await confirmLatePush(cycle);
+      }
+      if (deps.drainSignal?.aborted || state === "escalated" || state === "stopped")
+        return fixStatus(store, workflowId);
       const pr = await deps.readPullRequest();
+      if (deps.drainSignal?.aborted) return fixStatus(store, workflowId);
       const snapshot = fixes.edit((state) => {
         const { workflow, cycles, review, revision, save, transition } = state;
         const latest = cycles.at(-1);
         if (workflow.state === "escalated" || workflow.state === "stopped") return;
+        if (pr.state !== "open" || pr.headSha !== workflow.headSha)
+          throw new PullRequestHeadChangedError();
         if (latest && !["finished", "proposed", "escalated"].includes(latest.phase)) return latest;
-        if (pr.state !== "open" || pr.headSha !== workflow.headSha) return;
         if (!workflow.review && store.reviews().latestIndeterminate(workflowId, workflow.headSha)) {
           transition({
             type: "escalate",
@@ -579,6 +686,7 @@ Review data: ${JSON.stringify(cycle.review)}`,
           "The persisted fix configuration changed while this process was starting. Rerun with the saved cycle configuration.",
         );
       let cycle = snapshot;
+      let dispatched = false;
       try {
         if (cycle.phase === "authorized") {
           const claimed = edit(cycle, (before) => ({
@@ -589,17 +697,20 @@ Review data: ${JSON.stringify(cycle.review)}`,
           if (!claimed) return fixStatus(store, workflowId);
           cycle = claimed;
           await dispatch(cycle, pr);
+          dispatched = true;
           cycle = edit(cycle, (before) => ({ ...before, owner: null })) ?? cycle;
         }
-        if (cycle.phase === "agent" && !ownerAlive(cycle.owner)) {
+        if (cycle.phase === "agent" && !localProcessAlive(cycle.owner)) {
           const operation = store.agentOperations().get(cycle.operationId);
           if (!operation || operation.status === "requested") {
             const claimed = edit(cycle, (before) => ({ ...before, owner: process.pid }));
             if (!claimed) return fixStatus(store, workflowId);
             cycle = claimed;
             await dispatch(cycle, pr);
+            dispatched = true;
             cycle = edit(cycle, (before) => ({ ...before, owner: null })) ?? cycle;
           }
+          if (deps.drainSignal?.aborted) return fixStatus(store, workflowId);
           const result = store.agentOperations().get(cycle.operationId);
           if (
             result?.status === "requested" ||
@@ -634,6 +745,11 @@ Review data: ${JSON.stringify(cycle.review)}`,
               );
           }
           const worktree = evidence.worktree;
+          if (dispatched) {
+            // The turn may have outlasted the GitHub evidence that authorized dispatch.
+            await deps.refresh();
+            if (deps.drainSignal?.aborted) return fixStatus(store, workflowId);
+          }
           const claimed = edit(cycle, (before) => ({
             ...before,
             phase: "validating",
@@ -642,7 +758,7 @@ Review data: ${JSON.stringify(cycle.review)}`,
             validation: [{ status: "running", results: [] }],
           }));
           if (claimed) await validate(claimed, evidence.checkpoint.workspace);
-        } else if (cycle.phase === "validating" && !ownerAlive(cycle.owner)) {
+        } else if (cycle.phase === "validating" && !localProcessAlive(cycle.owner)) {
           finishValidation(
             cycle,
             "unknown",
@@ -661,7 +777,7 @@ Review data: ${JSON.stringify(cycle.review)}`,
           if (claimed) await validate(claimed, checkpoint.workspace);
         } else if (
           cycle.phase === "publication_authorized" ||
-          (cycle.phase === "committing" && !ownerAlive(cycle.owner))
+          (cycle.phase === "committing" && !localProcessAlive(cycle.owner))
         ) {
           const claimed = edit(cycle, (before) => ({
             ...before,
@@ -669,12 +785,13 @@ Review data: ${JSON.stringify(cycle.review)}`,
             owner: process.pid,
           }));
           if (claimed) await publish(claimed, pr);
-        } else if (cycle.phase === "pushing" && !ownerAlive(cycle.owner)) {
+        } else if (cycle.phase === "pushing" && !localProcessAlive(cycle.owner)) {
           const claimed = edit(cycle, (before) => ({
             ...before,
             phase: "confirming",
             owner: null,
             push: "unknown",
+            interruptedPushDeadline: now() + 60_000,
           }));
           if (claimed) {
             cycle = claimed;
@@ -684,9 +801,29 @@ Review data: ${JSON.stringify(cycle.review)}`,
           confirm(cycle, pr);
         }
       } catch (error) {
+        if (error instanceof GitHubDrainError && deps.drainSignal?.aborted) throw error;
+        if (
+          cycle.phase === "agent" &&
+          isGitHubRetry(error) &&
+          store.agentOperations().get(cycle.operationId)?.status === "requested"
+        )
+          throw error;
+        if (
+          (cycle.phase === "publication_authorized" ||
+            cycle.phase === "committing" ||
+            (cycle.phase === "agent" && dispatched)) &&
+          isGitHubRetry(error)
+        )
+          throw error;
         fail(cycle, describeError(error));
       }
       return fixStatus(store, workflowId);
     },
+    async advance() {
+      store.recoverAgentClaims();
+      await deps.refresh();
+      return controller.advanceReconciled();
+    },
   };
+  return controller;
 }

@@ -26,18 +26,20 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
     previous?: WorkerSessionReference,
     requireNew = false,
     beforeLaunch?: () => void,
+    checkout?: Worktree,
   ) {
-    const worktree = worktrees.open(target, requireNew ? "new" : previous === undefined);
+    const expected = previous?.worktree ?? checkout;
+    const worktree = worktrees.open(target, expected ? false : requireNew ? "new" : true);
     assertAvailable(worktree.path);
     if (
-      previous &&
-      (previous.worktree.repository !== worktree.repository ||
-        previous.worktree.workflowId !== worktree.workflowId ||
-        previous.worktree.path !== worktree.path ||
-        previous.worktree.branch !== worktree.branch)
+      expected &&
+      (expected.repository !== worktree.repository ||
+        expected.workflowId !== worktree.workflowId ||
+        expected.path !== worktree.path ||
+        expected.branch !== worktree.branch)
     )
       throw new Error("Session belongs to a different worktree.");
-    if (previous && previous.worktree.checkoutIdentity !== worktree.checkoutIdentity)
+    if (expected && expected.checkoutIdentity !== worktree.checkoutIdentity)
       throw new Error("Session belongs to a different linked checkout.");
 
     const workspace = { workingDirectory: worktree.path };
@@ -99,8 +101,12 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
   }
 
   return {
-    startSession: (target: WorktreeTarget, requireNew = false, beforeLaunch?: () => void) =>
-      openSession(target, undefined, requireNew, beforeLaunch),
+    startSession: (
+      target: WorktreeTarget,
+      requireNew = false,
+      beforeLaunch?: () => void,
+      checkout?: Worktree,
+    ) => openSession(target, undefined, requireNew, beforeLaunch, checkout),
     resumeSession: (
       target: WorktreeTarget,
       reference: WorkerSessionReference,

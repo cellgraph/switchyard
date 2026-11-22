@@ -42,6 +42,7 @@ export type AgentSessionCheckpoint = { identity: string; digest: string };
 export type AgentTurnEvidence = {
   expectedWorktree?: WorktreeLocation;
   launchAuthorizedAt?: string;
+  prelaunchCheckpoint?: string;
   runtime?: AgentRuntime;
   worktree?: Worktree;
   reference?: WorkerSessionReference;
@@ -89,7 +90,8 @@ export interface AgentOperationWorker {
     refreshLaunch?: () => Promise<void>;
     fixFindingIds?: string[];
     recordExpectedWorktree(worktree: WorktreeLocation): void;
-    recordWorkspace(worktree: Worktree): void;
+    recordWorkspace(worktree: Worktree, checkpoint?: string): void;
+    preflight?: { worktree: Worktree; checkpoint: string };
     recordSession(reference: WorkerSessionReference): void;
   }): Promise<AgentTurnEvidence>;
 }

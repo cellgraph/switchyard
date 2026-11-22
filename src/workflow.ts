@@ -45,6 +45,7 @@ export type WorkflowCommand =
   | { type: "fix_started" }
   | { type: "validation_started" }
   | { type: "cycle_finished"; outcome: CycleOutcome }
+  | { type: "late_publication_confirmed"; sha: string }
   | { type: "escalate"; reason: string; observedHeadSha?: string }
   | { type: "stop"; reason: string };
 
@@ -73,7 +74,10 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
     (command.type === "github_pull_request" ||
       command.type === "escalate" ||
       command.type === "stop");
-  if ((current.state === "stopped" && !mayChangeGitHubClosure) || current.state === "escalated") {
+  if (
+    (current.state === "stopped" && !mayChangeGitHubClosure) ||
+    (current.state === "escalated" && command.type !== "late_publication_confirmed")
+  ) {
     throw new InvalidTransitionError(
       `Cannot transition a ${current.state} workflow without a future explicit recovery action.`,
     );
@@ -226,6 +230,14 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
         next.state =
           current.review?.outcome === "in_progress" ? "review_running" : "awaiting_review";
       }
+      break;
+    case "late_publication_confirmed":
+      requireState(current, ["escalated"]);
+      next.headSha = command.sha;
+      next.review = null;
+      next.checks = [];
+      next.validationHeadSha = null;
+      next.cycleAwaitingReview = false;
       break;
     case "escalate":
       if (!command.reason.trim())

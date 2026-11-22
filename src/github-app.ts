@@ -26,6 +26,7 @@ export type GitHubRetryDeadlines = {
 
 const maxSecondaryAttempts = 5;
 const fallbackRetryDelay = 60_000;
+const authenticationRetryDelay = 300_000;
 const transientStatuses = new Set([408, 500, 502, 503, 504]);
 
 export function isSecondaryLimitPaused(state: GitHubRateLimitState | undefined): boolean {
@@ -58,6 +59,30 @@ export class GitHubTransientError extends Error {
   }
 }
 
+export class GitHubAuthenticationError extends GitHubTransientError {
+  readonly status = 401;
+
+  constructor(retryAt: number) {
+    super("GitHub rejected credentials (HTTP 401). Check the App credentials and installation.", {
+      retryAt,
+    });
+  }
+}
+
+export function installationAuthRetryKey(target: GitHubRepository): string {
+  return `auth:${target.installationId}`;
+}
+
+export class GitHubDrainError extends Error {
+  constructor() {
+    super("GitHub reconciliation was interrupted by worker shutdown.");
+  }
+}
+
+export function checkGitHubDrain(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new GitHubDrainError();
+}
+
 export function githubRetryError(
   errors: readonly unknown[],
 ): GitHubRateLimitError | GitHubTransientError | undefined {
@@ -86,6 +111,7 @@ type ApiRequest = {
   body?: string;
   reconcilePullRequest?: number | undefined;
   commitRetryKey?: string | undefined;
+  drainSignal?: AbortSignal | undefined;
 };
 
 export function pullRequestRetryKey(target: GitHubRepository, pullRequest: number): string {
@@ -219,9 +245,11 @@ export function createGitHubAppClient({
 
   async function request(
     target: GitHubRepository,
-    { path, method, body, reconcilePullRequest, commitRetryKey }: ApiRequest,
+    { path, method, body, reconcilePullRequest, commitRetryKey, drainSignal }: ApiRequest,
     credential: string,
   ): Promise<Response> {
+    checkGitHubDrain(drainSignal);
+    checkAuthentication(target);
     if (reconcilePullRequest !== undefined && !canReadPullRequest(target, reconcilePullRequest))
       throw new Error("Pull request reconciliation was stopped.");
     const scope = `installation:${target.installationId}` as const;
@@ -343,11 +371,25 @@ export function createGitHubAppClient({
     return response;
   }
 
+  function checkAuthentication(target: GitHubRepository): void {
+    const retryAt = retryDeadlines.get(installationAuthRetryKey(target));
+    if (retryAt !== undefined && retryAt > now()) throw new GitHubAuthenticationError(retryAt);
+  }
+
+  function rejectAuthentication(target: GitHubRepository): never {
+    const retryAt = now() + authenticationRetryDelay;
+    retryDeadlines.extend([installationAuthRetryKey(target)], retryAt);
+    throw new GitHubAuthenticationError(retryAt);
+  }
+
   async function tokenFor(
     target: GitHubRepository,
     cacheKey: string,
     reconcilePullRequest: number | undefined,
+    drainSignal?: AbortSignal,
   ): Promise<Token> {
+    checkGitHubDrain(drainSignal);
+    checkAuthentication(target);
     const cached = tokens.get(cacheKey);
     if (cached && cached.expiresAt - now() > 60_000) return cached;
 
@@ -358,6 +400,7 @@ export function createGitHubAppClient({
         path: `/app/installations/${target.installationId}/access_tokens`,
         method: "POST",
         reconcilePullRequest,
+        drainSignal,
         body: JSON.stringify({
           repositories: [target.repository.split("/")[1]],
           permissions: reviewWrites ? { ...permissions, pull_requests: "write" } : permissions,
@@ -365,6 +408,7 @@ export function createGitHubAppClient({
       },
       appJwt(),
     );
+    if (response.status === 401) rejectAuthentication(target);
     if (!response.ok)
       throw new Error(`GitHub installation token request failed (HTTP ${response.status}).`);
     const data = object(await readJson(response));
@@ -497,8 +541,8 @@ export function createGitHubAppClient({
             token.value,
           );
         } catch (cause) {
-          // This error proves either a local throttle or a remote 403/429 rejection.
-          if (cause instanceof GitHubRateLimitError)
+          // These errors prove either a local refusal or a remote rate-limit rejection.
+          if (cause instanceof GitHubRateLimitError || cause instanceof GitHubAuthenticationError)
             throw new GitHubWriteRejected(cause.message, { cause });
           throw cause;
         }
@@ -517,6 +561,7 @@ export function createGitHubAppClient({
       target: GitHubRepository,
       suffix: string,
       reconcilePullRequest?: number,
+      drainSignal?: AbortSignal,
     ): Promise<{ data: unknown; hasNext: boolean }> {
       const cacheKey = `${target.installationId}:${target.repository}`;
       const path = `/repos/${target.repository}${suffix}`;
@@ -528,16 +573,21 @@ export function createGitHubAppClient({
       const commitRetryKey = suffix.startsWith("/commits/")
         ? `commit:${target.installationId}:${path.split("?", 1)[0]}`
         : undefined;
-      const read = { path, reconcilePullRequest, commitRetryKey };
+      const read = { path, reconcilePullRequest, commitRetryKey, drainSignal };
       return queueRead(target.installationId, async () => {
+        checkGitHubDrain(drainSignal);
+        checkAuthentication(target);
         checkRetryDeadline(prRetryKey, commitRetryKey);
-        let token = await tokenFor(target, cacheKey, reconcilePullRequest);
+        let token = await tokenFor(target, cacheKey, reconcilePullRequest, drainSignal);
         let response = await request(target, read, token.value);
         if (response.status === 401) {
           tokens.delete(cacheKey);
-          token = await tokenFor(target, cacheKey, reconcilePullRequest);
+          token = await tokenFor(target, cacheKey, reconcilePullRequest, drainSignal);
           response = await request(target, read, token.value);
-          if (response.status === 401) tokens.delete(cacheKey);
+          if (response.status === 401) {
+            tokens.delete(cacheKey);
+            rejectAuthentication(target);
+          }
         }
         if (!response.ok)
           throw new Error(`GitHub API GET ${path} failed (HTTP ${response.status}).`);

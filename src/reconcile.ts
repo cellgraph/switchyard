@@ -1,6 +1,7 @@
 import { observeCodexReview } from "./codex-review.ts";
 import type { GitHubReader, PullRequestState, PullRequestTarget } from "./github-api.ts";
-import { GitHubRateLimitError, githubRetryError } from "./github-app.ts";
+import { checkGitHubDrain, GitHubRateLimitError, githubRetryError } from "./github-app.ts";
+import { canConfirmLatePush } from "./fix-store.ts";
 import type { GitHubObservationWriter, WorkflowStore } from "./store.ts";
 import type { CheckEvidence, Workflow } from "./workflow.ts";
 
@@ -26,8 +27,17 @@ export function canReconcilePullRequest(
   store: WorkflowStore,
   repository: string,
   pullRequest: number,
+  includeLatePush = false,
 ): boolean {
-  return !isReconciliationTerminal(store.findWorkflow(repository, pullRequest));
+  const workflow = store.findWorkflow(repository, pullRequest);
+  return (
+    !isReconciliationTerminal(workflow) ||
+    Boolean(
+      includeLatePush &&
+      workflow?.state === "escalated" &&
+      canConfirmLatePush(store.fixes(workflow.id).read().at(-1)),
+    )
+  );
 }
 
 export function createReconciler(
@@ -35,7 +45,8 @@ export function createReconciler(
   github: GitHubReader,
   requiredChecks: (target: PullRequestTarget) => string[] | null = () => null,
 ) {
-  return async (target: PullRequestTarget): Promise<void> => {
+  return async (target: PullRequestTarget, signal?: AbortSignal): Promise<void> => {
+    checkGitHubDrain(signal);
     const { repository, pullRequest } = target;
     const findWorkflow = () => store.findWorkflow(repository, pullRequest);
     if (isReconciliationTerminal(findWorkflow())) return;
@@ -82,21 +93,30 @@ export function createReconciler(
     }
 
     try {
-      const start = await github.readPullRequest(target);
+      const start = await github.readPullRequest(target, signal);
+      const current = findWorkflow();
+      // A changed head or closure is complete evidence that can revoke authorization on its own.
+      const invalidatesHead =
+        current && (start.headSha !== current.headSha || start.state === "closed");
+      if (!invalidatesHead) checkGitHubDrain(signal);
       let active = false;
-      apply((observation) => {
-        if (isReconciliationTerminal(findWorkflow())) return;
-        const workflow = observe(start, observation);
-        active = workflow.state !== "stopped" && workflow.state !== "escalated";
-        if (!active) github.completeReconciliation(target);
-      });
+      if (signal && !current && start.state === "open") active = true;
+      else
+        apply((observation) => {
+          if (isReconciliationTerminal(findWorkflow())) return;
+          const workflow = observe(start, observation);
+          active = workflow.state !== "stopped" && workflow.state !== "escalated";
+          if (!active) github.completeReconciliation(target);
+        });
+      checkGitHubDrain(signal);
       if (!active) return;
 
       const [checks, reviewInputs] = await Promise.allSettled([
-        github.readChecks(target, start.headSha),
-        github.readReviewInputs(target),
+        github.readChecks(target, start.headSha, signal),
+        github.readReviewInputs(target, signal),
       ]);
 
+      checkGitHubDrain(signal);
       if (isReconciliationTerminal(findWorkflow())) return;
       const readErrors = [checks, reviewInputs].flatMap((read) =>
         read.status === "rejected" ? [read.reason as unknown] : [],
@@ -107,8 +127,9 @@ export function createReconciler(
           : undefined;
       let latest: PullRequestState;
       try {
-        latest = await github.readPullRequest(target);
+        latest = await github.readPullRequest(target, signal);
       } catch (error) {
+        checkGitHubDrain(signal);
         // A contradictory review can revoke authorization before head confirmation.
         if (
           review !== undefined &&
@@ -123,6 +144,7 @@ export function createReconciler(
         throw githubRetryError([...readErrors, error]) ?? error;
       }
 
+      checkGitHubDrain(signal);
       const retry = githubRetryError(readErrors);
       let unfinished = false;
       apply((observation) => {
@@ -151,6 +173,7 @@ export function createReconciler(
       if (checks.status === "rejected") throw checks.reason;
     } catch (error) {
       if (error instanceof SupersededObservationError) throw error;
+      checkGitHubDrain(signal);
       let active = false;
       apply((observation) => {
         const current = findWorkflow();

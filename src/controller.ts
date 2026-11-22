@@ -2,6 +2,8 @@ import type { PullRequestTarget } from "./github-api.ts";
 import {
   belongsToReconciliation,
   GitHubRateLimitError,
+  GitHubDrainError,
+  installationAuthRetryKey,
   GitHubTransientError,
   isSecondaryLimitPaused,
   pullRequestRetryKey,
@@ -37,6 +39,8 @@ export function createController({
   reportError,
   reconcileIntervalMs,
   reportDeferred = false,
+  pollOnly = false,
+  signal,
   now = Date.now,
   isRetryOwnerActive = createGitHubRetryOwnerCheck(store, targets),
 }: {
@@ -46,6 +50,8 @@ export function createController({
   reportError: (message: string) => void;
   reconcileIntervalMs: number;
   reportDeferred?: boolean;
+  pollOnly?: boolean;
+  signal?: AbortSignal;
   now?: () => number;
   isRetryOwnerActive?: (key: string) => boolean;
 }) {
@@ -67,6 +73,7 @@ export function createController({
     return Math.max(
       retryStore.get(pullRequestRetryKey(target, target.pullRequest)) ?? 0,
       retryStore.get(tokenRetryKey(target)) ?? 0,
+      retryStore.get(installationAuthRetryKey(target)) ?? 0,
     );
   }
 
@@ -115,6 +122,7 @@ export function createController({
       let deferred = false;
       let retryAt = 0;
       for (const target of selected) {
+        if (signal?.aborted) break;
         const key = pullRequestRetryKey(target, target.pullRequest);
         if (!isActive(target)) {
           retryStore.delete(key);
@@ -136,6 +144,7 @@ export function createController({
           }
           await observation;
         } catch (error) {
+          if (error instanceof GitHubDrainError && signal?.aborted) break;
           failures.push(`${target.repository}#${target.pullRequest}: ${describeError(error)}`);
           if (error instanceof GitHubRateLimitError) deadline = error.retryAt;
           else if (error instanceof GitHubTransientError)
@@ -155,14 +164,17 @@ export function createController({
     }
 
     let success = true;
-    const deliveries = store.dueDeliveries(
-      now(),
-      25,
-      deliveryDeferred(targets)
-        ? ({ payload, workflowId }) => !deliveryDeferred(deliveryTargets(payload, workflowId))
-        : undefined,
-    );
+    const deliveries = pollOnly
+      ? []
+      : store.dueDeliveries(
+          now(),
+          25,
+          deliveryDeferred(targets)
+            ? ({ payload, workflowId }) => !deliveryDeferred(deliveryTargets(payload, workflowId))
+            : undefined,
+        );
     for (const { deliveryId, payload, workflowId } of deliveries) {
+      if (signal?.aborted) return false;
       const selected = deliveryTargets(payload, workflowId);
       if (deliveryDeferred(selected)) continue;
       try {
