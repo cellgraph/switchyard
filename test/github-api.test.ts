@@ -9,6 +9,7 @@ import { createGitHubReader, type GitHubReader } from "../src/github-api.ts";
 import {
   createGitHubAppClient,
   GitHubTransientError,
+  GitHubWriteRejected,
   resumeGitHubAfterSecondaryLimit,
   tokenRetryKey,
 } from "../src/github-app.ts";
@@ -118,6 +119,31 @@ describe("GitHub App and REST adapter", () => {
       /^GitHub rejected credentials \(HTTP 401\)/,
     );
     expect(exchanges).toBe(3);
+  });
+
+  it("recognizes an auth cooldown recorded during token exchange as an unsent comment", async () => {
+    const now = Date.UTC(2026, 0, 1);
+    let retryAt: number | undefined;
+    const fetcher = vi.fn<typeof fetch>(async () => {
+      retryAt = now + 300_000;
+      return Response.json({ token: "fixture", expires_at: new Date(now + 3_600_000) });
+    });
+    const client = createGitHubAppClient({
+      clientId: "test",
+      privateKey,
+      fetcher,
+      now: () => now,
+      reviewWrites: true,
+      retryDeadlines: {
+        get: (key) => (key.startsWith("auth:") ? retryAt : undefined),
+        extend: vi.fn(),
+      },
+    });
+    await expect(
+      client.postReviewComment(target, null, { body: "fixture" }),
+    ).rejects.toBeInstanceOf(GitHubWriteRejected);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(requestUrl(fetcher.mock.calls[0]![0]).pathname).toContain("/access_tokens");
   });
 
   it("recovers from a failed token exchange and honors an API retry window", async () => {

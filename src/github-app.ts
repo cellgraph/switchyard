@@ -541,8 +541,8 @@ export function createGitHubAppClient({
             token.value,
           );
         } catch (cause) {
-          // This error proves either a local throttle or a remote 403/429 rejection.
-          if (cause instanceof GitHubRateLimitError)
+          // These errors prove either a local refusal or a remote rate-limit rejection.
+          if (cause instanceof GitHubRateLimitError || cause instanceof GitHubAuthenticationError)
             throw new GitHubWriteRejected(cause.message, { cause });
           throw cause;
         }

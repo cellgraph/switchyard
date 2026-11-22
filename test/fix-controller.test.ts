@@ -387,6 +387,31 @@ describe("bounded single-PR fixes", () => {
     expect(store.getWorkflow(workflowId)).toMatchObject({ headSha: observedHead });
   });
 
+  it("revokes an authorized fix immediately if the unattended read sees a changed head", async () => {
+    review("review-1", "accepted");
+    await authorize();
+    const moved = "c".repeat(40);
+    const readPullRequest = vi
+      .fn<GitHubReader["readPullRequest"]>()
+      .mockResolvedValueOnce({ state: "open", headSha: moved })
+      .mockRejectedValue(new GitHubTransientError("Cannot confirm the new head."));
+    const reconcile = createReconciler(
+      store,
+      { ...reader, readPullRequest },
+      () => config.requiredChecks,
+    );
+    await reconcile(target, new AbortController().signal);
+    expect(readPullRequest).toHaveBeenCalledTimes(1);
+    expect(store.getWorkflow(workflowId)).toMatchObject({
+      state: "escalated",
+      headSha: moved,
+      review: null,
+    });
+    expect(current().phase).toBe("escalated");
+    await controller().advance();
+    expect(launches).toBe(0);
+  });
+
   function simulateDeadOwner(phase: FixCycle["phase"]) {
     store.fixes(workflowId).edit(({ cycles, save }) =>
       save({

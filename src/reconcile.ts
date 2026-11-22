@@ -94,9 +94,13 @@ export function createReconciler(
 
     try {
       const start = await github.readPullRequest(target, signal);
-      checkGitHubDrain(signal);
+      const current = findWorkflow();
+      // A changed head or closure is complete evidence that can revoke authorization on its own.
+      const invalidatesHead =
+        current && (start.headSha !== current.headSha || start.state === "closed");
+      if (!invalidatesHead) checkGitHubDrain(signal);
       let active = false;
-      if (signal && start.state === "open") active = true;
+      if (signal && !current && start.state === "open") active = true;
       else
         apply((observation) => {
           if (isReconciliationTerminal(findWorkflow())) return;
@@ -104,6 +108,7 @@ export function createReconciler(
           active = workflow.state !== "stopped" && workflow.state !== "escalated";
           if (!active) github.completeReconciliation(target);
         });
+      checkGitHubDrain(signal);
       if (!active) return;
 
       const [checks, reviewInputs] = await Promise.allSettled([
