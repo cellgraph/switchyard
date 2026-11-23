@@ -39,8 +39,6 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) before making
 
 Switchyard is licensed under the [MIT License](LICENSE).
 
-This is an intential extra line. It is used for testing purposes.
-
 For the controller-owned review, validation, and publication workflow, see [Bounded PR fixes](docs/fix-loop.md).
 
 To monitor configured PRs and advance authorized work automatically, see [Unattended controller](docs/unattended.md).
