@@ -1,12 +1,12 @@
 # Unattended controller
 
-Run the worker on one host from a stable Switchyard checkout. Give it a persistent SQLite database, trusted clones of the monitored repositories, a dedicated root for fix worktrees, and a persistent Codex profile. Keep these paths separate from Switchyard's own development worktrees. Use the [GitHub App reader](github-app.md) and the [Phase 5 agent and publication setup](fix-loop.md).
+Run the worker on one host from a stable Switchyard checkout. Give it a persistent SQLite database, trusted clones of the monitored repositories, a dedicated root for fix worktrees, and a persistent agent profile. Keep these paths separate from Switchyard's own development worktrees. Use the [GitHub App reader](github-app.md) and the [Phase 5 agent and publication setup](fix-loop.md).
 
 ## Configuration
 
 List the repositories, App installation IDs, and exact PR numbers to monitor. The worker polls immediately at startup and waits `reconcileIntervalMs` (default 60,000) after each pass. Set a positive interval in worker mode. Targets are processed in configuration order. A bounded agent turn or validation on an earlier target can delay later targets and the next pass.
 
-Use the optional `fixes` map to enable Phase 5 advancement for selected PRs. Each key is a configured lowercase `owner/repo#PR`. An entry uses the same settings as the [single-PR fix configuration](fix-loop.md), including validation command arguments and required check names. For a configuration with one PR, the existing top-level `fix` form also works. Give each PR in a shared clone a distinct local fix branch. A monitored PR without a fix entry is observed only. Keep the fix entry present while an authorized cycle needs to run. The worker uses the saved cycle settings until that cycle finishes or escalates.
+Use the optional `fixes` map to enable Phase 5 advancement for selected PRs. Each key is a configured lowercase `owner/repo#PR`. An entry uses the same settings as the [single-PR fix configuration](fix-loop.md), including validation command arguments and required check names. For a configuration with one PR, the existing top-level `fix` form also works. Give each PR in a shared clone a distinct local fix branch. A monitored PR without a fix entry is observed only. Keep the fix entry present while an authorized cycle needs to run. The worker uses the saved cycle settings until that cycle finishes or escalates. Each fix entry can select [Claude Code](claude-code.md) or use the default Codex provider.
 
 ```json
 {

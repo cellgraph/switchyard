@@ -115,6 +115,21 @@ Use the existing periodic reconciliation and Phase 5 state machine to advance co
 
 The [unattended operations guide](../unattended.md) covers configuration, startup, shutdown, inspection, and recovery. Deployment, notifications, and delegated authorization remain separate increments.
 
+## Phase 5.5B: Unattended deployment
+
+The unattended controller runs on an exe.dev VM with GitHub App authentication, polling, durable state, and PR reconciliation verified.
+
+## Phase 5.6A: Claude Code provider adapter
+
+Implemented local headless execution, provider selection for explicit turns and fix cycles, exact-transcript continuation, and normalized usage and outcome evidence. The existing controller owns requests, authorization, recovery, and publication. Claude Code uses restricted file tools with the approved edit scope. Mock processes cover failures, cancellation, and recovery. Run the credentialed checks in the [Claude Code smoke test](../claude-code.md#manual-smoke-test) on the deployment host before enabling it for a production workflow.
+
+### Remaining phases
+
+- Phase 5.6B covers distributed workers, remote dispatch, and worker fencing.
+- Phase 5.6C covers an independent adjudicator.
+- Phase 5.7 covers delegated authority and notification workflows.
+- Phase 6 covers plan, phase, and dependency orchestration plus the operational release work below.
+
 ## Phase 6: Operations, security, and release checklist
 
 1. Document configuration, App setup, macOS startup/shutdown, SQLite backup/migration, Codex auth, data retention, troubleshooting, and safe reset/recovery.

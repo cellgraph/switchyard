@@ -6,7 +6,6 @@ import type {
   AgentTurnEvidence,
 } from "./agent-operation.ts";
 import { describeError } from "./controller.ts";
-import { object } from "./github-data.ts";
 import { createLocalWorker } from "./local-worker.ts";
 import type { WorktreeManager } from "./worktree.ts";
 
@@ -95,7 +94,6 @@ export function createLocalAgentExecution(
             },
           }
         : undefined;
-      let usage: AgentTurnEvidence["usage"];
       const result = await session.runTurn(target.expectedHead, {
         prompt,
         ...(outputSchema ? { outputSchema } : {}),
@@ -103,24 +101,10 @@ export function createLocalAgentExecution(
         onEvent(event) {
           if (event.kind === "session_started" && session.reference)
             recordSession(session.reference);
-          if (fixFindingIds && event.provider === "codex" && event.kind === "turn_completed") {
-            const reported = object(object(event.data)?.usage);
-            const input = reported?.input_tokens;
-            const output = reported?.output_tokens;
-            if (
-              typeof input === "number" &&
-              typeof output === "number" &&
-              input >= 0 &&
-              output >= 0 &&
-              Number.isSafeInteger(input + output) &&
-              Number.isInteger(input) &&
-              Number.isInteger(output)
-            )
-              usage = { inputTokens: input, outputTokens: output };
-          }
         },
       });
       const reference = session.reference;
+      const { usage, sessionCostUsd, model } = result.agent;
       const evidence: AgentTurnEvidence = {
         agent: {
           outcome: result.agent.outcome,
@@ -128,6 +112,8 @@ export function createLocalAgentExecution(
         },
         workspace: result.workspace,
         ...(usage ? { usage } : {}),
+        ...(sessionCostUsd === undefined ? {} : { sessionCostUsd }),
+        ...(model ? { model } : {}),
       };
       if (fixFindingIds && result.agent.outcome === "completed") {
         const report = result.agent.structuredOutput as
@@ -142,7 +128,7 @@ export function createLocalAgentExecution(
           evidence.addressedFindings = fixFindingIds;
         } else {
           evidence.error =
-            "Agent requested operator judgment or did not report addressing every accepted finding. Inspect the Codex session.";
+            "Agent requested operator judgment or did not report addressing every accepted finding. Inspect the agent session.";
         }
       }
       if (reference) evidence.reference = reference;
@@ -159,7 +145,7 @@ export function createLocalAgentExecution(
           const workspace = worktrees.checkpoint(reference.worktree, result.workspace.head);
           const session = sessionCheckpoint(reference.agent.id, reference.worktree.path);
           if (source && source.identity !== session.identity)
-            throw new Error("Codex selected a different rollout during the turn.");
+            throw new Error("The agent selected a different session artifact during the turn.");
           evidence.checkpoint = {
             workspace,
             session,

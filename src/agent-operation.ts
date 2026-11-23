@@ -1,4 +1,4 @@
-import type { AgentTurnResult } from "./agent.ts";
+import type { AgentTurnResult, AgentTurnTelemetry } from "./agent.ts";
 import type { WorkerSessionReference, WorkerTurnResult } from "./local-worker.ts";
 import type { Worktree, WorktreeLocation, WorktreeTarget } from "./worktree.ts";
 
@@ -39,7 +39,7 @@ export type AgentOperationStatus =
 
 export type AgentSessionCheckpoint = { identity: string; digest: string };
 
-export type AgentTurnEvidence = {
+export type AgentTurnEvidence = AgentTurnTelemetry & {
   expectedWorktree?: WorktreeLocation;
   launchAuthorizedAt?: string;
   prelaunchCheckpoint?: string;
@@ -52,7 +52,6 @@ export type AgentTurnEvidence = {
   error?: string;
   addressedFindings?: string[];
   ignoredCheckpoint?: string;
-  usage?: { inputTokens: number; outputTokens: number };
 };
 
 export type AgentOperation = {

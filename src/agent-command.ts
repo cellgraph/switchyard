@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { parseAgentConfig, type AgentConfig } from "./agent-config.ts";
 import { createAgentController } from "./agent-controller.ts";
 import type { AgentOperationWorker, AgentRuntime, AgentTurnRequest } from "./agent-operation.ts";
+import { createClaudeAgent } from "./claude-agent.ts";
+import { claudeRuntime, claudeSessionCheckpoint } from "./claude-runtime.ts";
 import { createCodexAgent } from "./codex-agent.ts";
 import { codexRuntime, codexSessionCheckpoint } from "./codex-runtime.ts";
 import { object } from "./github-data.ts";
@@ -41,8 +44,6 @@ export async function runAgentCommand(args: string[], dbPath: string): Promise<b
     const fields = [
       "repositoryDirectory",
       "worktreeRoot",
-      "codexHome",
-      "model",
       "operationId",
       "workflowId",
       "branch",
@@ -54,20 +55,35 @@ export async function runAgentCommand(args: string[], dbPath: string): Promise<b
       if (typeof config[field] !== "string" || !config[field].trim())
         throw new Error(`Agent request requires ${field}.`);
     }
-    const { repositoryDirectory, worktreeRoot, codexHome, model, ...request } = config as Record<
-      (typeof fields)[number],
-      string
-    >;
+    const agent = parseAgentConfig(config);
+    const {
+      repositoryDirectory,
+      worktreeRoot,
+      operationId,
+      workflowId,
+      branch,
+      expectedPullRequestHead,
+      expectedHead,
+      prompt,
+    } = config as Record<(typeof fields)[number], string>;
+    const request: AgentTurnRequest = {
+      operationId,
+      workflowId,
+      branch,
+      expectedPullRequestHead,
+      expectedHead,
+      prompt,
+    };
     const controller = createAgentController(
       store,
-      localCodexWorker({ repositoryDirectory, worktreeRoot, codexHome, model }),
+      localAgentWorker({ repositoryDirectory, worktreeRoot, ...agent }),
     );
     const abort = new AbortController();
     const stop = () => abort.abort();
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
     try {
-      const operation = await controller.runTurn(request satisfies AgentTurnRequest, abort.signal);
+      const operation = await controller.runTurn(request, abort.signal);
       console.info(JSON.stringify(operation));
       if (operation.status !== "completed" || operation.error) process.exitCode = 1;
     } finally {
@@ -108,6 +124,51 @@ export function localCodexWorker({
       });
       return createLocalAgentExecution(worktrees, agent, (id, path) =>
         codexSessionCheckpoint(identity.home, id, path),
+      ).execute(input);
+    },
+  };
+}
+
+export function localAgentWorker(
+  config: AgentConfig & {
+    repositoryDirectory: string;
+    worktreeRoot: string;
+    allowedPaths?: string[];
+  },
+): AgentOperationWorker {
+  if (config.provider !== "claude-code") return localCodexWorker(config);
+  const { model, claude, repositoryDirectory, worktreeRoot, allowedPaths } = config;
+  const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
+  let identity: ReturnType<typeof claudeRuntime>;
+  const configurationId = createHash("sha256")
+    .update(
+      JSON.stringify([
+        repositoryDirectory,
+        worktreeRoot,
+        config.provider,
+        model,
+        claude,
+        allowedPaths,
+      ]),
+    )
+    .digest("hex");
+  return {
+    configurationId,
+    runtime: () => (identity = claudeRuntime(model, claude, apiKey)).runtime,
+    execute: (input) => {
+      const worktrees = createWorktreeManager({ repositoryDirectory, worktreeRoot });
+      const agent = createClaudeAgent(
+        {
+          ...claude,
+          ...identity,
+          home: identity.runtime.home,
+          model,
+          ...(allowedPaths === undefined ? {} : { allowedPaths }),
+        },
+        apiKey!,
+      );
+      return createLocalAgentExecution(worktrees, agent, (id, path) =>
+        claudeSessionCheckpoint(identity.runtime.home, id, path),
       ).execute(input);
     },
   };

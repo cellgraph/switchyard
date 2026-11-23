@@ -1,11 +1,13 @@
 import { homedir } from "node:os";
 import { isAbsolute } from "node:path";
 import { Codex, type ThreadEvent, type ThreadOptions } from "@openai/codex-sdk";
+import { agentTokenCount } from "./agent.ts";
 import type {
   AgentAdapter,
   AgentEvent,
   AgentSession,
   AgentTurnResult,
+  AgentUsage,
   AgentWorkspace,
 } from "./agent.ts";
 
@@ -91,6 +93,7 @@ export function createCodexAgent({
         let sessionConfirmed = false;
         let receivedEvent = false;
         let response = "";
+        let usage: AgentUsage | undefined;
         function uncertain(reason: string): AgentTurnResult {
           const interrupted = signal?.aborted;
           if (interrupted) reason = "Codex execution was canceled.";
@@ -114,7 +117,16 @@ export function createCodexAgent({
             }
             if (event.type === "item.completed" && event.item.type === "agent_message")
               response = event.item.text;
-            if (event.type === "turn.completed") completed = true;
+            if (event.type === "turn.completed") {
+              completed = true;
+              const { input_tokens: input, output_tokens: output } = event.usage ?? {};
+              if (
+                agentTokenCount(input) &&
+                agentTokenCount(output) &&
+                agentTokenCount(input + output)
+              )
+                usage = { inputTokens: input, outputTokens: output };
+            }
             if (event.type === "error") diagnostic = codexDiagnostic(event.message) ?? diagnostic;
             if (event.type === "turn.failed")
               failure = codexDiagnostic(event.error.message) ?? "Codex reported a turn error.";
@@ -136,11 +148,21 @@ export function createCodexAgent({
         if (!completed) return uncertain("Codex exited without a terminal turn event.");
         if (!sessionConfirmed)
           return { outcome: "unknown", reason: "Codex did not confirm the session for this turn." };
-        if (outputSchema === undefined) return { outcome: "completed", response };
+        const telemetry = usage ? { usage } : {};
+        if (outputSchema === undefined) return { outcome: "completed", response, ...telemetry };
         try {
-          return { outcome: "completed", response, structuredOutput: JSON.parse(response) };
+          return {
+            outcome: "completed",
+            response,
+            structuredOutput: JSON.parse(response),
+            ...telemetry,
+          };
         } catch {
-          return { outcome: "failed", reason: "Codex returned invalid structured JSON." };
+          return {
+            outcome: "failed",
+            reason: "Codex returned invalid structured JSON.",
+            ...telemetry,
+          };
         }
       },
     };

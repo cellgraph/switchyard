@@ -15,9 +15,24 @@ export type AgentTurn = {
   onEvent?: (event: AgentEvent) => void;
 };
 
-export type AgentTurnResult =
-  | { outcome: "completed"; response: string; structuredOutput?: unknown }
-  | { outcome: "failed" | "interrupted" | "unknown"; reason: string };
+export type AgentUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+};
+
+export type AgentTurnTelemetry = {
+  usage?: AgentUsage;
+  sessionCostUsd?: number;
+  model?: string;
+};
+
+export type AgentTurnResult = AgentTurnTelemetry &
+  (
+    | { outcome: "completed"; response: string; structuredOutput?: unknown }
+    | { outcome: "failed" | "interrupted" | "unknown"; reason: string }
+  );
 
 export interface AgentSession {
   readonly reference: AgentSessionReference | null;
@@ -27,4 +42,8 @@ export interface AgentSession {
 export interface AgentAdapter {
   startSession(workspace: AgentWorkspace): AgentSession;
   resumeSession(workspace: AgentWorkspace, reference: AgentSessionReference): AgentSession;
+}
+
+export function agentTokenCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
