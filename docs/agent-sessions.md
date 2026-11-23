@@ -31,6 +31,10 @@ The GitHub controller automatically checks recovery when it starts. For a CLI-on
 
 Use the workflow checkout and Codex thread exclusively through Switchyard. The checkout checkpoint supports up to 10,000 entries and 64 MiB of content, including ignored files. The rollout checkpoint supports files up to 64 MiB. Codex must have an active rollout indexed in the state database in the configured Codex home. A managed override for the SQLite location requires inspection. Exceeding either limit or changing the checkout, thread, runtime configuration, or SDK/CLI version requires inspection. The evidence check is local and assumes the checkout and Codex home are on a trusted filesystem.
 
+## Claude Code
+
+An explicit turn or a fix configuration can select Claude Code with its own model, profile and execution limits. See [Claude Code setup, recovery, and smoke test](claude-code.md).
+
 ## Bounded PR fixes
 
 Use the [bounded fix controller](fix-loop.md) to start a turn from durable, accepted review findings. Direct agent turn requests do not authorize fixes for durable review runs. The fix controller requires a clean exact-head checkout, uses a compatible recorded session when available, and updates the session checkpoint after Git and GitHub confirm publication.

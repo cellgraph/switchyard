@@ -92,6 +92,7 @@ describe("Codex SDK adapter", () => {
       outcome: "completed",
       response,
       structuredOutput: { summary: "done" },
+      usage: { inputTokens: 1, outputTokens: 2 },
     });
     expect(sdk.runStreamed).toHaveBeenCalledWith("test", { outputSchema });
     expect(onEvent.mock.calls.map(([event]) => event.kind)).toEqual([
@@ -180,6 +181,7 @@ describe("Codex SDK adapter", () => {
     expect(await session.runTurn({ prompt: "test", outputSchema: {} })).toEqual({
       outcome: "failed",
       reason: "Codex returned invalid structured JSON.",
+      usage: { inputTokens: 1, outputTokens: 2 },
     });
     stream([], Object.assign(new Error("missing executable"), { code: "ENOENT" }));
     expect(

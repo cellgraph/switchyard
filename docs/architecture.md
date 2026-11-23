@@ -10,7 +10,7 @@ GitHub App webhook ──▶ webhook inbox ──▶ SQLite workflow controller
                            ┌─────────────────┴──────────────────┐
                            │                                    │
                     GitHub adapter                     local worker
-                    (read PR/reviews/checks)        Git worktree + Codex SDK
+                    (read PR/reviews/checks)        Git worktree + agent adapter
                            │                                    │
                            └────────── durable state ───────────┘
 ```
@@ -18,8 +18,8 @@ GitHub App webhook ──▶ webhook inbox ──▶ SQLite workflow controller
 - **Controller:** owns workflow state, policy, timers/reconciliation, cycle limits, and decisions about whether to resume, wait, escalate, or mark ready for human review. It is a single local Node.js process in the first version.
 - **Webhook receiver:** validates the signature over raw bytes and records the delivery ID and routing hint in the SQLite inbox before responding.
 - **GitHub adapter:** reads current PR, review, comment, check run, and status data through read-only GitHub App credentials. It provides the inputs for the versioned review adapter. An explicit operator command also publishes and reconciles finding comments and disposition replies.
-- **Worker:** checks out and manages a dedicated Git worktree and invokes Codex. It reports progress/results to the controller. In the first version it runs in process on the same macOS machine; the interface will not assume that forever.
-- **Agent adapter:** starts or resumes an implementation session and streams its turn result. Codex is the only implementation. Keep the session ID opaque and vendor-specific in storage. A future Claude Code adapter may implement the same narrow capabilities without shaping the first version around a lowest common denominator.
+- **Worker:** checks out and manages a dedicated Git worktree and invokes the selected agent provider. It reports progress/results to the controller. In the first version it runs in process on the same macOS machine; the interface will not assume that forever.
+- **Agent adapter:** starts or resumes an implementation session and streams its turn result. The Codex SDK and Claude Code headless CLI implement the same interface. The provider owns its session ID and runtime checkpoint format. The local worker verifies the worktree and the controller owns dispatch and recovery.
 - **SQLite:** stores workflow state, inbound webhook receipts, external operation records, session identifiers, cycle counts, head SHAs, review runs, finding actions, publication intents, and CI status snapshots. WAL mode and bounded transactions are appropriate for a single controller.
 
 The controller claims agent operations through SQLite and calls the local worker in process. The worker receives one operation ID and checkout target, and returns evidence through a provider-neutral interface.
@@ -97,9 +97,13 @@ The local worker checks the Git common directory, registered checkout, branch an
 
 The controller checks the process ID recorded with each agent claim at startup and during polling. Live owners retain their claims through outcome commit. Recovery holds a claim for inspection after the OS confirms its owner has exited. An interrupted claim can leave a Codex subprocess or Git effects for an operator to inspect. Phase 3B does not guess the result, adopt an unproven session, reset a held session, or clean up its worktree. See the [local operations guide](agent-sessions.md) for commands and verification.
 
+## Claude Code provider
+
+Phase 5.6A selects the provider at the local worker boundary from the explicit request or the saved fix-cycle configuration. Claude Code uses a pinned noninteractive CLI with restricted file tools and explicit edit scopes. Codex uses its own workspace-write sandbox and indexed rollouts. Both return opaque session references and normalized outcomes and usage. The worker checkpoints provider artifacts alongside the same linked checkout, and both go through the same database claims, exact-head authorization, and recovery rules. The GitHub review adapter continues to collect independent review evidence. See [ADR-0004](adr/0004-local-claude-code-provider.md) and the [Claude Code operating guide](claude-code.md).
+
 ## Bounded review and fix cycles
 
-Phase 5 adds cycle records to the workflow database. The controller uses the existing workflow transitions for fixing, validating, awaiting review, and human handoff. A cycle binds the selected review and finding actions to the PR head, the Codex operation, the worktree, and an immutable candidate tree. The normal reconciler observes GitHub. Explicit CLI advances claim agent, validation, commit, and push work using SQLite. The agent leaves an uncommitted candidate in a dedicated checkout. Local validation checks the captured candidate, and publication requires a second operator approval.
+Phase 5 adds cycle records to the workflow database. The controller uses the existing workflow transitions for fixing, validating, awaiting review, and human handoff. A cycle binds the selected review and finding actions to the PR head, the agent operation, the worktree, and an immutable candidate tree. The normal reconciler observes GitHub. Explicit CLI advances claim agent, validation, commit, and push work using SQLite. The agent leaves an uncommitted candidate in a dedicated checkout. Local validation checks the captured candidate, and publication requires a second operator approval.
 
 The workflow stays in validation while publication is uncertain. The Git remote and GitHub PR must confirm the same expected commit before the controller reanchors the session to the clean new checkout. Review and CI evidence are scoped to the newly observed head. Required check names are configured locally. New findings require operator triage. A clean review and passing checks reach human handoff. See [bounded fix operations](fix-loop.md).
 

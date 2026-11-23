@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import type { AgentConfig } from "./agent-config.ts";
 import type { AgentTurnIntent } from "./agent-operation.ts";
 import { digest } from "./review-store.ts";
 import type { FindingInput } from "./review.ts";
@@ -13,11 +14,9 @@ export const fixMigration = `
   );`;
 
 export type ValidationCommand = { id: string; argv: string[] };
-export type FixConfig = {
+export type FixConfig = AgentConfig & {
   repositoryDirectory: string;
   worktreeRoot: string;
-  codexHome: string;
-  model: string;
   localBranch: string;
   allowedPaths: string[];
   requiredChecks: string[];

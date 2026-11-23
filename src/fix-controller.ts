@@ -741,7 +741,7 @@ Review data: ${JSON.stringify(cycle.review)}`,
             );
             if (usage === null || usage > cycle.config.maxTotalTokens)
               throw new Error(
-                "Codex usage is unavailable or exceeded the configured token budget. Inspect the retained candidate.",
+                "Agent usage is unavailable or exceeded the configured token budget. Inspect the retained candidate.",
               );
           }
           const worktree = evidence.worktree;

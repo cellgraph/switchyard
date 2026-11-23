@@ -87,15 +87,11 @@ describe("bounded single-PR fixes", () => {
           expect(turn.prompt).toContain(finding.evidence);
           expect(turn.prompt).toContain("Operator reproduced the issue.");
           await onTurn(workingDirectory);
-          turn.onEvent?.({
-            provider: "codex",
-            kind: "turn_completed",
-            data: { usage: { input_tokens: 12, output_tokens: 5 } },
-          });
           writeFileSync(join(workingDirectory, "tracked.txt"), `corrected ${launches}\n`);
           return {
             outcome: "completed",
             response: "",
+            usage: { inputTokens: 12, outputTokens: 5 },
             structuredOutput: {
               status: markForJudgment ? "needs_operator" : "addressed",
               addressedFindingIds: current().review.findings.map(({ id }) => id),

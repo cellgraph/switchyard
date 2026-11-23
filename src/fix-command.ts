@@ -1,5 +1,5 @@
 import { loadConfig, workflowKey } from "./config.ts";
-import { localCodexWorker } from "./agent-command.ts";
+import { localAgentWorker } from "./agent-command.ts";
 import { authorizeFix, createFixController, fixStatus } from "./fix-controller.ts";
 import { createFixGit, runValidation } from "./fix-git.ts";
 import { canConfirmLatePush, requiredChecksForCycle, type FixConfig } from "./fix-store.ts";
@@ -29,7 +29,7 @@ export function advanceReconciledFix(
     workflowId,
     config,
     configuredRequiredChecks: configured.requiredChecks,
-    worker: localCodexWorker(config),
+    worker: localAgentWorker(config),
     git: createFixGit(worktrees, `git@github.com:${target.repository}.git`),
     validate: runValidation,
     readPullRequest: () => reader.readPullRequest(target, options.drainSignal),

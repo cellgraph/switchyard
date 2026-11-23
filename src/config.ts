@@ -1,5 +1,7 @@
 import { readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
+import { claudeEditRules } from "./claude-agent.ts";
+import { parseAgentConfig } from "./agent-config.ts";
 import type { FixConfig } from "./fix-store.ts";
 import type { PullRequestTarget } from "./github-api.ts";
 import { object, positiveInteger, repositoryName } from "./github-data.ts";
@@ -47,6 +49,8 @@ export function parseFixConfig(value: unknown): FixConfig {
         "Allowed paths must be literal repository-relative files or directories ending in /.",
       );
   }
+  const agent = parseAgentConfig(input);
+  if (agent.provider === "claude-code") claudeEditRules(allowedPaths);
   const requiredChecks = strings(input.requiredChecks, "requiredChecks");
   if (new Set(requiredChecks).size !== requiredChecks.length)
     throw new Error("Required check names must be unique.");
@@ -64,8 +68,7 @@ export function parseFixConfig(value: unknown): FixConfig {
   return {
     repositoryDirectory: string("repositoryDirectory", isAbsolute),
     worktreeRoot: string("worktreeRoot", isAbsolute),
-    codexHome: string("codexHome", isAbsolute),
-    model: string("model"),
+    ...agent,
     localBranch: string("localBranch"),
     allowedPaths,
     requiredChecks,

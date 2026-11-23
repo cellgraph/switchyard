@@ -525,7 +525,7 @@ describe("durable agent controller", () => {
           error:
             when === "before launch"
               ? "Agent session changed since the previous operation."
-              : "Codex selected a different rollout during the turn.",
+              : "The agent selected a different session artifact during the turn.",
         });
         expect(runTurn).toHaveBeenCalledTimes(when === "before launch" ? 1 : 2);
         expect(store.agentOperations().session(fixture.workflow.id)?.status).toBe("held");
