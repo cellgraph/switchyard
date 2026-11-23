@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { lstatSync, readdirSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { agentTokenCount } from "./agent.ts";
 import type {
   AgentAdapter,
@@ -247,20 +248,27 @@ export function createClaudeAgent(options: Options, apiKey: string): AgentAdapte
           let model: string | undefined;
           let stopReason: AgentTurnResult | undefined;
           let spawnFailed = false;
-          let force: NodeJS.Timeout | undefined;
-          function kill(signal: NodeJS.Signals) {
-            if (!child.pid) return;
+          const force = new AbortController();
+          let groupCleanup: Promise<boolean> | undefined;
+          function signalGroup(signal: NodeJS.Signals | 0) {
+            if (!child.pid) return "gone";
             try {
               process.kill(-child.pid, signal);
+              return "sent";
             } catch (error) {
-              if ((error as NodeJS.ErrnoException).code !== "ESRCH") child.kill(signal);
+              if ((error as NodeJS.ErrnoException).code === "ESRCH") return "gone";
+              if (signal !== 0) child.kill(signal);
+              return "failed";
             }
           }
           function stop(outcome: "interrupted" | "unknown", reason: string) {
             if (stopReason) return;
             stopReason = { outcome, reason };
-            kill("SIGTERM");
-            force = setTimeout(() => kill("SIGKILL"), 1_000);
+            if (signalGroup("SIGTERM") === "gone") return;
+            groupCleanup = delay(1_000, undefined, { signal: force.signal }).then(
+              () => signalGroup("SIGKILL") !== "failed",
+              () => true, // The close handler confirmed the group was gone.
+            );
           }
           const abort = () => stop("interrupted", "Claude Code execution was canceled.");
           const timeout = setTimeout(
@@ -344,10 +352,18 @@ export function createClaudeAgent(options: Options, apiKey: string): AgentAdapte
           child.once("error", () => {
             spawnFailed = !child.pid;
           });
-          child.once("close", (code, signal) => {
+          child.once("close", async (code, signal) => {
             clearTimeout(timeout);
-            clearTimeout(force);
             turn.signal?.removeEventListener("abort", abort);
+            if (groupCleanup) {
+              // A descendant with independent stdio can outlive the CLI and its pipes.
+              if (signalGroup(0) === "gone") force.abort();
+              if (!(await groupCleanup))
+                stopReason = {
+                  outcome: "unknown",
+                  reason: "Could not confirm forced termination of the Claude Code process group.",
+                };
+            }
             if (!stopReason && buffer.trim()) {
               try {
                 frame(buffer);

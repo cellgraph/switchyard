@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
   linkSync,
@@ -76,6 +77,17 @@ process.stdin.on("end", () => {
   if (prompt === "unsafe") return;
   if (prompt === "wait") {
     process.on("SIGTERM", () => {});
+    return setInterval(() => {}, 1000);
+  }
+  if (prompt === "wait with child") {
+    const { spawn } = require("node:child_process");
+    const child = spawn(process.execPath, ["-e",
+      'process.on("SIGTERM", () => {});' +
+      'require("node:fs").writeFileSync(process.argv[1], JSON.stringify({ pid: process.pid, group: process.ppid }));' +
+      'setInterval(() => {}, 1000);',
+      join(home, "ready-child"),
+    ], { stdio: "ignore" });
+    child.unref();
     return setInterval(() => {}, 1000);
   }
   if (prompt === "signal") return process.kill(process.pid, "SIGKILL");
@@ -314,6 +326,74 @@ describe("Claude Code local provider", () => {
     await session().runTurn({ prompt: "never launched", signal: abort.signal });
     expect(launches()).toHaveLength(2);
   });
+
+  it("keeps the operation claim until cancellation reaches a child with independent stdio", async () => {
+    const fixture = agentRepository();
+    const store = new WorkflowStore(fixture.db);
+    const abort = new AbortController();
+    let child: { pid: number; group: number } | undefined;
+    let childExited = false;
+    const claimAtForce: (string | undefined)[] = [];
+    const kill = process.kill;
+    const signal = vi.spyOn(process, "kill").mockImplementation((pid, sig) => {
+      if (child && pid === -child.group && sig === "SIGKILL")
+        claimAtForce.push(store.agentOperations().get(fixture.request.operationId)?.status);
+      return kill(pid, sig);
+    });
+    try {
+      store.createWorkflow(fixture.workflow);
+      vi.stubEnv("ANTHROPIC_API_KEY", secret);
+      const worker = localAgentWorker({
+        provider: "claude-code",
+        model: "configured-model",
+        repositoryDirectory: fixture.repo,
+        worktreeRoot: fixture.worktrees,
+        claude: { executable, home, timeoutMs: 4_000 },
+      });
+      const turn = createAgentController(store, worker).runTurn(
+        { ...fixture.request, prompt: "wait with child" },
+        abort.signal,
+      );
+      try {
+        const started = await vi.waitFor(
+          () =>
+            JSON.parse(readFileSync(join(home, "ready-child"), "utf8")) as NonNullable<
+              typeof child
+            >,
+          { timeout: 2_000 },
+        );
+        child = started;
+        expect(store.agentOperations().get(fixture.request.operationId)?.status).toBe("running");
+        abort.abort();
+        expect(await turn).toMatchObject({ status: "interrupted" });
+        expect(claimAtForce).toEqual(["running"]);
+        await vi.waitFor(() => {
+          const ps = spawnSync("ps", ["-o", "stat=", "-p", String(started.pid)], {
+            encoding: "utf8",
+          });
+          if (ps.error) throw ps.error;
+          // An orphan can stay in the process table as a zombie until its adopter reaps it.
+          expect(ps.stdout.trim()).toMatch(/^(?:Z|$)/);
+        });
+        childExited = true;
+        expect(store.agentOperations().session(fixture.workflow.id)?.status).toBe("held");
+      } finally {
+        abort.abort();
+        await turn;
+      }
+    } finally {
+      signal.mockRestore();
+      store.close();
+      rmSync(fixture.root, { recursive: true, force: true });
+      if (child && !childExited) {
+        try {
+          process.kill(child.pid, "SIGKILL");
+        } catch (error) {
+          expect(error).toMatchObject({ code: "ESRCH" });
+        }
+      }
+    }
+  }, 10_000);
 
   it.each(["symbolic", "hard"])(
     "rejects a worktree containing a %s link before launch",

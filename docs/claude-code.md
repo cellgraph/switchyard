@@ -23,6 +23,8 @@ Omit `codexHome` for Claude Code requests. A request without `provider` or with 
 
 Claude Code's OS sandbox wraps its Bash tool. This adapter uses restricted mode and a file-tool allowlist, with Bash and other command, browser, subagent, and network tools excluded. It uses `dontAsk` with no permission responder, disables custom hooks and connectors, loads no user or repository settings, and supplies an empty MCP configuration by using strict MCP mode with no servers. Switchyard checks that the initialization frame reports the expected checkout, executable version, key source, permissions, and tools before accepting evidence. The CLI itself communicates with Anthropic. [Claude Code sandboxing](https://code.claude.com/docs/en/sandboxing) · [Claude Code permissions](https://code.claude.com/docs/en/permissions)
 
+The configured `--tools` list is an upper bound of `Read`, `Glob`, `Grep`, `Edit`, and `Write`. The native 2.1.330 CLI reported an effective set of `Edit` and `Read` with these flags, plus `StructuredOutput` when a schema was supplied. Plan fixes around the observed native tools. The mock CLI tests exercise Switchyard's policy checks. Use the native initialization frame to verify availability.
+
 For fixes, Switchyard translates the approved `allowedPaths` into anchored edit rules and rechecks the resulting candidate against the same scope. Claude Code accepts path segments made of ASCII letters, numbers, underscores, and `@.+-`. A file scope can overlap a directory scope that already covers it. Otherwise an ancestor of another scope must be configured as a directory. Standalone turns can edit ordinary files in their workflow checkout. The provider reserves Git metadata and Claude settings. Use a checkout without symlinks, hard links, nested mounts, or special files. Switchyard rejects linked files, cross-device entries, and special files. As with Codex, trust the local controller account, installed binary, host administrator, and checkout filesystem. Give secrets to the controller outside the worktree. Configure validation commands in Switchyard for fixes that need shell execution.
 
 ## Evidence and restart
@@ -31,7 +33,7 @@ Review `--agent-status OPERATION_ID` for the configured provider and model, the 
 
 A completed invocation requires matching initialization and terminal result frames, a clean process exit, successful Git observation, and a transcript checkpoint in the configured profile. Switchyard resumes only a recorded active session with the same runtime, worktree identity, checkout content, and transcript file and digest. It passes the exact transcript path to Claude Code. Transcripts over 64 MiB or project paths over 200 encoded characters require operator inspection. Preserve the original profile and install when restarting. [Claude Code session storage](https://code.claude.com/docs/en/agent-sdk/sessions)
 
-Cancellation and timeout send SIGTERM to the provider process group, with SIGKILL after a short grace period. Missing or inconsistent evidence, a changed transcript or checkout, and interrupted turns hold the workflow. A hard controller crash can leave the CLI alive. Recovery detects lost operation owners and holds the worktree even if it finds a transcript or edits, since those cannot confirm the operation's outcome. Inspect the worktree, transcript, and local processes before making a manual decision. Use a fresh workflow binding for a provider change. Keep existing claim, review, validation, and publication gates.
+Cancellation and timeout send SIGTERM to the provider process group. Switchyard retains the operation claim until the CLI closes and the group is gone or has been sent SIGKILL after a short grace period. A signaling failure leaves an unknown outcome for inspection. Missing or inconsistent evidence, a changed transcript or checkout, and interrupted turns hold the workflow. A hard controller crash can leave the CLI alive. Recovery detects lost operation owners and holds the worktree even if it finds a transcript or edits, since those cannot confirm the operation's outcome. Inspect the worktree, transcript, and local processes before making a manual decision. Use a fresh workflow binding for a provider change. Keep existing claim, review, validation, and publication gates.
 
 ## Manual smoke test
 
@@ -43,3 +45,60 @@ Use a disposable, reconciled PR with an `awaiting_review` workflow in a test dat
 4. For a disposable bounded fix, authorize only one tracked path. Include another tracked path and a harmless file next to the worktree as boundary checks. Confirm the agent can edit the approved path and that attempts to access the sibling file or edit the other path are denied. Inspect the operation and leave publication unauthorized.
 
 Automated CI substitutes local mock CLI processes and needs no Anthropic credentials.
+
+### Verify the effective native tools
+
+From the Switchyard checkout, set `SMOKE_CLAUDE` to the absolute native executable path, `SMOKE_CHECKOUT` to a disposable checkout, `SMOKE_PROFILE` to a separate empty private directory, and `SMOKE_MODEL` to the configured model. Export these variables alongside the API key. Run the plain and structured probes below. Save the two output lines with the smoke-test record. Expect `Edit` and `Read` for the plain probe and `Edit`, `Read`, and `StructuredOutput` for the schema probe. Investigate a different tool set before enabling the provider. The probe prints only the CLI version and tool names from each initialization frame.
+
+```sh
+node --input-type=module <<'JS'
+import { spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { assertClaudePolicy, claudeEnvironment } from "./src/claude-runtime.ts";
+
+const { SMOKE_CLAUDE, SMOKE_CHECKOUT, SMOKE_PROFILE, SMOKE_MODEL, ANTHROPIC_API_KEY } = process.env;
+if (![SMOKE_CLAUDE, SMOKE_CHECKOUT, SMOKE_PROFILE, SMOKE_MODEL, ANTHROPIC_API_KEY].every(Boolean))
+  throw new Error("Missing native smoke-test configuration.");
+const home = realpathSync(SMOKE_PROFILE);
+assertClaudePolicy(home);
+const settings = {
+  apiKeyHelper: "/usr/bin/printenv SWITCHYARD_CLAUDE_API_KEY",
+  disableAllHooks: true,
+  disableClaudeAiConnectors: true,
+  permissions: {
+    deny: ["Edit(.git)", "Read(.git)", "Edit(.claude)"],
+    disableBypassPermissionsMode: "disable",
+    disableAutoMode: "disable",
+  },
+};
+const flags = [
+  "--print", "--output-format", "stream-json", "--verbose",
+  "--bare", "--restricted", "--safe-mode", "--setting-sources", "",
+  "--disable-slash-commands", "--no-chrome", "--strict-mcp-config",
+  "--tools", "Read,Glob,Grep,Edit,Write", "--allowedTools", "Edit(./**)",
+  "--permission-mode", "dontAsk", "--permission-prompts", "none",
+  "--settings", JSON.stringify(settings), "--model", SMOKE_MODEL,
+];
+const schema = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] };
+for (const [mode, extra] of [["plain", []], ["schema", ["--json-schema", JSON.stringify(schema)]]]) {
+  const { stdout, status } = spawnSync(SMOKE_CLAUDE, [...flags, ...extra], {
+    cwd: realpathSync(SMOKE_CHECKOUT),
+    env: { ...claudeEnvironment(home), SWITCHYARD_CLAUDE_API_KEY: ANTHROPIC_API_KEY },
+    input: 'Reply with {"ok":true} and leave the checkout alone.',
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  if (status !== 0) throw new Error(`Native ${mode} probe failed.`);
+  let init;
+  try {
+    init = stdout.trim().split("\n").map((line) => JSON.parse(line))
+      .find(({ type, subtype }) => type === "system" && subtype === "init");
+  } catch {
+    throw new Error(`Native ${mode} probe returned invalid stream data.`);
+  }
+  if (init?.claude_code_version !== "2.1.330" || !Array.isArray(init.tools))
+    throw new Error(`Native ${mode} initialization evidence is missing or incompatible.`);
+  console.log(JSON.stringify({ mode, version: init.claude_code_version, tools: init.tools.sort() }));
+}
+JS
+```
