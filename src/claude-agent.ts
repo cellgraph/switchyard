@@ -35,9 +35,10 @@ type Options = {
   allowedPaths?: string[];
 };
 
-export function claudeEditRules(paths: string[] | undefined): string[] {
-  if (!paths) return ["Edit(./**)"];
-  return paths.map((path) => {
+export function claudeEditRules(paths: string[] | undefined) {
+  const deny = ["Edit(.git)", "Read(.git)", "Edit(.claude)"];
+  if (!paths) return { allow: ["Edit(./**)"], deny };
+  for (const path of paths) {
     // Only accept literal path segments representable without gitignore metacharacters.
     if (
       !/^[a-zA-Z0-9_@.+-]+(?:\/[a-zA-Z0-9_@.+-]+)*\/?$/.test(path) ||
@@ -46,14 +47,31 @@ export function claudeEditRules(paths: string[] | undefined): string[] {
       throw new Error(
         "Claude Code edit scopes require literal path segments without pattern characters.",
       );
-    return `Edit(/${path.endsWith("/") ? `${path}**` : path})`;
-  });
+  }
+  const allow: string[] = [];
+  for (const path of new Set(paths)) {
+    if (path.endsWith("/")) {
+      allow.push(`Edit(/${path}**)`);
+      continue;
+    }
+    allow.push(`Edit(/${path})`);
+    const descendants = `${path}/`;
+    if (paths.some((scope) => scope.endsWith("/") && descendants.startsWith(scope))) continue;
+    if (paths.some((scope) => scope.startsWith(descendants)))
+      throw new Error(
+        "Claude Code edit scopes cannot treat an ancestor of another scope as a file.",
+      );
+    deny.push(`Edit(/${path}/**)`);
+  }
+  return { allow, deny };
 }
 
-function command(options: Options, turn: AgentTurn, session: string[], rules: string[]) {
-  const deny = ["Edit(.git)", "Read(.git)", "Edit(.claude)"];
-  for (const path of options.allowedPaths ?? [])
-    if (!path.endsWith("/")) deny.push(`Edit(/${path}/**)`);
+function command(
+  options: Options,
+  turn: AgentTurn,
+  session: string[],
+  { allow, deny }: ReturnType<typeof claudeEditRules>,
+) {
   return [
     "--print",
     "--output-format",
@@ -70,7 +88,7 @@ function command(options: Options, turn: AgentTurn, session: string[], rules: st
     "--tools",
     fileTools.join(","),
     "--allowedTools",
-    rules.join(","),
+    allow.join(","),
     "--permission-mode",
     "dontAsk",
     "--permission-prompts",
@@ -103,27 +121,44 @@ function diagnostic(text: string): string | undefined {
     return "Claude Code denied permission to run the request.";
 }
 
-function usageEvidence(result: Record<string, unknown>): AgentTurnTelemetry {
-  const evidence: AgentTurnTelemetry = {};
-  const usage = object(result.usage);
-  const input = usage?.input_tokens;
-  const output = usage?.output_tokens;
-  const read = usage?.cache_read_input_tokens ?? 0;
-  const create = usage?.cache_creation_input_tokens ?? 0;
-  if (
-    agentTokenCount(input) &&
-    agentTokenCount(output) &&
-    agentTokenCount(read) &&
-    agentTokenCount(create) &&
-    agentTokenCount(input + output + read + create)
-  ) {
-    evidence.usage = {
-      inputTokens: input + read + create,
-      outputTokens: output,
-      ...(read ? { cacheReadInputTokens: read } : {}),
-      ...(create ? { cacheCreationInputTokens: create } : {}),
-    };
+function turnUsage(result: Record<string, unknown>): AgentTurnTelemetry["usage"] {
+  // The session ledger can include restored spend. Only sum usage from the current result.
+  const reported = Object.values(object(result.model_usage_since_last_result) ?? {});
+  if (!reported.length) return;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadInputTokens = 0;
+  let cacheCreationInputTokens = 0;
+  for (const value of reported) {
+    const usage = object(value);
+    const input = usage?.inputTokens;
+    const output = usage?.outputTokens;
+    const read = usage?.cacheReadInputTokens ?? 0;
+    const create = usage?.cacheCreationInputTokens ?? 0;
+    if (
+      !agentTokenCount(input) ||
+      !agentTokenCount(output) ||
+      !agentTokenCount(read) ||
+      !agentTokenCount(create)
+    )
+      return;
+    inputTokens += input + read + create;
+    outputTokens += output;
+    cacheReadInputTokens += read;
+    cacheCreationInputTokens += create;
   }
+  if (!agentTokenCount(inputTokens + outputTokens)) return;
+  return {
+    inputTokens,
+    outputTokens,
+    ...(cacheReadInputTokens ? { cacheReadInputTokens } : {}),
+    ...(cacheCreationInputTokens ? { cacheCreationInputTokens } : {}),
+  };
+}
+
+function usageEvidence(result: Record<string, unknown>): AgentTurnTelemetry {
+  const usage = turnUsage(result);
+  const evidence: AgentTurnTelemetry = usage ? { usage } : {};
   const cost = result.total_cost_usd;
   // Claude includes spend restored from earlier turns in total_cost_usd.
   if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0)
@@ -131,25 +166,41 @@ function usageEvidence(result: Record<string, unknown>): AgentTurnTelemetry {
   return evidence;
 }
 
-function checkWorkspace(directory: string) {
+function workspaceIssue(directory: string): string | undefined {
   // The CLI checks symlink resolution. Reject aliases and special files as well,
   // since a hard link or file on another mount can alias content outside this checkout.
-  const device = lstatSync(directory).dev;
-  let remaining = 10_000;
-  const pending = [directory];
-  while (pending.length) {
-    for (const name of readdirSync(pending.pop()!, { withFileTypes: true })) {
-      if (--remaining < 0)
-        throw new Error("Claude Code worktree exceeds the checkout entry limit.");
-      const path = join(name.parentPath, name.name);
-      const stat = lstatSync(path);
-      if (stat.dev !== device || (!stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1)))
-        throw new Error(
-          "Claude Code requires a worktree without links, other filesystems, or special files.",
-        );
-      if (stat.isDirectory()) pending.push(path);
+  try {
+    const device = lstatSync(directory).dev;
+    let remaining = 10_000;
+    const pending = [directory];
+    while (pending.length) {
+      for (const name of readdirSync(pending.pop()!, { withFileTypes: true })) {
+        if (--remaining < 0) return "Claude Code worktree exceeds the checkout entry limit.";
+        const path = join(name.parentPath, name.name);
+        const stat = lstatSync(path);
+        if (stat.dev !== device || (!stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1)))
+          return "Claude Code requires a worktree without links, other filesystems, or special files.";
+        if (stat.isDirectory()) pending.push(path);
+      }
     }
+  } catch {
+    return "Could not verify the Claude Code worktree before launch.";
   }
+}
+
+function launchIssue(options: Options, directory: string): string | undefined {
+  try {
+    assertClaudePolicy(options.home);
+  } catch {
+    return "Could not verify an unmanaged Claude Code profile before launch.";
+  }
+  try {
+    if (claudeExecutableIdentity(options.executable) !== options.executableIdentity)
+      return "Claude Code executable changed during preflight.";
+  } catch {
+    return "Claude Code executable became unavailable during preflight.";
+  }
+  return workspaceIssue(directory);
 }
 
 export function createClaudeAgent(options: Options, apiKey: string): AgentAdapter {
@@ -168,12 +219,18 @@ export function createClaudeAgent(options: Options, apiKey: string): AgentAdapte
       async runTurn(turn) {
         if (turn.signal?.aborted)
           return { outcome: "interrupted", reason: "Canceled before launch." };
-        assertClaudePolicy(options.home);
-        if (claudeExecutableIdentity(options.executable) !== options.executableIdentity)
-          throw new Error("Claude Code executable changed during preflight.");
-        checkWorkspace(directory);
+        const issue = launchIssue(options, directory);
+        if (issue) return { outcome: "failed", reason: issue };
         const id = confirmedId ?? randomUUID();
-        const transcript = claudeTranscript(options.home, id, directory);
+        let transcript: string;
+        try {
+          transcript = claudeTranscript(options.home, id, directory);
+        } catch {
+          return {
+            outcome: "failed",
+            reason: "Claude Code session ID or project path is unsupported.",
+          };
+        }
         const session = confirmedId ? ["--resume", transcript] : ["--session-id", id];
         return new Promise<AgentTurnResult>((resolve) => {
           const child = spawn(options.executable, command(options, turn, session, rules), {

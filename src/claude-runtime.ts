@@ -9,6 +9,8 @@ import { object } from "./github-data.ts";
 
 export const claudeProvider = "claude-code";
 export const claudeVersion = "2.1.330";
+// Bump when the launch policy changes to prevent resuming across permission changes.
+const claudePolicyVersion = 1;
 export const claudeSessionId = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/;
 const managedDirectory =
   process.platform === "darwin" ? "/Library/Application Support/ClaudeCode" : "/etc/claude-code";
@@ -102,7 +104,13 @@ export function claudeRuntime(model: string, settings: ClaudeSettings, key: stri
     home,
     configuration: createHash("sha256")
       .update(
-        JSON.stringify([identity(home), executableIdentity, claudeEnvironment(home), settings]),
+        JSON.stringify([
+          claudePolicyVersion,
+          identity(home),
+          executableIdentity,
+          claudeEnvironment(home),
+          settings,
+        ]),
       )
       .digest("hex"),
   };

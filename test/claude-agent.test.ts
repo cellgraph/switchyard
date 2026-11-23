@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { localAgentWorker, localCodexWorker } from "../src/agent-command.ts";
 import { parseAgentConfig } from "../src/agent-config.ts";
 import { createAgentController } from "../src/agent-controller.ts";
-import { createClaudeAgent } from "../src/claude-agent.ts";
+import { claudeEditRules, createClaudeAgent } from "../src/claude-agent.ts";
 import {
   claudeExecutableIdentity,
   claudeSessionCheckpoint,
@@ -24,7 +24,7 @@ import {
 } from "../src/claude-runtime.ts";
 import { parseFixConfig } from "../src/config.ts";
 import { WorkflowStore } from "../src/store.ts";
-import { agentRepository } from "./fixtures/agent-repository.ts";
+import { agentRepository, git } from "./fixtures/agent-repository.ts";
 
 vi.mock("node:fs", async (importOriginal) => {
   const fs = await importOriginal<typeof import("node:fs")>();
@@ -96,8 +96,14 @@ process.stdin.on("end", () => {
     permission_denials: prompt === "denied" ? [{ input: "sensitive tool input" }] : [],
     result: "result with " + process.env.SWITCHYARD_CLAUDE_API_KEY,
     ...(prompt === "missing structured" ? {} : { structured_output: { value: process.env.SWITCHYARD_CLAUDE_API_KEY } }),
-    usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 },
-    total_cost_usd: 0.04,
+    usage: { input_tokens: resume ? 50 : 10, output_tokens: resume ? 19 : 2 },
+    ...(prompt === "missing invocation usage" ? {} : {
+      model_usage_since_last_result: {
+        "claude-resolved-test": { inputTokens: 7, outputTokens: 1, cacheReadInputTokens: 3, cacheCreationInputTokens: 4 },
+        "claude-other-model": { inputTokens: 3, outputTokens: 1 },
+      }
+    }),
+    total_cost_usd: resume ? 0.09 : 0.04,
   });
 });
 `,
@@ -186,6 +192,20 @@ describe("Claude Code local provider", () => {
     expect(() => parseFixConfig({ ...fix, allowedPaths: ["*.txt"] })).toThrow("literal");
   });
 
+  it("preserves recursive permission when an exact scope overlaps it", () => {
+    const rules = claudeEditRules(["src", "src/", "src/component.ts", "outside.txt"]);
+    expect(rules.allow).toEqual([
+      "Edit(/src)",
+      "Edit(/src/**)",
+      "Edit(/src/component.ts)",
+      "Edit(/outside.txt)",
+    ]);
+    expect(rules.deny).toContain("Edit(/outside.txt/**)");
+    expect(rules.deny).not.toContain("Edit(/src/**)");
+    expect(rules.deny).not.toContain("Edit(/src/component.ts/**)");
+    expect(() => claudeEditRules(["src", "src/file.ts"])).toThrow("ancestor");
+  });
+
   it("launches headlessly with an allowlisted environment and returns sanitized structured evidence", async () => {
     vi.stubEnv("GITHUB_TOKEN", "unrelated-secret");
     const current = session();
@@ -268,6 +288,12 @@ describe("Claude Code local provider", () => {
     expect(JSON.stringify(result)).not.toMatch(/sensitive|fake-anthropic-secret/);
   });
 
+  it("does not use cumulative token counts when invocation usage is unavailable", async () => {
+    const result = await session().runTurn({ prompt: "missing invocation usage" });
+    expect(result).toMatchObject({ outcome: "completed", sessionCostUsd: 0.04 });
+    expect(result).not.toHaveProperty("usage");
+  });
+
   it("bounds timeouts and cancellation, keeping an observed session reference", async () => {
     const timeout = session(1_000);
     expect(await timeout.runTurn({ prompt: "wait" })).toMatchObject({
@@ -295,7 +321,10 @@ describe("Claude Code local provider", () => {
       const target = join(root, "outside");
       writeFileSync(target, "untouched");
       (link === "symbolic" ? symlinkSync : linkSync)(target, join(workingDirectory, "alias"));
-      await expect(session().runTurn({ prompt: "edit" })).rejects.toThrow("without links");
+      expect(await session().runTurn({ prompt: "edit" })).toMatchObject({
+        outcome: "failed",
+        reason: expect.stringContaining("without links"),
+      });
       expect(readFileSync(target, "utf8")).toBe("untouched");
     },
   );
@@ -317,6 +346,50 @@ describe("Claude Code local provider", () => {
     expect(() => localAgentWorker({ ...repo, ...config }).runtime()).toThrow(
       "unavailable or incompatible",
     );
+  });
+
+  it("records an actionable checkout preflight failure without launching the CLI", async () => {
+    const fixture = agentRepository();
+    const store = new WorkflowStore(fixture.db);
+    try {
+      symlinkSync("tracked.txt", join(fixture.repo, "alias"));
+      git(fixture.repo, "add", "alias");
+      git(
+        fixture.repo,
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "-m",
+        "Add a symlink",
+      );
+      const head = git(fixture.repo, "rev-parse", "HEAD");
+      store.createWorkflow({ ...fixture.workflow, headSha: head });
+      vi.stubEnv("ANTHROPIC_API_KEY", secret);
+      const worker = localAgentWorker({
+        provider: "claude-code",
+        model: "configured-model",
+        repositoryDirectory: fixture.repo,
+        worktreeRoot: fixture.worktrees,
+        claude: { executable, home, timeoutMs: 4_000 },
+      });
+      const result = await createAgentController(store, worker).runTurn({
+        ...fixture.request,
+        expectedHead: head,
+        expectedPullRequestHead: head,
+      });
+      expect(result).toMatchObject({
+        status: "completed",
+        error: expect.stringContaining("requires a worktree without links"),
+        evidence: { agent: { outcome: "failed" } },
+      });
+      expect(store.agentOperations().session(fixture.workflow.id)?.status).toBe("held");
+      expect(() => launches()).toThrow();
+    } finally {
+      store.close();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
   });
 
   it.each(["resume", "modified transcript", "interrupted", "changed provider"])(
@@ -382,7 +455,11 @@ describe("Claude Code local provider", () => {
             : worker();
         const next = await createAgentController(store, nextWorker).runTurn(second);
         if (scenario === "resume") {
-          expect(next).toMatchObject({ status: "completed", error: null });
+          expect(next).toMatchObject({
+            status: "completed",
+            error: null,
+            evidence: { usage: { inputTokens: 17, outputTokens: 2 }, sessionCostUsd: 0.09 },
+          });
           expect(next.evidence?.reference).toEqual(binding.reference);
           expect(launches()[1].args).toEqual(expect.arrayContaining(["--resume", transcript]));
           expect(claudeSessionCheckpoint(home, agent.id, worktree.path).digest).not.toBe(
