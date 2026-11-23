@@ -13,6 +13,7 @@ export function createLocalAgentExecution(
   worktrees: WorktreeManager,
   agent: AgentAdapter,
   sessionCheckpoint: (id: string, directory: string) => AgentSessionCheckpoint,
+  readOnly = false,
 ): Pick<AgentOperationWorker, "execute"> {
   const worker = createLocalWorker(worktrees, agent);
   return {
@@ -32,10 +33,21 @@ export function createLocalAgentExecution(
       recordExpectedWorktree(worktrees.locate(target));
       let source: AgentSessionCheckpoint | undefined;
       let ignoredBaseline: string | undefined;
+      let readOnlyBaseline: string | undefined;
       const authorize = () => {
         if (fixFindingIds)
           ignoredBaseline = worktrees.ignoredCheckpoint(session.worktree, target.expectedHead);
-        authorizeLaunch();
+        if (!readOnly) return authorizeLaunch();
+        const before = worktrees.checkpoint(session.worktree, target.expectedHead);
+        readOnlyBaseline = before;
+        return Promise.resolve(authorizeLaunch()).then(() => {
+          if (
+            worktrees.checkpoint(session.worktree, target.expectedHead) !== before ||
+            (saved &&
+              !isDeepStrictEqual(source, sessionCheckpoint(saved.agent.id, saved.worktree.path)))
+          )
+            throw new Error("Worktree or session changed while awaiting launch authorization.");
+        });
       };
       const saved = previous?.reference;
       if (previous) {
@@ -57,7 +69,7 @@ export function createLocalAgentExecution(
             source = sessionCheckpoint(saved.agent.id, saved.worktree.path);
             if (!isDeepStrictEqual(source, previous?.checkpoint?.session))
               throw new Error("Agent session changed since the previous operation.");
-            authorize();
+            return authorize();
           })
         : worker.startSession(target, true, authorize, preflight?.worktree);
       const checkpoint = refreshLaunch
@@ -143,6 +155,8 @@ export function createLocalAgentExecution(
             evidence.ignoredCheckpoint = ignored;
           }
           const workspace = worktrees.checkpoint(reference.worktree, result.workspace.head);
+          if (readOnly && workspace !== readOnlyBaseline)
+            throw new Error("The read-only turn changed checkout contents.");
           const session = sessionCheckpoint(reference.agent.id, reference.worktree.path);
           if (source && source.identity !== session.identity)
             throw new Error("The agent selected a different session artifact during the turn.");

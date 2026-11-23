@@ -57,10 +57,12 @@ export function createCodexAgent({
   model,
   codexHome,
   apiKey,
+  readOnly = false,
 }: {
   model: string;
   codexHome: string;
   apiKey?: string;
+  readOnly?: boolean;
 }): AgentAdapter {
   if (!model.trim()) throw new Error("A Codex model must be configured.");
   if (!isAbsolute(codexHome)) throw new Error("Codex home must be an absolute path.");
@@ -77,6 +79,7 @@ export function createCodexAgent({
       workingDirectory,
       model,
       ...codexTurnPolicy,
+      ...(readOnly ? { sandboxMode: "read-only" } : {}),
     };
     const thread = id ? codex.resumeThread(id, options) : codex.startThread(options);
     let reference = id ?? null;

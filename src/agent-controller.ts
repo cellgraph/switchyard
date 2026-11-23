@@ -92,7 +92,10 @@ export function createAgentController(
           prompt,
           previous,
           ...(signal === undefined ? {} : { signal }),
-          authorizeLaunch: () => operations.authorizeLaunch(operationId),
+          authorizeLaunch() {
+            if (!operations.authorizeLaunch(operationId))
+              throw new Error("Workflow authorization changed before the agent launched.");
+          },
           ...(refreshLaunch
             ? {
                 async refreshLaunch() {

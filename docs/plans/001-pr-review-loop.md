@@ -123,9 +123,14 @@ The unattended controller runs on an exe.dev VM with GitHub App authentication, 
 
 Implemented local headless execution, provider selection for explicit turns and fix cycles, exact-transcript continuation, and normalized usage and outcome evidence. The existing controller owns requests, authorization, recovery, and publication. Claude Code uses restricted file tools with the approved edit scope. Mock processes cover failures, cancellation, and recovery. Run the credentialed checks in the [Claude Code smoke test](../claude-code.md#manual-smoke-test) on the deployment host before enabling it for a production workflow.
 
+## Phase 5.6B: Distributed worker execution
+
+Run explicitly authorized, read-only agent turns on eligible workers using the existing durable operation and session model. Advertise per-repository provider and model profiles, authenticate each worker independently, bind launch and completion to a durable lease, and retain ambiguous work for inspection without replay. Status exposes registration, capacity, assignment, deadline and terminal disposition. See [ADR-0004](../adr/0004-remote-agent-turns.md) and the [controller and worker smoke test](../distributed-workers.md#two-process-smoke-test).
+
+Automated coverage uses fake provider sessions and loopback transport. The first credentialed execution on the Mac mini and exe.dev is an operator smoke test. Remote edit candidates, validation and publication are deferred pending a design for independently verifying and transferring candidate artifacts. Controller-local fixes retain their existing execution path.
+
 ### Remaining phases
 
-- Phase 5.6B covers distributed workers, remote dispatch, and worker fencing.
 - Phase 5.6C covers an independent adjudicator.
 - Phase 5.7 covers delegated authority and notification workflows.
 - Phase 6 covers plan, phase, and dependency orchestration plus the operational release work below.

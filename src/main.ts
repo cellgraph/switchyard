@@ -12,6 +12,7 @@ import { createGitHubReader, type PullRequestTarget } from "./github-api.ts";
 import { createGitHubAppClient, resumeGitHubAfterSecondaryLimit } from "./github-app.ts";
 import { positiveInteger } from "./github-data.ts";
 import { canReconcilePullRequest, createReconciler } from "./reconcile.ts";
+import { runRemoteCommand } from "./remote-command.ts";
 import { runReviewCommand } from "./review-command.ts";
 import { WorkflowStore } from "./store.ts";
 import { runUnattended, workerStatus } from "./unattended.ts";
@@ -60,6 +61,7 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const dbPath = process.env.SWITCHYARD_DB_PATH ?? "switchyard.sqlite";
   process.umask(0o077);
+  if (await runRemoteCommand(args, dbPath)) return;
   if (await runReviewCommand(args, dbPath, (path) => loadConfig(path).targets)) return;
   if (await runAgentCommand(args, dbPath)) return;
   if (await runFixCommand(args, dbPath, makeReader)) return;

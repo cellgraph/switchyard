@@ -1,3 +1,4 @@
+import { createRemoteStore, remoteMigration } from "./remote-store.ts";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { createAgentOperationStore, recoverAgentOperations } from "./agent-store.ts";
@@ -133,6 +134,7 @@ const migrations = [
     PRIMARY KEY (repository, pull_request)
   );`,
   "CREATE TABLE unattended_worker (slot INTEGER PRIMARY KEY CHECK(slot=1), record TEXT NOT NULL);",
+  remoteMigration,
 ];
 
 export class WorkflowStore {
@@ -333,6 +335,22 @@ export class WorkflowStore {
         "Publication has already started. Reconcile the push before changing its findings or stopping the workflow.",
       );
     }
+  }
+
+  remoteWorkers(now = Date.now) {
+    const getWorkflow = (id: string) => this.getWorkflow(id);
+    return createRemoteStore(
+      this.#db,
+      (run) => this.#transaction(run),
+      createAgentOperationStore(this.#db, {
+        // Remote claims and their agent transitions share the enclosing transaction.
+        transaction: (run) => run(),
+        getWorkflow,
+        transition: (id, command) => this.#transition(id, command),
+      }),
+      getWorkflow,
+      now,
+    );
   }
 
   agentOperations() {
@@ -696,6 +714,7 @@ export class WorkflowStore {
     ambiguousOperations: number;
     unverifiedAgentOperations?: string[];
   } {
+    const expiredRemote = this.remoteWorkers().expire();
     return this.#transaction(() => {
       const deliveries = Number(
         this.#db.prepare("UPDATE deliveries SET status='pending' WHERE status='processing'").run()
@@ -720,7 +739,7 @@ export class WorkflowStore {
       );
       return {
         deliveries,
-        ambiguousOperations: ambiguousLegacyOperations + recovered.length,
+        ambiguousOperations: ambiguousLegacyOperations + recovered.length + expiredRemote,
         ...(unverified.length ? { unverifiedAgentOperations: unverified } : {}),
       };
     });

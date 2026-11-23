@@ -101,11 +101,13 @@ export function localCodexWorker({
   worktreeRoot,
   codexHome,
   model,
+  readOnly = false,
 }: {
   repositoryDirectory: string;
   worktreeRoot: string;
   codexHome: string;
   model: string;
+  readOnly?: boolean;
 }): AgentOperationWorker {
   const apiKey = process.env.OPENAI_API_KEY?.trim();
   let identity: AgentRuntime;
@@ -119,11 +121,15 @@ export function localCodexWorker({
       const worktrees = createWorktreeManager({ repositoryDirectory, worktreeRoot });
       const agent = createCodexAgent({
         model,
+        readOnly,
         codexHome: identity.home,
         ...(apiKey ? { apiKey } : {}),
       });
-      return createLocalAgentExecution(worktrees, agent, (id, path) =>
-        codexSessionCheckpoint(identity.home, id, path),
+      return createLocalAgentExecution(
+        worktrees,
+        agent,
+        (id, path) => codexSessionCheckpoint(identity.home, id, path),
+        readOnly,
       ).execute(input);
     },
   };
@@ -134,10 +140,11 @@ export function localAgentWorker(
     repositoryDirectory: string;
     worktreeRoot: string;
     allowedPaths?: string[];
+    readOnly?: boolean;
   },
 ): AgentOperationWorker {
   if (config.provider !== "claude-code") return localCodexWorker(config);
-  const { model, claude, repositoryDirectory, worktreeRoot, allowedPaths } = config;
+  const { model, claude, repositoryDirectory, worktreeRoot, allowedPaths, readOnly } = config;
   const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
   let identity: ReturnType<typeof claudeRuntime>;
   const configurationId = createHash("sha256")
@@ -163,12 +170,16 @@ export function localAgentWorker(
           ...identity,
           home: identity.runtime.home,
           model,
+          ...(readOnly ? { readOnly } : {}),
           ...(allowedPaths === undefined ? {} : { allowedPaths }),
         },
         apiKey!,
       );
-      return createLocalAgentExecution(worktrees, agent, (id, path) =>
-        claudeSessionCheckpoint(identity.runtime.home, id, path),
+      return createLocalAgentExecution(
+        worktrees,
+        agent,
+        (id, path) => claudeSessionCheckpoint(identity.runtime.home, id, path),
+        readOnly,
       ).execute(input);
     },
   };

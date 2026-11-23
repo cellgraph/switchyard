@@ -56,6 +56,11 @@ describe("Codex SDK adapter", () => {
       open.mockReturnValue({ runStreamed: sdk.runStreamed });
   });
 
+  it("uses the read-only sandbox for remote profiles", () => {
+    createCodexAgent({ ...settings, readOnly: true }).startSession(workspace);
+    expect(sdk.startThread).toHaveBeenCalledWith({ ...options, sandboxMode: "read-only" });
+  });
+
   it("scopes SDK execution and streams native events while exposing structured output", async () => {
     const adapter = createCodexAgent(settings);
     const session = adapter.startSession(workspace);

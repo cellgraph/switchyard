@@ -71,7 +71,7 @@ process.stdin.on("end", () => {
   if (prompt === "bad stream") return console.log("raw sensitive stderr " + process.env.SWITCHYARD_CLAUDE_API_KEY);
   emit({
     type: "system", subtype: "init", permissionMode: "dontAsk",
-    model: "claude-resolved-test", tools: prompt === "unsafe" ? ["Bash"] : ["Read", "Edit"],
+    model: "claude-resolved-test", tools: prompt === "unsafe" ? ["Bash"] : option("--tools").split(",").filter(tool => tool === "Read" || tool === "Edit"),
     mcp_servers: [], cwd, additional_directories: [], apiKeySource: "apiKeyHelper", claude_code_version: ${JSON.stringify(claudeVersion)},
   });
   if (prompt === "unsafe") return;
@@ -144,7 +144,7 @@ describe("Claude Code local provider", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  function session(timeoutMs = 4_000) {
+  function session(timeoutMs = 4_000, readOnly = false) {
     return createClaudeAgent(
       {
         executable,
@@ -153,6 +153,7 @@ describe("Claude Code local provider", () => {
         model: "configured-model",
         timeoutMs,
         maxBudgetUsd: 0.25,
+        readOnly,
         allowedPaths: ["tracked.txt", "src/"],
       },
       secret,
@@ -202,6 +203,15 @@ describe("Claude Code local provider", () => {
     };
     expect(parseFixConfig({ ...fix, allowedPaths: ["src/"] }).provider).toBe("claude-code");
     expect(() => parseFixConfig({ ...fix, allowedPaths: ["*.txt"] })).toThrow("literal");
+  });
+
+  it("offers only read tools for remote profiles", async () => {
+    expect(await session(4_000, true).runTurn({ prompt: "read-only" })).toMatchObject({
+      outcome: "completed",
+    });
+    const { args } = launches()[0];
+    expect(args[args.indexOf("--tools") + 1]).toBe("Read,Glob,Grep");
+    expect(JSON.parse(args[args.indexOf("--settings") + 1]).permissions.deny).toContain("Edit");
   });
 
   it("preserves recursive permission when an exact scope overlaps it", () => {

@@ -128,3 +128,7 @@ Recommend a ruleset for `main` that requires pull requests and the `Quality chec
 - Determine the least-privilege GitHub App permission set for reading review threads, checks, and PR code, and the most practical macOS authentication model for pushing.
 - Confirm whether “required checks” should be derived from branch protection/rulesets, supplied in local configuration, or both. Fail closed if the set cannot be determined.
 - Define operator actions that can resolve held operations after investigation. Phase 3B supports inspection and escalation.
+
+## Distributed execution
+
+Phase 5.6B adds a worker-initiated execution listener backed by the workflow controller's SQLite database. Operator-authorized standalone turns can run in a remote worker's isolated checkout using a configured Codex or Claude Code profile. A durable single-delivery claim binds the work to a worker identity, process incarnation and expiring fence. The existing agent operation store retains the authorization and terminal-state decisions. Expiry holds unknown work for inspection. Local fixes, validation and publication continue through their existing path. See [ADR-0004](adr/0004-remote-agent-turns.md) and the [remote worker guide](distributed-workers.md).
