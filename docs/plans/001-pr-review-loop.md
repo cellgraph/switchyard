@@ -127,7 +127,7 @@ Implemented local headless execution, provider selection for explicit turns and 
 
 Run explicitly authorized, read-only agent turns on eligible workers using the existing durable operation and session model. Advertise per-repository provider and model profiles, authenticate each worker independently, bind launch and completion to a durable lease, and retain ambiguous work for inspection without replay. Status exposes registration, capacity, assignment, deadline and terminal disposition. See [ADR-0004](../adr/0004-remote-agent-turns.md) and the [controller and worker smoke test](../distributed-workers.md#two-process-smoke-test).
 
-Automated coverage uses fake provider sessions and loopback transport. The first credentialed execution on the Mac mini and exe.dev is an operator smoke test. Remote edit candidates, validation and publication are deferred pending a design for independently verifying and transferring candidate artifacts. Controller-local fixes retain their existing execution path.
+Automated coverage uses fake provider sessions and loopback transport. The [credentialed execution record](../distributed-workers.md#credentialed-execution-record) describes the live Codex completion and tunnel disconnect tests on the Mac mini and exe.dev. Remote edit candidates, validation and publication are deferred pending a design for independently verifying and transferring candidate artifacts. Controller-local fixes retain their existing execution path.
 
 ### Remaining phases
 
