@@ -138,7 +138,11 @@ export function createRemoteStore(
   }
 
   return {
-    expire: () => transaction(() => expire(now())),
+    expire: () =>
+      transaction(() => {
+        operations.retireRevokedRemoteRequests();
+        return expire(now());
+      }),
 
     enqueue(request: AgentTurnRequest, profile: Omit<Placement, "repository">, timeoutMs: number) {
       const { prompt, ...input } = request;

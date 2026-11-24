@@ -242,8 +242,10 @@ export function createClaudeAgent(options: Options, apiKey: string): AgentAdapte
           };
         }
         const session = confirmedId ? ["--resume", transcript] : ["--session-id", id];
+        const args = command(options, turn, session, rules);
+        turn.checkLaunch?.();
         return new Promise<AgentTurnResult>((resolve) => {
-          const child = spawn(options.executable, command(options, turn, session, rules), {
+          const child = spawn(options.executable, args, {
             cwd: directory,
             env,
             detached: true,

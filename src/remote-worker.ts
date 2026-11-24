@@ -59,16 +59,22 @@ export async function runRemoteWorker({
     const key = { operationId, instance, fence };
     const canceled = new AbortController();
     const done = new AbortController();
-    const timeout = AbortSignal.timeout(
-      Math.max(1, Math.floor(remote.timeoutMs - (performance.now() - claimedAt))),
-    );
+    const deadline = claimedAt + remote.timeoutMs;
+    const timeout = AbortSignal.timeout(Math.max(1, Math.floor(deadline - performance.now())));
     const runSignal = AbortSignal.any([signal, timeout, canceled.signal]);
     const heartbeatSignal = AbortSignal.any([runSignal, done.signal]);
     let latestReference: AgentTurnEvidence["reference"];
-    let renewedAt = claimedAt;
-    const watchdog = setInterval(() => {
-      if (performance.now() - renewedAt >= remoteLeaseMs) canceled.abort();
-    }, 500);
+    // A request starts locally before the controller can commit its lease.
+    // Basing the bound on the send time accounts for delayed acknowledgements.
+    let leaseEndsAt = claimedAt + remoteLeaseMs;
+    function cancelIfExpired() {
+      if (performance.now() >= Math.min(leaseEndsAt, deadline)) canceled.abort();
+    }
+    function checkLaunch() {
+      cancelIfExpired();
+      runSignal.throwIfAborted();
+    }
+    const watchdog = setInterval(cancelIfExpired, 500);
     const heartbeat = (async () => {
       while (!heartbeatSignal.aborted) {
         await wait(5_000, heartbeatSignal);
@@ -76,7 +82,7 @@ export async function runRemoteWorker({
         const sentAt = performance.now();
         try {
           await request("renew", { ...key, reference: latestReference });
-          renewedAt = sentAt;
+          leaseEndsAt = sentAt + remoteLeaseMs;
         } catch (error) {
           reportError("remote_heartbeat_failed", error, operationId);
           if (error instanceof RemoteProtocolError && error.status < 500) canceled.abort();
@@ -127,8 +133,9 @@ export async function runRemoteWorker({
         recordSession(reference) {
           latestReference = reference;
         },
+        checkLaunch,
         async authorizeLaunch() {
-          runSignal.throwIfAborted();
+          checkLaunch();
           launchRequested = true;
           try {
             await request("launch", { ...key, worktree });
@@ -136,7 +143,7 @@ export async function runRemoteWorker({
             if (error instanceof RemoteProtocolError && error.status < 500) launchRequested = false;
             throw error;
           }
-          runSignal.throwIfAborted();
+          checkLaunch();
         },
       });
     } catch (error) {

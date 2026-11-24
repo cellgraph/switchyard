@@ -81,11 +81,15 @@ function failedPublishedChecks(workflow: Workflow, cycle: FixCycle | undefined):
   );
 }
 
+const remoteFixGuidance =
+  "This workflow has a remote session. Address the findings manually or use a new workflow with a local session.";
+
 export function fixStatus(store: WorkflowStore, workflowId: string) {
   const workflow = store.getWorkflow(workflowId);
   if (!workflow) throw new Error("Workflow does not exist. Reconcile GitHub first.");
   const cycles = store.fixes(workflowId).read();
   const latest = cycles.at(-1);
+  const session = store.agentOperations().session(workflowId);
   const choices: Record<FixCycle["phase"], string> = {
     proposed: "Authorize the proposal after checking the findings and allowed paths.",
     authorized: "Advance to dispatch the authorized agent turn.",
@@ -117,17 +121,21 @@ export function fixStatus(store: WorkflowStore, workflowId: string) {
       ? "Human merge review."
       : workflow.state === "escalated" || workflow.state === "stopped"
         ? "Inspect the escalation reason."
-        : current
-          ? choices[current.phase]
-          : pending.length
-            ? "Record an operator disposition for each new finding."
-            : failedPublishedChecks(workflow, latest).length
-              ? "Advance to record the failed required checks and hold the workflow."
-              : workflow.state === "fixing"
-                ? "Advance to evaluate the current review."
-                : workflow.review?.outcome === "completed_clean"
-                  ? "Wait for all configured required checks on the clean reviewed head."
-                  : "Wait for a completed exact-head review.";
+        : workflow.state === "fixing" &&
+            session?.remoteWorkerId &&
+            (!current || current.phase === "proposed")
+          ? remoteFixGuidance
+          : current
+            ? choices[current.phase]
+            : pending.length
+              ? "Record an operator disposition for each new finding."
+              : failedPublishedChecks(workflow, latest).length
+                ? "Advance to record the failed required checks and hold the workflow."
+                : workflow.state === "fixing"
+                  ? "Advance to evaluate the current review."
+                  : workflow.review?.outcome === "completed_clean"
+                    ? "Wait for all configured required checks on the clean reviewed head."
+                    : "Wait for a completed exact-head review.";
   return {
     workflow,
     nextAction,
@@ -151,7 +159,7 @@ export function fixStatus(store: WorkflowStore, workflowId: string) {
     pendingFindingIds: pending,
     cycles,
     agent: current ? store.agentOperations().get(current.operationId) : null,
-    session: store.agentOperations().session(workflowId),
+    session,
   };
 }
 
@@ -166,6 +174,8 @@ export function authorizeFix(
     const cycle = cycles.at(-1);
     if (!cycle || cycle.id !== id)
       throw new Error("Fix cycle ID does not match the current proposal.");
+    if (!publication && store.agentOperations().session(workflowId)?.remoteWorkerId)
+      throw new Error(remoteFixGuidance);
     const phase = publication ? "publication_authorized" : "authorized";
     if (cycle.phase === phase) return cycle;
     if (
@@ -607,6 +617,7 @@ Review data: ${JSON.stringify(cycle.review)}`,
           return;
         }
         if (workflow.state !== "fixing" || !review) return;
+        if (store.agentOperations().session(workflowId)?.remoteWorkerId) return;
         if (review.pending.length) {
           transition({
             type: "fix_attention",

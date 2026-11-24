@@ -23,6 +23,7 @@ export function createLocalAgentExecution(
       prompt,
       signal,
       authorizeLaunch,
+      checkLaunch,
       refreshLaunch,
       preflight,
       fixFindingIds,
@@ -110,6 +111,7 @@ export function createLocalAgentExecution(
         prompt,
         ...(outputSchema ? { outputSchema } : {}),
         ...(signal === undefined ? {} : { signal }),
+        ...(checkLaunch === undefined ? {} : { checkLaunch }),
         onEvent(event) {
           if (event.kind === "session_started" && session.reference)
             recordSession(session.reference);

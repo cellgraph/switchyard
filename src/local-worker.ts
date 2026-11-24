@@ -75,11 +75,14 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
             agent: { outcome: "interrupted", reason: "Canceled before launch." },
             workspace: before,
           };
+        // Synchronous checkout verification can delay the abort timer.
+        turn.checkLaunch?.();
         session ??= openAgentSession();
         active.add(worktree.path);
         try {
           let result: AgentTurnResult;
           try {
+            turn.checkLaunch?.();
             result = await session.runTurn(turn);
           } catch {
             result = {

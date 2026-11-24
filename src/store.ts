@@ -337,28 +337,27 @@ export class WorkflowStore {
     }
   }
 
+  #agentOperationStore(transaction: <T>(run: () => T) => T) {
+    return createAgentOperationStore(this.#db, {
+      transaction,
+      getWorkflow: (id) => this.getWorkflow(id),
+      transition: (id, command) => this.#transition(id, command),
+    });
+  }
+
   remoteWorkers(now = Date.now) {
-    const getWorkflow = (id: string) => this.getWorkflow(id);
     return createRemoteStore(
       this.#db,
       (run) => this.#transaction(run),
-      createAgentOperationStore(this.#db, {
-        // Remote claims and their agent transitions share the enclosing transaction.
-        transaction: (run) => run(),
-        getWorkflow,
-        transition: (id, command) => this.#transition(id, command),
-      }),
-      getWorkflow,
+      // Remote claims and their agent transitions share the enclosing transaction.
+      this.#agentOperationStore((run) => run()),
+      (id) => this.getWorkflow(id),
       now,
     );
   }
 
   agentOperations() {
-    return createAgentOperationStore(this.#db, {
-      transaction: (run) => this.#transaction(run),
-      getWorkflow: (id) => this.getWorkflow(id),
-      transition: (id, command) => this.#transition(id, command),
-    });
+    return this.#agentOperationStore((run) => this.#transaction(run));
   }
 
   fixes(workflowId: string) {
@@ -524,6 +523,7 @@ export class WorkflowStore {
         "INSERT INTO transitions (workflow_id, from_state, to_state, reason, head_sha, created_at) VALUES (?, ?, ?, ?, ?, ?)",
       )
       .run(id, result.from, result.to, result.reason, result.headSha, now);
+    this.#agentOperationStore((run) => run()).retireRevokedRemoteRequests(id);
     if (w.headSha !== current.headSha || w.state === "stopped" || w.state === "escalated")
       this.#db
         .prepare("UPDATE review_runs SET eligible=0 WHERE workflow_id=? AND eligible=1")

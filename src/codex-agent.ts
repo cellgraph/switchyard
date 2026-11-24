@@ -88,7 +88,7 @@ export function createCodexAgent({
       get reference() {
         return reference ? { provider, id: reference } : null;
       },
-      async runTurn({ prompt, outputSchema, signal, onEvent }) {
+      async runTurn({ prompt, outputSchema, signal, checkLaunch, onEvent }) {
         if (signal?.aborted) return { outcome: "interrupted", reason: "Canceled before launch." };
         let completed = false;
         let failure: string | undefined;
@@ -106,10 +106,13 @@ export function createCodexAgent({
           };
         }
         try {
+          checkLaunch?.();
           const { events } = await thread.runStreamed(prompt, {
             ...(signal === undefined ? {} : { signal }),
             ...(outputSchema === undefined ? {} : { outputSchema }),
           });
+          // The SDK starts the provider when its lazy stream is consumed.
+          checkLaunch?.();
           for await (const event of events) {
             receivedEvent = true;
             if (event.type === "thread.started") {

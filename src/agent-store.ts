@@ -193,6 +193,20 @@ export function createAgentOperationStore(
     );
   }
 
+  function retireIfRevoked(operation: AgentOperation): boolean {
+    const { intent } = operation;
+    return (
+      !authorized(getWorkflow(intent.workflowId), intent) &&
+      setStatus(
+        intent.operationId,
+        "requested",
+        "completed",
+        null,
+        "Workflow authorization changed before dispatch.",
+      )
+    );
+  }
+
   return {
     get,
     session,
@@ -208,6 +222,22 @@ export function createAgentOperationStore(
           )
           .get(workflowId),
       );
+    },
+
+    retireRevokedRemoteRequests(workflowId?: string) {
+      transaction(() => {
+        const query = `SELECT t.operation_id FROM remote_turns t JOIN operations o USING(operation_id)
+          WHERE o.status='requested' AND t.prompt IS NOT NULL`;
+        const rows = (
+          workflowId === undefined
+            ? db.prepare(query).all()
+            : db.prepare(query + " AND o.workflow_id=?").all(workflowId)
+        ) as { operation_id: string }[];
+        const clear = db.prepare("UPDATE remote_turns SET prompt=NULL WHERE operation_id=?");
+        for (const { operation_id } of rows) {
+          if (retireIfRevoked(get(operation_id)!)) clear.run(operation_id);
+        }
+      });
     },
 
     request(input: Omit<AgentTurnIntent, "mode" | "workflowRevision">): AgentOperation {
@@ -295,16 +325,7 @@ export function createAgentOperationStore(
         )
           return null;
         const { intent } = operation;
-        if (!authorized(getWorkflow(intent.workflowId), intent)) {
-          setStatus(
-            id,
-            "requested",
-            "completed",
-            null,
-            "Workflow authorization changed before dispatch.",
-          );
-          return null;
-        }
+        if (retireIfRevoked(operation)) return null;
         assertNoLegacyOperation(intent.workflowId);
         const previous = session(intent.workflowId);
         if (previous && previous.remoteWorkerId !== remoteWorkerId) return null;

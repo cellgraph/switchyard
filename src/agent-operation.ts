@@ -88,6 +88,7 @@ export interface AgentOperationWorker {
     previous: AgentSessionBinding | null;
     signal?: AbortSignal;
     authorizeLaunch(): void | Promise<void>;
+    checkLaunch?: () => void;
     refreshLaunch?: () => Promise<void>;
     fixFindingIds?: string[];
     recordExpectedWorktree(worktree: WorktreeLocation): void;

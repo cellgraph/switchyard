@@ -3,6 +3,7 @@ import { once } from "node:events";
 import { rmSync } from "node:fs";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createAgentController } from "../src/agent-controller.ts";
 import type { AgentAdapter } from "../src/agent.ts";
@@ -167,6 +168,117 @@ it("waits for matching model, provider and repository and claims only once", () 
     workerId: "claude",
     waitingForCapacity: false,
   });
+});
+
+it.each(["reconciliation", "sweep"])(
+  "retires a revoked queued turn during %s with no eligible worker",
+  (boundary) => {
+    const stale = enqueue();
+    const newHead = "c".repeat(40);
+    if (boundary === "reconciliation") {
+      store.transition(fixture.workflow.id, { type: "head_changed", sha: newHead });
+    } else {
+      // Simulate a stale queue left by a controller that predates transition-time retirement.
+      using db = new DatabaseSync(fixture.db);
+      db.prepare("UPDATE workflows SET head_sha=? WHERE id=?").run(newHead, fixture.workflow.id);
+      remote().expire();
+    }
+
+    expect(store.agentOperations().get(stale.intent.operationId)).toMatchObject({
+      status: "completed",
+      error: "Workflow authorization changed before dispatch.",
+    });
+    using db = new DatabaseSync(fixture.db, { readOnly: true });
+    expect(
+      db
+        .prepare("SELECT prompt FROM remote_turns WHERE operation_id=?")
+        .get(stale.intent.operationId),
+    ).toEqual({ prompt: null });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM remote_attempts").get()).toEqual({ count: 0 });
+    expect(store.agentOperations().session(fixture.workflow.id)).toBeNull();
+    expect(
+      remote().enqueue(
+        {
+          ...fixture.request,
+          operationId: "fresh-turn",
+          expectedHead: newHead,
+          expectedPullRequestHead: newHead,
+        },
+        codex,
+        90_000,
+      ).status,
+    ).toBe("requested");
+  },
+);
+
+it("does not launch the provider when synchronous post-grant verification overruns the deadline", async () => {
+  const url = await listen();
+  const manager = createWorktreeManager({
+    repositoryDirectory: fixture.repo,
+    worktreeRoot: fixture.worktrees,
+  });
+  let checkpoints = 0;
+  const worktrees = {
+    ...manager,
+    checkpoint(...args: Parameters<typeof manager.checkpoint>) {
+      if (++checkpoints === 2) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1100);
+        now += 1100;
+      }
+      return manager.checkpoint(...args);
+    },
+  };
+  const runTurn = vi.fn(async () => ({ outcome: "completed" as const, response: "Too late." }));
+  const open = vi.fn(() => ({ reference: null, runTurn }));
+  const profile: RemoteProfile = {
+    ...codex,
+    repository: "owner/repo",
+    locate: worktrees.locate,
+    worker: {
+      runtime: () => runtime(),
+      configurationId: "fake-worker",
+      ...createLocalAgentExecution(
+        worktrees,
+        { startSession: open, resumeSession: open },
+        () => checkpoint,
+        true,
+      ),
+    },
+  };
+  enqueue(codex, 1000);
+  const abort = new AbortController();
+  const log = vi.fn();
+  const task = runRemoteWorker({
+    capabilities: caps(),
+    profiles: [profile],
+    signal: abort.signal,
+    request: remoteClient(url, "mac", token),
+    pollMs: 5,
+    log(event) {
+      log(event);
+      if (event.event === "remote_completion") abort.abort();
+    },
+  });
+  try {
+    await vi.waitFor(
+      () =>
+        expect(log).toHaveBeenCalledWith(
+          expect.objectContaining({ event: "remote_completion", result: "expired" }),
+        ),
+      { timeout: 3000 },
+    );
+  } finally {
+    abort.abort();
+    await task;
+  }
+  expect(checkpoints).toBe(2);
+  expect(open).not.toHaveBeenCalled();
+  expect(runTurn).not.toHaveBeenCalled();
+  expect(store.agentOperations().get(fixture.request.operationId)).toMatchObject({
+    status: "unknown",
+    evidence: { launchAuthorizedAt: expect.any(String) },
+  });
+  expect(store.agentOperations().session(fixture.workflow.id)?.status).toBe("held");
 });
 
 it("renews a lease across a controller restart and commits terminal evidence only once", () => {
