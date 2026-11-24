@@ -19,7 +19,7 @@ No review comments is not evidence of a completed clean review. A new head commi
 
 ## Status
 
-The local workflow store, GitHub App integration, durable local agent sessions, and durable review evidence are implemented. See the [review operations guide](docs/reviews.md) for review runs, finding decisions, and GitHub synchronization. See the [local agent session guide](docs/agent-sessions.md) for running and recovering a Codex turn. See [CONTEXT.md](CONTEXT.md), [the architecture](docs/architecture.md), [ADR-0001](docs/adr/0001-local-controller-and-agent-boundary.md), and [implementation plan 001](docs/plans/001-pr-review-loop.md) for the current decisions and next steps.
+The local workflow store, GitHub App integration, durable local agent sessions, and durable review evidence are implemented. See the [review operations guide](docs/reviews.md) for review runs, finding decisions, and GitHub synchronization. See the [local agent session guide](docs/agent-sessions.md) for running and recovering a Codex turn. See the [distributed worker guide](docs/distributed-workers.md) for remote read-only turns with Codex or Claude Code. See [CONTEXT.md](CONTEXT.md), [the architecture](docs/architecture.md), [ADR-0001](docs/adr/0001-local-controller-and-agent-boundary.md), and [implementation plan 001](docs/plans/001-pr-review-loop.md) for the current decisions and next steps.
 
 ## Development environment
 

@@ -25,7 +25,7 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
     target: WorktreeTarget,
     previous?: WorkerSessionReference,
     requireNew = false,
-    beforeLaunch?: () => void,
+    beforeLaunch?: () => void | Promise<void>,
     checkout?: Worktree,
   ) {
     const expected = previous?.worktree ?? checkout;
@@ -65,12 +65,24 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
             workspace: before,
           };
 
-        beforeLaunch?.();
+        const authorization = beforeLaunch?.();
+        if (authorization) {
+          await authorization;
+          worktrees.validate(worktree, expectedHead);
+        }
+        if (turn.signal?.aborted)
+          return {
+            agent: { outcome: "interrupted", reason: "Canceled before launch." },
+            workspace: before,
+          };
+        // Synchronous checkout verification can delay the abort timer.
+        turn.checkLaunch?.();
         session ??= openAgentSession();
         active.add(worktree.path);
         try {
           let result: AgentTurnResult;
           try {
+            turn.checkLaunch?.();
             result = await session.runTurn(turn);
           } catch {
             result = {
@@ -104,13 +116,13 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
     startSession: (
       target: WorktreeTarget,
       requireNew = false,
-      beforeLaunch?: () => void,
+      beforeLaunch?: () => void | Promise<void>,
       checkout?: Worktree,
     ) => openSession(target, undefined, requireNew, beforeLaunch, checkout),
     resumeSession: (
       target: WorktreeTarget,
       reference: WorkerSessionReference,
-      beforeLaunch?: () => void,
+      beforeLaunch?: () => void | Promise<void>,
     ) => openSession(target, reference, false, beforeLaunch),
   };
 }

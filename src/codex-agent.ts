@@ -57,10 +57,12 @@ export function createCodexAgent({
   model,
   codexHome,
   apiKey,
+  readOnly = false,
 }: {
   model: string;
   codexHome: string;
   apiKey?: string;
+  readOnly?: boolean;
 }): AgentAdapter {
   if (!model.trim()) throw new Error("A Codex model must be configured.");
   if (!isAbsolute(codexHome)) throw new Error("Codex home must be an absolute path.");
@@ -77,6 +79,7 @@ export function createCodexAgent({
       workingDirectory,
       model,
       ...codexTurnPolicy,
+      ...(readOnly ? { sandboxMode: "read-only" } : {}),
     };
     const thread = id ? codex.resumeThread(id, options) : codex.startThread(options);
     let reference = id ?? null;
@@ -85,7 +88,7 @@ export function createCodexAgent({
       get reference() {
         return reference ? { provider, id: reference } : null;
       },
-      async runTurn({ prompt, outputSchema, signal, onEvent }) {
+      async runTurn({ prompt, outputSchema, signal, checkLaunch, onEvent }) {
         if (signal?.aborted) return { outcome: "interrupted", reason: "Canceled before launch." };
         let completed = false;
         let failure: string | undefined;
@@ -103,10 +106,13 @@ export function createCodexAgent({
           };
         }
         try {
+          checkLaunch?.();
           const { events } = await thread.runStreamed(prompt, {
             ...(signal === undefined ? {} : { signal }),
             ...(outputSchema === undefined ? {} : { outputSchema }),
           });
+          // The SDK starts the provider when its lazy stream is consumed.
+          checkLaunch?.();
           for await (const event of events) {
             receivedEvent = true;
             if (event.type === "thread.started") {

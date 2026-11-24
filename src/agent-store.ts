@@ -43,7 +43,7 @@ export function recoverAgentOperations(db: DatabaseSync) {
   const claims = db
     .prepare(
       `SELECT operation_id, workflow_id, owner_pid FROM operations
-     WHERE kind='durable_agent_turn' AND status IN ('dispatching','running')`,
+     WHERE kind='durable_agent_turn' AND status IN ('dispatching','running') AND json_extract(input, '$.remote') IS NULL`,
     )
     .all() as { operation_id: string; workflow_id: string; owner_pid: number | null }[];
   const holdSession = db.prepare(
@@ -193,6 +193,20 @@ export function createAgentOperationStore(
     );
   }
 
+  function retireIfRevoked(operation: AgentOperation): boolean {
+    const { intent } = operation;
+    return (
+      !authorized(getWorkflow(intent.workflowId), intent) &&
+      setStatus(
+        intent.operationId,
+        "requested",
+        "completed",
+        null,
+        "Workflow authorization changed before dispatch.",
+      )
+    );
+  }
+
   return {
     get,
     session,
@@ -208,6 +222,22 @@ export function createAgentOperationStore(
           )
           .get(workflowId),
       );
+    },
+
+    retireRevokedRemoteRequests(workflowId?: string) {
+      transaction(() => {
+        const query = `SELECT t.operation_id FROM remote_turns t JOIN operations o USING(operation_id)
+          WHERE o.status='requested' AND t.prompt IS NOT NULL`;
+        const rows = (
+          workflowId === undefined
+            ? db.prepare(query).all()
+            : db.prepare(query + " AND o.workflow_id=?").all(workflowId)
+        ) as { operation_id: string }[];
+        const clear = db.prepare("UPDATE remote_turns SET prompt=NULL WHERE operation_id=?");
+        for (const { operation_id } of rows) {
+          if (retireIfRevoked(get(operation_id)!)) clear.run(operation_id);
+        }
+      });
     },
 
     request(input: Omit<AgentTurnIntent, "mode" | "workflowRevision">): AgentOperation {
@@ -234,6 +264,12 @@ export function createAgentOperationStore(
           mode: workflow.state,
           workflowRevision: workflowRevision(workflow.id),
         };
+        if (intent.remote && (intent.fix || intent.mode !== "awaiting_review"))
+          throw new Error(
+            "Remote turns require a PR awaiting review and explicit standalone authorization.",
+          );
+        if (intent.remote && intent.expectedHead !== intent.expectedPullRequestHead)
+          throw new Error("Remote checkout and pull request heads must match.");
         if (!eligible(workflow, intent) || !fixAgentAuthorized(db, workflow, intent))
           throw new Error("Workflow head or fix authorization does not match the request.");
         assertNoLegacyOperation(workflow.id);
@@ -256,6 +292,8 @@ export function createAgentOperationStore(
             .get(workflow.id, workflow.id)
         )
           throw new Error("Legacy agent session or worktree requires inspection before dispatch.");
+        if (previous && Boolean(previous.remoteWorkerId) !== Boolean(intent.remote))
+          throw new Error("The agent session belongs to a different execution location.");
         if (previous?.status === "held" || previous?.status === "starting")
           throw new Error("Agent session requires manual reconciliation.");
         if (!previous && intent.mode === "fixing" && !workflow.review?.runId)
@@ -278,28 +316,26 @@ export function createAgentOperationStore(
       });
     },
 
-    claim(id: string): { previous: AgentSessionBinding | null } | null {
+    claim(id: string, remoteWorkerId?: string): { previous: AgentSessionBinding | null } | null {
       return transaction(() => {
         const operation = get(id);
-        if (operation?.status !== "requested") return null;
-        const { intent } = operation;
-        if (!authorized(getWorkflow(intent.workflowId), intent)) {
-          setStatus(
-            id,
-            "requested",
-            "completed",
-            null,
-            "Workflow authorization changed before dispatch.",
-          );
+        if (
+          operation?.status !== "requested" ||
+          Boolean(operation.intent.remote) !== Boolean(remoteWorkerId)
+        )
           return null;
-        }
+        const { intent } = operation;
+        if (retireIfRevoked(operation)) return null;
         assertNoLegacyOperation(intent.workflowId);
         const previous = session(intent.workflowId);
+        if (previous && previous.remoteWorkerId !== remoteWorkerId) return null;
         if (!setStatus(id, "requested", "dispatching", operation.evidence)) return null;
-        db.prepare("UPDATE operations SET owner_pid=? WHERE operation_id=?").run(process.pid, id);
+        if (!remoteWorkerId)
+          db.prepare("UPDATE operations SET owner_pid=? WHERE operation_id=?").run(process.pid, id);
         if (!previous) {
           const now = new Date().toISOString();
           saveSession(intent.workflowId, {
+            ...(remoteWorkerId ? { remoteWorkerId } : {}),
             initialOperationId: id,
             lastOperationId: id,
             status: "starting",
@@ -327,22 +363,19 @@ export function createAgentOperationStore(
       });
     },
 
-    authorizeLaunch(id: string): void {
-      transaction(() => {
+    authorizeLaunch(id: string): boolean {
+      return transaction(() => {
         const operation = get(id);
         if (
           operation?.status !== "running" ||
           operation.evidence?.launchAuthorizedAt ||
           !authorized(getWorkflow(operation.intent.workflowId), operation.intent)
         )
-          throw new Error("Workflow authorization changed before the agent launched.");
-        if (
-          !setStatus(id, "running", "running", {
-            ...operation.evidence,
-            launchAuthorizedAt: new Date().toISOString(),
-          })
-        )
-          throw new Error("Agent operation lost its dispatch authorization.");
+          return false;
+        return setStatus(id, "running", "running", {
+          ...operation.evidence,
+          launchAuthorizedAt: new Date().toISOString(),
+        });
       });
     },
 

@@ -34,6 +34,7 @@ type Options = {
   timeoutMs: number;
   maxBudgetUsd?: number;
   allowedPaths?: string[];
+  readOnly?: boolean;
 };
 
 export function claudeEditRules(paths: string[] | undefined) {
@@ -67,6 +68,12 @@ export function claudeEditRules(paths: string[] | undefined) {
   return { allow, deny };
 }
 
+function enabledTools(options: Options) {
+  return options.readOnly
+    ? fileTools.filter((tool) => tool !== "Edit" && tool !== "Write")
+    : fileTools;
+}
+
 function command(
   options: Options,
   turn: AgentTurn,
@@ -87,7 +94,7 @@ function command(
     "--no-chrome",
     "--strict-mcp-config",
     "--tools",
-    fileTools.join(","),
+    enabledTools(options).join(","),
     "--allowedTools",
     allow.join(","),
     "--permission-mode",
@@ -205,7 +212,9 @@ function launchIssue(options: Options, directory: string): string | undefined {
 }
 
 export function createClaudeAgent(options: Options, apiKey: string): AgentAdapter {
-  const rules = claudeEditRules(options.allowedPaths);
+  const rules = options.readOnly
+    ? { allow: enabledTools(options), deny: ["Edit", "Write", "Read(.git)"] }
+    : claudeEditRules(options.allowedPaths);
   // Using the supported key helper keeps provider policy delivery off for this profile
   // and requires the CLI to load the same settings document as the permission rules.
   const env = { ...claudeEnvironment(options.home), SWITCHYARD_CLAUDE_API_KEY: apiKey };
@@ -233,8 +242,10 @@ export function createClaudeAgent(options: Options, apiKey: string): AgentAdapte
           };
         }
         const session = confirmedId ? ["--resume", transcript] : ["--session-id", id];
+        const args = command(options, turn, session, rules);
+        turn.checkLaunch?.();
         return new Promise<AgentTurnResult>((resolve) => {
-          const child = spawn(options.executable, command(options, turn, session, rules), {
+          const child = spawn(options.executable, args, {
             cwd: directory,
             env,
             detached: true,
@@ -301,7 +312,7 @@ export function createClaudeAgent(options: Options, apiKey: string): AgentAdapte
                 !event.tools.every(
                   (tool) =>
                     typeof tool === "string" &&
-                    (fileTools.includes(tool) ||
+                    (enabledTools(options).includes(tool) ||
                       (turn.outputSchema !== undefined && internalTools.has(tool))),
                 ) ||
                 !Array.isArray(event.mcp_servers) ||

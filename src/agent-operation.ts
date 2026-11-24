@@ -22,6 +22,7 @@ export type AgentTurnRequest = {
 };
 
 export type AgentTurnIntent = Omit<AgentTurnRequest, "prompt"> & {
+  remote?: { provider: "codex" | "claude-code"; model: string; timeoutMs: number };
   promptDigest: string;
   configurationId: string;
   workflowRevision: number;
@@ -64,6 +65,7 @@ export type AgentOperation = {
 };
 
 export type AgentSessionBinding = {
+  remoteWorkerId?: string;
   initialOperationId: string;
   lastOperationId: string;
   status: "starting" | "active" | "held";
@@ -85,7 +87,8 @@ export interface AgentOperationWorker {
     prompt: string;
     previous: AgentSessionBinding | null;
     signal?: AbortSignal;
-    authorizeLaunch(): void;
+    authorizeLaunch(): void | Promise<void>;
+    checkLaunch?: () => void;
     refreshLaunch?: () => Promise<void>;
     fixFindingIds?: string[];
     recordExpectedWorktree(worktree: WorktreeLocation): void;

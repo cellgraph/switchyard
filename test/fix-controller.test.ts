@@ -247,6 +247,99 @@ describe("bounded single-PR fixes", () => {
     store.recover();
   }
 
+  function completeRemoteTurn() {
+    const remote = store.remoteWorkers();
+    const provider = { provider: "codex", model: "fixture" } as const;
+    remote.enqueue(fixture.request, provider, 90_000);
+    remote.register("mac", {
+      platform: "darwin",
+      architecture: "arm64",
+      isolation: "linked-worktree",
+      sandbox: "read-only",
+      concurrency: 1,
+      profiles: [{ ...provider, repository: "owner/repo" }],
+    });
+    const task = remote.claim("mac", "instance")!;
+    const key = { operationId: task.intent.operationId, fence: task.fence, instance: "instance" };
+    const location = worktrees.locate({
+      workflowId,
+      branch: task.intent.branch,
+      expectedHead: task.intent.expectedHead,
+    });
+    const checkout = { ...location, checkoutIdentity: "remote-checkout" };
+    expect(
+      remote.start(
+        "mac",
+        key,
+        {
+          ...provider,
+          sdkVersion: "fixture",
+          cliVersion: "fixture",
+          home: fixture.root,
+          configuration: "fixture",
+        },
+        location,
+      ),
+    ).toBe(true);
+    expect(remote.launch("mac", key, checkout)).toBe(true);
+    expect(
+      remote.complete("mac", key, {
+        agent: { outcome: "completed" },
+        reference: { worktree: checkout, agent: { provider: "codex", id: "remote-session" } },
+        workspace: { head: task.intent.expectedHead, changedPaths: [] },
+        checkpoint: { workspace: "fixture", session: { identity: "fixture", digest: "fixture" } },
+      }),
+    ).toEqual({ status: "completed", error: false });
+  }
+
+  it("does not offer a local fix proposal for a remote-bound session", async () => {
+    completeRemoteTurn();
+    review("review-1", "accepted");
+    const result = await controller().advance();
+    expect(result.cycles).toEqual([]);
+    expect(result.nextAction).toContain("remote session");
+    expect(result.nextAction).toContain("manually");
+    expect(launches).toBe(0);
+  });
+
+  it("rejects approval of a legacy local proposal with a remote-bound session", async () => {
+    completeRemoteTurn();
+    // An older release could persist this proposal before the placement guard.
+    const db = new DatabaseSync(fixture.db);
+    const result = db
+      .prepare("SELECT execution FROM agent_sessions WHERE workflow_id=?")
+      .get(workflowId)!;
+    db.prepare(
+      "UPDATE agent_sessions SET execution=json_remove(execution, '$.remoteWorkerId') WHERE workflow_id=?",
+    ).run(workflowId);
+    review("review-1", "accepted");
+    await controller().advance();
+    const proposal = current();
+    db.prepare("UPDATE agent_sessions SET execution=? WHERE workflow_id=?").run(
+      result.execution!,
+      workflowId,
+    );
+    db.close();
+
+    expect(() => authorizeFix(store, workflowId, proposal.id, false)).toThrow(
+      /remote session.*manually/i,
+    );
+    expect(current().phase).toBe("proposed");
+    expect(launches).toBe(0);
+  });
+
+  it("allows a fresh local fix proposal after an unclaimed remote turn loses authorization", async () => {
+    store.remoteWorkers().enqueue(fixture.request, { provider: "codex", model: "fixture" }, 90_000);
+    git(fixture.repo, "commit", "--allow-empty", "-m", "new PR head");
+    observedHead = git(fixture.repo, "rev-parse", "HEAD");
+    await controller().advance();
+    review("review-1", "accepted");
+    const result = await controller().advance();
+    expect(result.cycles.at(-1)?.phase).toBe("proposed");
+    expect(store.agentOperations().session(workflowId)).toBeNull();
+    expect(launches).toBe(0);
+  });
+
   it("waits for both operator approvals and drains claimed operations without replay across worker runs", async () => {
     const push = vi.fn(repository.push.bind(repository));
     const gitBoundary = { ...repository, push };

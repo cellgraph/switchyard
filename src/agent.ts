@@ -12,6 +12,7 @@ export type AgentTurn = {
   prompt: string;
   outputSchema?: Record<string, unknown>;
   signal?: AbortSignal;
+  checkLaunch?: () => void;
   onEvent?: (event: AgentEvent) => void;
 };
 
