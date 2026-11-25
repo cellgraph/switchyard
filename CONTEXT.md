@@ -18,9 +18,9 @@ Switchyard never automatically merges a pull request. The first milestone suppor
 - Persist workflow state before and after external side effects, make webhook handling idempotent, and provide recovery after process restarts.
 - Attach all review and CI evidence to exact commit SHAs.
 - Never infer a clean review from missing comments, missing review records, or elapsed time.
-- Restrict credentials and agent execution permissions to the minimum needed.
+- Let the operator provision credentials and permissions on trusted execution hosts. Keep workflow authorization and evidence checks in Switchyard. See [ADR-0005](docs/adr/0005-trusted-execution-environments.md).
 - Keep controller and worker responsibilities logically separate, while using one process and local worker initially.
-- Add a vendor-neutral agent boundary only where it enables Codex now and makes a credible future Claude Code adapter possible.
+- Extend the agent boundary when a supported provider or workflow demonstrates the need.
 - Prefer concrete implementations, functions, explicit errors, and comments that explain why.
 
 ## Initial technology direction
