@@ -21,7 +21,7 @@ Omit `codexHome` for Claude Code requests. A request without `provider` or with 
 
 ## Current permissions
 
-The setup and smoke tests in this guide describe the shipped API-key adapter. [ADR-0005](adr/0005-trusted-execution-environments.md) sets the direction for the [proposed subscription follow-up](plans/002-claude-code-authentication.md). Keep using the current flags and profile requirements for this version.
+The setup and smoke tests in this guide describe the shipped API-key adapter. [ADR-0005](adr/0005-trusted-execution-environments.md) sets the direction for the [proposed subscription follow-up](plans/002-claude-code-authentication.md). Keep using the current flags and profile requirements for this version. The implementation follow-up will replace this setup and its smoke tests with instructions for the single native launcher and explicit authentication modes.
 
 Claude Code's OS sandbox wraps its Bash tool. This adapter uses restricted mode and a file-tool allowlist, with Bash and other command, browser, subagent, and network tools excluded. It uses `dontAsk` with no permission responder, disables custom hooks and connectors, loads no user or repository settings, and supplies an empty MCP configuration by using strict MCP mode with no servers. Switchyard checks that the initialization frame reports the expected checkout, executable version, key source, permissions, and tools before accepting evidence. The CLI itself communicates with Anthropic. [Claude Code sandboxing](https://code.claude.com/docs/en/sandboxing) · [Claude Code permissions](https://code.claude.com/docs/en/permissions)
 

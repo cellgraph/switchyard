@@ -131,7 +131,7 @@ Automated coverage uses fake provider sessions and loopback transport. The [cred
 
 ### Follow-up before Phase 5.6C
 
-Follow [ADR-0005](../adr/0005-trusted-execution-environments.md) and review the [Claude Code authentication plan](002-claude-code-authentication.md). Pending operator approval, prove a native subscription turn on the Mac mini, simplify the Claude launch around native runtime policy, and retain API-key compatibility. Verify review checkout invariants, session continuity, cancellation and recovery locally and across the existing Mac mini and exe.dev worker setup. Record credentialed results and return to Phase 5.6C.
+Follow [ADR-0005](../adr/0005-trusted-execution-environments.md) and review the [Claude Code authentication plan](002-claude-code-authentication.md). Pending operator approval, prove a native subscription turn on the Mac mini, replace the Claude launcher with a single native path that requires explicit subscription or API-key authentication. Verify review checkout invariants, session continuity, cancellation and recovery locally and across the existing Mac mini and exe.dev worker setup. Record credentialed results and return to Phase 5.6C.
 
 ### Remaining phases
 

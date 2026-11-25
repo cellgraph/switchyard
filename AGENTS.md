@@ -16,6 +16,7 @@ Apply these principles when planning, implementing, and reviewing changes.
 
 - Prefer the simplest solution that satisfies current requirements.
 - Introduce abstractions when a demonstrated need calls for them.
+- Add backward compatibility or migrations only when existing deployments, persisted data, or consumers require them. During early development, replace obsolete implementations directly.
 - Prefer native tool and runtime capabilities to duplicating them in Switchyard.
 - Delegate responsibilities to the execution environment and native runtime where practical.
 - Assume trusted, operator-controlled infrastructure unless an explicit requirement establishes a different trust model.
