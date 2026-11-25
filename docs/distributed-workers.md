@@ -4,6 +4,12 @@ The controller host can run an execution listener alongside its normal GitHub po
 
 Phase 5.6B supports explicitly authorized, read-only turns on PRs awaiting review. Codex uses its read-only sandbox with approval and agent network access disabled. Claude Code uses the existing restricted profile with only read tools. The worker checks the checkout and transcript locally and the controller checks the bound checkout identity, exact commit, runtime, workflow revision, and empty changed paths before confirming success. Provider transcripts remain on the worker. Run local implementation, validation and publication through the existing fix loop on workflows without a remote session binding. For a workflow with a remote session, address findings manually or use a new workflow with a local session. The controller checks placement before proposing or approving a local fix.
 
+### Trust and proposed review behavior
+
+Run workers on trusted hosts that you control. The [execution responsibility ADR](adr/0005-trusted-execution-environments.md) requires review instructions to leave the checkout unchanged and rejection of results when the checkout changes. Runtime permissions remain the operator's responsibility. A clean checkout is evidence about the observed checkout only. Provider-side or external actions can survive rejection or cancellation, and controller publication approval covers only controller actions.
+
+The registration and test instructions below describe Phase 5.6B as shipped. The [Claude authentication follow-up](plans/002-claude-code-authentication.md) proposes relying on native Claude permissions while keeping the worktree, session, routing, and lease checks. Until that work ships, the native flags described above still apply.
+
 ## Controller setup
 
 Run these commands on the controller host as the account that owns the Switchyard database. Generate a fresh 32-byte random token for each worker, such as with `openssl rand -hex 32`. Save the token in the worker's secret store. Compute the SHA-256 digest of the exact hex string without a trailing newline, and place only that digest in the controller configuration. Keep the bearer token out of config files, command arguments, prompts and logs.

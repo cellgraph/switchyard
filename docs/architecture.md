@@ -2,6 +2,10 @@
 
 This document describes the smallest architecture that supports the first Codex/GitHub pull request loop while leaving a path to other agents and remote workers. The decisions here are recorded in [ADR-0001](adr/0001-local-controller-and-agent-boundary.md); unresolved assumptions are explicit so they can be verified in later phases.
 
+## Execution responsibility
+
+Switchyard trusts operator-controlled workers to run their configured native providers and report evidence. Switchyard owns coordination, lifecycle, and the evidence and authorization for controller actions. The execution environment owns the permissions and extensions available to an agent. See [ADR-0005](adr/0005-trusted-execution-environments.md) for the review contract and the limits of checkout verification.
+
 ## Components
 
 ```text
@@ -99,7 +103,7 @@ The controller checks the process ID recorded with each agent claim at startup a
 
 ## Claude Code provider
 
-Phase 5.6A selects the provider at the local worker boundary from the explicit request or the saved fix-cycle configuration. Claude Code uses a pinned noninteractive CLI with restricted file tools and explicit edit scopes. Codex uses its own workspace-write sandbox and indexed rollouts. Both return opaque session references and normalized outcomes and usage. The worker checkpoints provider artifacts alongside the same linked checkout, and both go through the same database claims, exact-head authorization, and recovery rules. The GitHub review adapter continues to collect independent review evidence. See [ADR-0004](adr/0004-local-claude-code-provider.md) and the [Claude Code operating guide](claude-code.md).
+Phase 5.6A selects the provider at the local worker boundary from the explicit request or the saved fix-cycle configuration. The shipped Claude adapter uses a pinned noninteractive CLI with restricted file tools and explicit edit scopes. The [authentication follow-up](plans/002-claude-code-authentication.md) proposes delegating runtime policy to Claude and the operator. Codex uses its own workspace-write sandbox and indexed rollouts. Both return opaque session references and normalized outcomes and usage. The worker checkpoints provider artifacts alongside the same linked checkout, and both go through the same database claims, exact-head authorization, and recovery rules. The GitHub review adapter continues to collect independent review evidence. See [ADR-0004](adr/0004-local-claude-code-provider.md) and the [Claude Code operating guide](claude-code.md).
 
 ## Bounded review and fix cycles
 

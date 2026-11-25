@@ -129,6 +129,10 @@ Run explicitly authorized, read-only agent turns on eligible workers using the e
 
 Automated coverage uses fake provider sessions and loopback transport. The [credentialed execution record](../distributed-workers.md#credentialed-execution-record) describes the live Codex completion and tunnel disconnect tests on the Mac mini and exe.dev. Remote edit candidates, validation and publication are deferred pending a design for independently verifying and transferring candidate artifacts. Controller-local fixes retain their existing execution path.
 
+### Follow-up before Phase 5.6C
+
+Follow [ADR-0005](../adr/0005-trusted-execution-environments.md) and review the [Claude Code authentication plan](002-claude-code-authentication.md). Pending operator approval, prove a native subscription turn on the Mac mini, replace the Claude launcher with a single native path that requires explicit subscription or API-key authentication. Verify review checkout invariants, session continuity, cancellation and recovery locally and across the existing Mac mini and exe.dev worker setup. Record credentialed results and return to Phase 5.6C.
+
 ### Remaining phases
 
 - Phase 5.6C covers an independent adjudicator.

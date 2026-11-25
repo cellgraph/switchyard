@@ -2,7 +2,11 @@
 
 Switchyard coordinates coding agents through the lifecycle of a software change. Its first milestone automates the Codex review and fix loop for GitHub pull requests: it waits for a review of the exact PR head, resumes the implementation session when that review has actionable findings, and stops for human approval when review and required checks are clean. Switchyard never merges a pull request.
 
-The longer-term project is a small orchestration system that can coordinate different coding agents and local or remote execution workers. The first implementation stays focused on one agent, GitHub, and a local macOS controller.
+## Scope and trust
+
+Switchyard is a personal orchestration tool for trusted, operator-controlled hosts. It coordinates workflows, selects agents and workers, and verifies worktree and session evidence. The operator provisions the host and native runtime, including credentials, permissions and extensions. Multitenant isolation and runtime policy administration are outside the project scope.
+
+Review turns expect an unchanged checkout. Switchyard can reject a result when the checkout differs, but that check cannot prevent or undo external side effects. Publication approvals gate actions the controller performs. An agent can act independently wherever the host and native runtime give it permission. See the [execution responsibility ADR](docs/adr/0005-trusted-execution-environments.md).
 
 ## First milestone
 

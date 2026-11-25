@@ -1,6 +1,6 @@
 # ADR-0004: Run Claude Code through the local agent boundary
 
-- Status: Accepted for Phase 5.6A
+- Status: Accepted for Phase 5.6A. [ADR-0005](0005-trusted-execution-environments.md) supersedes the execution-policy portions of decision 2. The original launcher described here is still implemented.
 - Date: 2026-11-22
 
 ## Context
@@ -16,4 +16,4 @@ The local worker and durable session binding now need to support a second implem
 
 ## Consequences
 
-Claude Code can read and edit files through its restricted tool API. Fixes that require commands during implementation need a provider with a supported shell boundary. Both providers leave Git publication to the separately authorized controller path. The Claude CLI pin requires renewed permission and transcript verification before an upgrade. A changed provider runtime or interrupted turn holds the existing binding. Remote worker identity and fencing remain a later phase.
+Claude Code can read and edit files through its restricted tool API. Fixes that require commands during implementation need a provider with a supported shell boundary. The controller publishes only through its separately authorized path. Agent actions follow the permissions of the native environment. The Claude CLI pin requires renewed permission and transcript verification before an upgrade. A changed provider runtime or interrupted turn holds the existing binding. Remote worker identity and fencing remain a later phase.
