@@ -20,11 +20,17 @@ Run a persistent VM controller with SQLite. Place agent assignments explicitly o
 
 ### Native agent interfaces and records
 
-The official Codex SDK and native Claude Code CLI are the first adapters. They start or continue native sessions, submit a prompt with an optional structured response schema, report status, results and failures, and support cancellation where available. The workflow defines the assignment and validates its result. Native tools, permissions and capabilities can vary by provider. Authentication, subscriptions, credentials, usage and billing belong to the native runtime and operator. Authentication failures follow ordinary execution failure handling.
+The official Codex SDK and native Claude Code CLI are the first adapters. Keep the narrow start and resume contract. Adapters submit a prompt with an optional structured response schema, report the native session ID and execution outcome, and request cancellation where supported. Native tools, permissions and results can vary by provider. The execution subsystem is independent of software development workflow policy. Concrete workflows own assignment semantics, lifecycle and result validation. They supply assignment identifiers and execution inputs. A shared assignment entity or table requires a demonstrated need from a concrete workflow.
+
+Introduce named agent configurations when concrete placement and role requirements emerge in Phases C and D. A configuration can specify how Switchyard communicates with an agent, including the mechanism, placement, runtime, model and invocation context.
+
+Logical agent identity identifies an agent in the workflow. Native session identity refers to a runtime conversation. Execution identity identifies one dispatch attempt. External identity governs how actions are attributed and authorized in systems such as GitHub. Native authentication, credentials, authorization, subscriptions, billing and external identity management belong to the execution environment and its operator. Authentication failures follow ordinary execution outcome handling. Identity provisioning and credential management stay outside Switchyard. Revisit attribution and appropriately scoped access during distributed execution and autonomous role design.
 
 Native agents and their execution environments own worktree creation, selection, use and cleanup as well as checkout and validation activity. Switchyard may pass a working directory or other invocation context when the native interface needs it. It uses Git and GitHub evidence where relevant to workflow decisions. It has no worktree management, recursive checkpoints, filesystem identity checks, ignored-file tracking or checkout attestation. Supported native session interfaces replace internal database inspection, transcript hashing, configuration fingerprints and exact-version continuation gates.
 
 Record native sessions separately from individual execution attempts. Sessions can serve multiple assignments, and roles can maintain independent sessions within a workflow. Store native session IDs, assignment IDs, placement and execution context, timestamps, status and decision-relevant outcomes. Preserve substantive prompts, responses, streams and transcripts in the native environments. SQLite explains decisions through coordination metadata, evidence references and history.
+
+Retain five execution states: `running`, `not_started`, `completed`, `failed` and `unknown`. A new state requires a demonstrated, distinct coordination decision.
 
 ### GitHub and the first workflow
 
@@ -42,7 +48,9 @@ Unresolved accepted findings and failed required CI can trigger the same Impleme
 
 ### Recovery, remote execution and operator control
 
-Reconcile and continue when an authoritative system establishes the outcome. Retry known non-execution within workflow limits. Pause for operator intervention when the outcome remains uncertain. Use supported native inspection and continuation where appropriate. A timeout, disconnect or new PR head alone cannot justify replay.
+Prefer reconciliation from authoritative evidence where practical. Retry known non-execution within workflow limits. When uncertainty remains, pause for operator-directed recovery. An assisting agent can inspect Switchyard, native runtimes, Git and GitHub through supported interfaces. A timeout, disconnect or new PR head alone cannot justify replay.
+
+External evidence may establish that a workflow reached its objective while the native execution outcome remains unknown. Preserve that distinction and keep protections against duplicate work and unsafe continuation while execution may still be ongoing. Native session abandonment may become an operator fallback if it preserves those protections. Learn from actual operating problems before adding recovery mechanisms. Comprehensive provider-specific recovery is outside scope.
 
 Investigate Superlogical Rex before selecting the distributed execution implementation. The spike can establish that Rex replaces the existing worker, supplies primitives for a thinner worker, or is unsuitable. If unsuitable, reassess the existing HTTP protocol against explicit placement, outcome reporting and conservative recovery. This decision gates distributed implementation and leaves local execution and GitHub reconciliation work free to proceed.
 
