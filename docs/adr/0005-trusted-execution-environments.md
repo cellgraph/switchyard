@@ -1,7 +1,7 @@
 # ADR-0005: Trust operator-controlled execution environments
 
-- Status: Accepted architectural direction. Implementation pending operator approval of [Plan 002](../plans/002-claude-code-authentication.md).
-- Supersession: [ADR-0006](0006-orchestrate-through-native-tools.md) supersedes parts of this record. See its prior decisions table for details.
+- Original status: Accepted architectural direction.
+- Current status: Operator ownership of native environments remains accepted. [ADR-0006](0006-orchestrate-through-native-tools.md#prior-decisions-superseded) supersedes the original controller checkout, publication and lease requirements and the Plan 002 rollout.
 - Date: 2026-11-24
 
 ## Context
@@ -19,4 +19,4 @@ Switchyard is a personal orchestration tool. The original Claude adapter prescri
 
 A checkout comparison observes the final state. It cannot detect every temporary write or prevent or undo side effects outside the checkout, such as network requests, file writes elsewhere, commits pushed independently, or actions by remote extensions. Process cancellation applies to the process group Switchyard starts. The operator must configure the environment to limit actions or background work outside that group. Controller publication approvals govern only the controller's actions. Agents can use any independent permission the operator gives them.
 
-This supersedes the launcher policy in the [Claude adapter ADR](0004-local-claude-code-provider.md) and the adapter-enforced review policy in the [remote worker ADR](0004-remote-agent-turns.md). [Plan 002](../plans/002-claude-code-authentication.md) stages the behavior change. The operating guides describe the current adapters until that work ships.
+This decision superseded the launcher policy in the [Claude adapter ADR](0004-local-claude-code-provider.md) and the adapter-enforced review policy in the [remote worker ADR](0004-remote-agent-turns.md). [Plan 002](../plans/002-claude-code-authentication.md) preserves the investigation that informed the original rollout proposal. [Plan 003](../plans/003-architectural-simplification.md) governs the implementation.

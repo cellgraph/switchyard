@@ -1,5 +1,7 @@
 # Workflow state and recovery
 
+**Implementation status.** This guide describes the existing implementation. [ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture, and [Plan 003](plans/003-architectural-simplification.md) describes the pending replacement.
+
 The controller owns transitions among `awaiting_review`, `review_running`, `fixing`, `validating`, `ready_for_human`, `escalated`, and `stopped`. Transition commands take explicit evidence and persist the resulting state and an append-only reason/head-SHA record together. Agent output is not a transition command.
 
 Readiness requires an explicit `completed_clean` review for the current head, a known non-empty configured required-check set, and a passing snapshot for every configured check at that exact SHA. Missing, stale, pending, failed, unknown, or indeterminate evidence fails closed. A new head clears current review and check evidence; if validation is active, the workflow remains `validating` until its cycle outcome is recorded. The validation-start SHA is persisted so a review on a changed head can be distinguished from stale evidence even when review arrives before the cycle outcome. An unsuccessful validation below the limit returns to `fixing`, allowing another attempt from the current findings even when no new head exists. A validation-successful fix remains pending until reviewed; if that review finds issues, the attempt counts as unsuccessful. Three unsuccessful fix/review cycles escalate the workflow.

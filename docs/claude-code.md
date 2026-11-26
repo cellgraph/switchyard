@@ -1,5 +1,7 @@
 # Claude Code execution
 
+**Implementation status.** This guide describes the existing implementation. [ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture, and [Plan 003](plans/003-architectural-simplification.md) describes the pending replacement.
+
 Switchyard can use Claude Code for an explicit `--agent-turn` request or as the implementation provider in a per-PR `fix` or `fixes` entry. Add these settings alongside the existing checkout and workflow settings. Supply a model ID or alias available to your Anthropic API account.
 
 ```json

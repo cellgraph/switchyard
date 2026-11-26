@@ -1,6 +1,6 @@
 # Plan 001: Codex GitHub PR review/fix loop
 
-**Roadmap update:** [ADR-0006](../adr/0006-orchestrate-through-native-tools.md) supersedes parts of this plan. [Plan 003](003-architectural-simplification.md) proposes the replacement implementation sequence for work after Phase 5.6B. Retain the completed phases below as historical context; do not implement superseded requirements.
+**Historical plan.** [Plan 003](003-architectural-simplification.md) replaces the remaining PR-loop work after Phase 5.6B. The phases and proposals below preserve the original roadmap. [ADR-0006](../adr/0006-orchestrate-through-native-tools.md#prior-decisions-superseded) identifies the architectural requirements that were superseded.
 
 ## Goal
 

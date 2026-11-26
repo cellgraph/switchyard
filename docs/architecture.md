@@ -1,20 +1,16 @@
 # Switchyard architecture
 
-[ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted direction after the operator's review of PR #21. The [current implementation](#current-implementation-after-pr-21) still uses several mechanisms that the review superseded. Use the linked operating guides for the commands and constraints in effect today.
+[ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture. [Plan 003](plans/003-architectural-simplification.md) sequences the replacement. The operating guides below describe the existing implementation while that work is pending.
 
 ## Accepted direction
 
-A persistent controller runs on a VM. Agents execute on configured local or remote hosts. Local development can run the controller and worker together and use fixtures or explicit reconciliation.
+A persistent TypeScript controller on a VM uses SQLite for workflow state, execution records and operator decisions. Execution and session management, explicit placement, history and operator operations are reusable by software development workflows that may have no PR. The first workflow applies concrete PR review and revision policy.
 
-- **Controller and SQLite.** The controller applies workflow policy, tracks execution, records durable state and history, evaluates evidence and outcomes, and requests operator intervention. Policy defines automatic and explicit triggers, success criteria, limits, and stopping conditions. Once a workflow starts, its steps advance under those rules.
-- **GitHub reconciliation.** Webhooks are the primary trigger. They notify the controller of possible changes. Webhook notifications, controller startup, periodic reconciliation, and explicit operator requests use the same reconciliation implementation to read authoritative GitHub state. Reassess the need for durable delivery records and separate delivery processing.
-- **Git and GitHub.** Use Git-native evidence for source changes, branches, worktrees, and commits. GitHub holds PR state and substantive review content, including findings and detailed dispositions. The controller keeps workflow metadata and references such as the reviewed SHA, review and finding IDs, execution status, and disposition status as needed.
-- **Workers and native runtimes.** Configuration determines the worker, provider, model, and native profile. If the worker is unavailable, wait. The operator provisions trusted hosts and manages credentials and native permissions. The runtime owns session management. Switchyard records the provider session ID and execution context and uses supported continuation interfaces.
-- **Agents.** Give each role standing instructions and a task prompt. Implementers use engineering judgment about scope, run validation, commit, and push. Reviewers are instructed to leave the checkout unchanged and independently assess the changes. Agents retrieve substantive findings from GitHub and publish review findings, disposition explanations, and implementation responses there.
-
-The controller decides when the PR is ready for human handoff. A recognized explicit clean review and passing required CI must match the current head SHA. A new head invalidates earlier review and CI evidence for readiness. Missing review comments or missing required checks cannot establish success. Switchyard never merges a PR automatically.
-
-When an authoritative system establishes an interrupted operation's outcome, reconcile and continue. When an operation is known not to have executed, retry within workflow limits. When the outcome remains uncertain, pause for operator inspection. Use native session inspection and continuation when appropriate. Apply the workflow's stopping rules when required GitHub evidence is unavailable.
+- **GitHub observation.** Authenticated webhooks signal that state may have changed. Startup, notifications, periodic sweeps and explicit operator requests share one read-only reconciler. GitHub owns PR state, review content and CI results. Durable initiation and execution records prevent duplicate work. Webhook deliveries are transient.
+- **Native execution.** The Codex SDK and Claude Code CLI start or continue native sessions in persistent, trusted environments configured by the operator. The controller supplies assignment prompts and optional response schemas and handles results and cancellation where supported. A session can serve multiple execution attempts. Switchyard stores enough metadata and references to explain decisions. Native runtimes retain conversation history, and agents and hosts manage worktrees and Git.
+- **PR workflow.** Enabled repositories automatically enroll open, non-draft, same-repository PRs, including those created by people and independent agents. Switchyard dispatches the Reviewer, Adjudicator and Implementer as needed. Agents publish reviews and dispositions, create issues for deferred findings, and implement, validate, commit and push revisions. The controller verifies structured metadata against GitHub. Required CI failures and accepted findings use the same bounded revision path.
+- **Handoff and recovery.** Require completed review and passing required CI at the current head, with no unresolved blocking findings. Rejected or deferred findings can satisfy the review gate on unchanged code. A new head invalidates earlier readiness evidence. Reconcile established outcomes, retry known non-execution within limits, and pause on uncertainty. The CLI exposes durable attention requests and operator controls. Merge remains a human decision.
+- **Placement.** Roles run where configured. An unavailable host waits. The Rex spike in Plan 003 precedes the remote transport choice. Fixtures and local execution support local development.
 
 ## Current implementation after PR #21
 
@@ -32,10 +28,3 @@ This describes the repository at `e0b10d6` and distinguishes shipped behavior fr
 ### Review evidence
 
 The current Codex adapter recognizes versioned GitHub review evidence. The observed Codex integration can update a single PR conversation comment across heads using a `codex-review-state:v1` marker, and can post independent receipts and marked inline findings. This is observed behavior, so an unknown or ambiguous marker needs additional evidence or operator attention. GitHub review text remains untrusted input. See the [review evidence guide](reviews.md#review-sources-and-completion).
-
-## Plans requiring revision
-
-- [Plan 002](plans/002-claude-code-authentication.md) needs revision before implementation. Its native authentication investigation remains relevant. Its proposed transcript and runtime bindings, worktree checks, path gates, and remote acceptance criteria need to reflect ADR-0006.
-- [Plan 001](plans/001-pr-review-loop.md) needs revision after Phase 5.6B. Reassess the Phase 5.6C independent adjudicator, Phase 5.7 delegated authority and notifications, and Phase 6 plan orchestration and release criteria. Earlier phases describe mechanisms that still ship and may need replacement as part of that work.
-
-[ADR-0006](adr/0006-orchestrate-through-native-tools.md#open-questions-for-the-operator) records open questions about eligibility, review evidence, webhook durability, and remote execution.

@@ -1,5 +1,7 @@
 # Local agent sessions
 
+**Implementation status.** This guide describes the existing implementation. [ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture, and [Plan 003](plans/003-architectural-simplification.md) describes the pending replacement.
+
 Start by reconciling the PR through the existing GitHub App configuration so the workflow and its current head appear in the Switchyard database. Use a trusted clone of that repository, a dedicated worktree root outside Git checkouts, and a persistent Codex home that this controller owns. Sign in to Codex in that home or make `OPENAI_API_KEY` available to the controller. Configured credentials must have access to the requested model.
 
 Submit an explicit turn to the database used for GitHub reconciliation. Use absolute paths, the current full PR head SHA, and a semantic workflow branch. For an initial turn, use the recorded PR head for both SHAs. For a follow-up, use the latest recorded PR head and the local head returned by the previous turn. Follow-ups use a new operation ID and the same checkout, Codex home, and model. Keep request files private and omit secrets from prompts.

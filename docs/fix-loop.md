@@ -1,5 +1,7 @@
 # Bounded PR fixes
 
+**Implementation status.** This guide describes the existing implementation. [ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture, and [Plan 003](plans/003-architectural-simplification.md) describes the pending replacement.
+
 Run the controller from a stable checkout. Use a trusted local clone of the PR repository, a dedicated worktree root outside every checkout, a persistent agent profile, and the same SQLite database for all commands. Switchyard edits a separate linked checkout. The PR head commit must already be available in the clone. Fetch the PR branch before the first dispatch if needed.
 
 Use the GitHub App reader documented in [GitHub setup](github-app.md). Publication uses your existing SSH credentials for the canonical GitHub repository. Set up SSH access and Git commit identity before authorizing publication. This version supports a PR whose source branch belongs to the same GitHub repository and differs from the default branch. Choose a separate local branch name. Use repositories and PRs whose validation code you trust. Validation runs local executables with the candidate checkout as their working directory and a minimal environment. Those executables have the operating system privileges of the controller account.

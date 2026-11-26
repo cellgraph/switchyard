@@ -1,5 +1,7 @@
 # Distributed agent turns
 
+**Implementation status.** This guide describes the existing implementation. [ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture, and [Plan 003](plans/003-architectural-simplification.md) describes the pending replacement.
+
 The controller host can run an execution listener alongside its normal GitHub poller. Both processes use the same local SQLite database. Workers connect outbound, poll for eligible turns, and execute in isolated worktrees using their own clones and provider profiles. See [ADR-0004](adr/0004-remote-agent-turns.md) for lease, delivery and transport decisions.
 
 Phase 5.6B supports explicitly authorized, read-only turns on PRs awaiting review. Codex uses its read-only sandbox with approval and agent network access disabled. Claude Code uses the existing restricted profile with only read tools. The worker checks the checkout and transcript locally and the controller checks the bound checkout identity, exact commit, runtime, workflow revision, and empty changed paths before confirming success. Provider transcripts remain on the worker. Run local implementation, validation and publication through the existing fix loop on workflows without a remote session binding. For a workflow with a remote session, address findings manually or use a new workflow with a local session. The controller checks placement before proposing or approving a local fix.
