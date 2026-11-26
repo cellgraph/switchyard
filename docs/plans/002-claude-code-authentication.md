@@ -1,5 +1,7 @@
 # Claude Code authentication follow-up
 
+**Roadmap update:** [Plan 003](003-architectural-simplification.md) proposes incorporating native Claude authentication into the simplified execution foundation under [ADR-0006](../adr/0006-orchestrate-through-native-tools.md). Retain the investigation below as evidence; the older launcher, checkpoint and validation proposal is not the implementation target.
+
 - Status: Proposed for operator review before Phase 5.6C
 - Date: 2026-11-24
 - Baseline: Switchyard `fb0e0d0` (Phase 5.6B)
