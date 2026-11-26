@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -6,7 +6,11 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createAgentController } from "../src/agent-controller.ts";
 import type { AgentResult, AgentTurn } from "../src/agent.ts";
 import { WorkflowStore } from "../src/store.ts";
-import { crashAfterSession, executionContext as context } from "./fixtures/execution.ts";
+import {
+  crashAfterSession,
+  executionContext as context,
+  runSdkWithEarlyExit,
+} from "./fixtures/execution.ts";
 
 const assignment = { id: "first", assignmentId: "assignment-1", context, prompt: "private prompt" };
 const success = {
@@ -188,6 +192,28 @@ it("recovers a dead owner once and holds its assignment and native session witho
     }),
   ).rejects.toThrow("unresolved execution");
   expect(adapter).not.toHaveBeenCalled();
+});
+
+it("contains the pinned Codex SDK's offline early-exit crash in a separate process", () => {
+  const executable = join(dir, "early-exit-codex");
+  writeFileSync(executable, "#!/bin/sh\nexit 2\n", { mode: 0o700 });
+
+  const worker = runSdkWithEarlyExit(path, executable);
+  // Revisit this expectation when a supported SDK release handles stdin errors.
+  expect(worker.status, worker.stderr).toBe(1);
+  expect(worker.stderr).toContain("Error: write EPIPE");
+  expect(worker.stdout).toBe("");
+  const executions = store.agentExecutions();
+  expect(executions.get("early-exit")).toMatchObject({ status: "running", finishedAt: null });
+  expect(executions.recover()).toBe(1);
+  expect(executions.get("early-exit")).toMatchObject({
+    status: "unknown",
+    finishedAt: expect.any(String),
+  });
+  expect(executions.recover()).toBe(0);
+  expect(() => executions.claim({ id: "retry", assignmentId: "sdk-assignment", context })).toThrow(
+    "already has",
+  );
 });
 
 it("holds unconfirmed completion and sanitizes adapter exceptions after the claim", async () => {

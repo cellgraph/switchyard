@@ -4,6 +4,8 @@ The development CLI runs assignments directly through the Codex TypeScript SDK o
 
 Prepare the working directory, dependencies, and native agent account and permissions on the local host. Use the native runtime's ordinary settings for credentials, tools and billing. The runtime and agent handle worktrees, validation, commits and publication as required by the assignment. Preserve the local native profile and session history for continuation.
 
+Check the intended account using the bundled Codex CLI's `login status` or `claude auth status` in the invocation environment. The npm Codex SDK uses its bundled CLI, which can differ from the `codex` on `PATH`. For a subscription run, check for API-key or billing overrides in native settings and the inherited environment. Phase A used local Git repositories and defaults with ChatGPT and Claude Max sign-in. A fixture read succeeded under each profile's ordinary permissions.
+
 ## Run and continue
 
 Point `SWITCHYARD_DB_PATH` at a fresh development database. On each invocation, write the assignment prompt in a private text file. When a response schema is needed, supply a JSON Schema object in a separate file.
@@ -11,12 +13,12 @@ Point `SWITCHYARD_DB_PATH` at a fresh development database. On each invocation, 
 ```sh
 export SWITCHYARD_DB_PATH=/absolute/path/to/switchyard-dev.sqlite
 
-npm start -- agent run --provider codex --cwd /path/to/clone \
+npm start --silent -- agent run --provider codex --cwd /path/to/clone \
   --execution codex-first --prompt /path/to/first.txt
 
-npm start -- agent status codex-first
+npm start --silent -- agent status codex-first
 
-npm start -- agent run --session SESSION_ID \
+npm start --silent -- agent run --session SESSION_ID \
   --execution codex-next --prompt /path/to/next.txt --schema /path/to/schema.json
 ```
 
@@ -36,14 +38,14 @@ Supply `--execution ID` to reserve an ID you can inspect after a crash. The exec
 | `failed`      | The runtime reported a failure or returned unusable result data after a known turn. Side effects can remain. |
 | `unknown`     | The outcome could not be established. The assignment and any associated session are held for inspection.     |
 
-`agent run` exits nonzero when the stored execution status is anything other than `completed`. Native errors appear as fixed diagnostics. Ctrl-C requests cancellation through the native interface. If cancellation leaves no authoritative result, the status is `unknown`.
+`agent run` exits nonzero when the stored execution status is anything other than `completed`. Native errors appear as fixed diagnostics. SIGINT (Ctrl-C from a terminal) and SIGTERM request cancellation through the adapter. With the tested runtimes, signaling the Switchyard process aborted the local native subprocess through Node's spawn signal. Both commands exited with a recorded `unknown` when no authoritative terminal result reached the adapter. An interactive interrupt inside a native session can stop the current turn while keeping the session open. The standalone CLI runs a non-interactive subprocess.
 
 A confirmed turn that omits required output or returns unusable output fails the assignment. A later assignment can still use the recorded session. If SQLite is briefly busy or locked, the current owner retries saving the observed ID and outcome. The CLI returns a native result only after the write is confirmed. A persistent write failure leaves the claim held for recovery.
 
-Run `npm start -- agent recover` to mark claims whose local owner exited before recording an outcome. A live or reused PID leaves the claim intact. A crash can leave native processes or external effects in progress. Inspect the execution record, native session and any external effects using the runtime and environment. The development CLI keeps uncertain assignments and sessions held. Use the database on the same persistent local host as the execution processes.
+Run `npm start --silent -- agent recover` to mark claims whose local owner exited before recording an outcome. A live or reused PID leaves the claim intact. A crash can leave native processes or external effects in progress. Inspect the execution record, native session and any external effects using the runtime and environment. The development CLI keeps uncertain assignments and sessions held and never replays them during recovery. Use the database on the same persistent local host as the execution processes.
 
-## Remaining Phase A verification
+For Codex, use the recorded native ID with the supported App Server `thread/read` and `thread/turns/list` requests to inspect a stored thread without submitting another turn. The standalone run and a fresh inspection server have separate process lifetimes. Correlate stored turn evidence with the execution in question. The `notLoaded` status in a fresh server describes that server's view. For Claude Code, see the [native session inspection instructions](claude-code.md#inspecting-an-interrupted-session). Session visibility or local process exit alone cannot establish non-execution.
 
-The offline suite covers both adapters and the durable lifecycle using fixtures. In the operator's preconfigured environments, start a session with each native provider, record a harmless test phrase, and continue the same session in another process after running recovery. Ask the second assignment to return the phrase without repeating it in the prompt. Exercise structured output and check the durable terminal state and native ID across invocations. Verify cancellation and inspection behavior in a disposable environment and record any limitations. Record the observed native account and continuation behavior separately from the offline tests. Use the operator's existing accounts and configurations for this verification.
+The pinned Codex SDK can crash the standalone process if its child exits while stdin is still being written. If no result appears, use the execution ID printed on stderr, run recovery in a separate invocation, and inspect the held record. The [Phase A verification report](native-execution-verification.md) records observed behavior and the integration gate.
 
-[Codex TypeScript SDK](https://github.com/openai/codex/tree/main/sdk/typescript) · [Claude Code programmatic usage](https://code.claude.com/docs/en/headless)
+[Codex TypeScript SDK](https://github.com/openai/codex/tree/main/sdk/typescript) · [Codex App Server](https://developers.openai.com/codex/app-server) · [Claude Code programmatic usage](https://code.claude.com/docs/en/headless)
