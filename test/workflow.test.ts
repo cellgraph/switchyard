@@ -145,22 +145,16 @@ describe("workflow state and durable store", () => {
     expect(calls).toBe(1);
   });
 
-  it("recovers processing deliveries and marks uncertain operations ambiguous without replay", () => {
+  it("recovers interrupted processing without losing the delivery", () => {
     dir = mkdtempSync(join(tmpdir(), "switchyard-"));
     const path = join(dir, "state.sqlite");
     store = new WorkflowStore(path);
     store.createWorkflow(fixture());
     store.receiveDelivery("delivery-2", { action: "review" }, "wf-1");
     expect(store.claimDelivery("delivery-2")).toBe(true);
-    expect(store.createOperation("op-1", "wf-1", "agent_turn", { prompt: "fix" })).toBe(true);
     store.close();
     store = new WorkflowStore(path);
-    expect(store.recover()).toEqual({ deliveries: 1, ambiguousOperations: 1 });
+    expect(store.recover()).toEqual({ deliveries: 1, unknownExecutions: 0 });
     expect(store.pendingDeliveries()).toHaveLength(1);
-    expect(store.getWorkflow("wf-1")?.state).toBe("escalated");
-    expect(store.createOperation("op-1", "wf-1", "agent_turn", { prompt: "fix" })).toBe(false);
-    expect(store.transitions("wf-1").at(-1)?.reason).toBe(
-      "An external operation has an ambiguous outcome after restart.",
-    );
   });
 });

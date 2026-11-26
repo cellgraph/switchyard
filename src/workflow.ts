@@ -36,7 +36,7 @@ export type WorkflowCommand =
   | { type: "review_received"; evidence: ReviewEvidence }
   | { type: "checks_received"; evidence: CheckEvidence[]; configuredNames: string[] | null }
   | { type: "findings_changed" }
-  | { type: "escalate"; reason: string; observedHeadSha?: string }
+  | { type: "escalate"; reason: string }
   | { type: "stop"; reason: string };
 
 export type Transition = {
@@ -143,11 +143,6 @@ export function transitionWorkflow(
     case "escalate":
       if (!command.reason.trim())
         throw new InvalidTransitionError("An escalation requires a reason.");
-      if (command.observedHeadSha !== undefined) {
-        if (!command.observedHeadSha)
-          throw new InvalidTransitionError("An observed head SHA cannot be empty.");
-        if (command.observedHeadSha !== current.headSha) setHead(next, command.observedHeadSha);
-      }
       next.state = "escalated";
       next.escalationReason = command.reason;
       delete next.closedByGitHub;

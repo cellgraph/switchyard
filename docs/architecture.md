@@ -1,6 +1,6 @@
 # Switchyard architecture
 
-[ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture. [Plan 003](plans/003-architectural-simplification.md) sequences the replacement. The operating guides describe the implementation after Phase A, Increment 1.
+[ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture. [Plan 003](plans/003-architectural-simplification.md) sequences the replacement. The operating guides describe the implementation after Phase A2.
 
 ## Accepted direction
 
@@ -14,16 +14,22 @@ A persistent TypeScript controller on a VM uses SQLite for workflow state, execu
 
 ## Current implementation
 
-| Area                      | Available behavior                                                                                                                                                                                                                                                                                                                                                 |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| GitHub observation        | Signed webhooks, the SQLite inbox, startup and periodic sweeps, and manual reconciliation observe configured PRs. The unattended worker polls only. See [GitHub App setup](github-app.md) and [unattended polling](unattended.md).                                                                                                                                 |
-| Readiness and state       | An explicit clean review and passing configured checks must match the current head. Unresolved findings from reviews projected onto the workflow can still block readiness after a head change. Reconciliation guards against stale and superseded observations. Operator stops and holds for uncertain operations persist. See the [state model](state-model.md). |
-| Explicit native execution | Local turns still use the Codex SDK or Claude Code CLI with existing worktree checks, session checkpoints, and runtime bindings. Explicit read-only remote turns still use the existing worker and lease protocol. See [agent sessions](agent-sessions.md), [Claude Code](claude-code.md), and [distributed workers](distributed-workers.md).                      |
-| Review content            | SQLite retains review runs, findings and disposition history. The separate explicit review-comment synchronization commands still work pending Phase B. See [review operations](reviews.md).                                                                                                                                                                       |
+| Area                      | Available behavior                                                                                                                                                                                                                                                                      |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GitHub observation        | Signed webhooks, the SQLite inbox, startup and periodic sweeps, and manual reconciliation observe configured PRs. The unattended worker polls only. See [GitHub App setup](github-app.md) and [unattended polling](unattended.md).                                                      |
+| Readiness and state       | An explicit clean review and passing configured checks must match the current head. Prior unresolved findings can still block readiness after a head change. Reconciliation guards against superseded observations and preserves operator stops. See the [state model](state-model.md). |
+| Explicit native execution | The Codex SDK and Claude Code CLI start or continue sessions from a configured local working directory and accept optional response schemas. Assignments run independently of PR observation. See [local execution](agent-sessions.md).                                                 |
+| Review content            | SQLite retains review runs, findings and disposition history. Explicit review-comment synchronization remains available pending Phase B. See [review operations](reviews.md).                                                                                                           |
 
-Phase A, Increment 1 removed controller-owned fix dispatch, edit scopes, staging and validation, commits, pushes, and fix-specific authorization and recovery. Changes to PR code and validation happen outside the controller. The SQLite baseline starts fresh and retains the inbox, review records, local worktree and session bindings, and remote attempt records until their replacement phases.
+### Local execution and persistence
 
-The rest of Phase A simplifies the native adapters and replaces PR-bound checkout and session persistence. Phase B replaces the GitHub observation and review integration. Phase C decides remote placement and transport. Phase D implements autonomous role dispatch, execution limits, the operator CLI and deployment cutover.
+A session records the provider, local placement, working directory, optional model and native config directory, and the native ID once the runtime reports it. Each execution attempt records its own ID and assignment ID, refers to one session, and records its claim, terminal status and diagnostic when applicable. A session can serve several assignments. Independent sessions can run in the same database, including without any PR records.
+
+Switchyard commits an execution's intent and claim in one SQLite transaction before invoking an adapter, and commits its terminal status before returning the result. The execution record provides durable deduplication. A new attempt for the same assignment requires known non-execution of earlier attempts. A running or uncertain execution prevents concurrent use of its session. A lost owner becomes uncertain. The runtime retains the conversation, and response content returns to the requesting caller. The [local CLI guide](agent-sessions.md) documents inspection and recovery.
+
+A2 replaced the affected persistence alongside the native adapters because the earlier persistence encoded their worktree, runtime and authorization contracts. The [HTTP worker](distributed-workers.md) depended on these contracts and has been retired. The SQLite baseline retains the GitHub inbox, exact-head review and CI evidence, findings and workflow history.
+
+Phase A still requires live verification of native start, continuation after restart and outcome reporting. Phase B replaces the GitHub observation and review integration. Phase C investigates Rex before choosing remote placement and transport. Phase D implements autonomous role dispatch, execution limits, the operator CLI and deployment cutover.
 
 ### Review evidence
 

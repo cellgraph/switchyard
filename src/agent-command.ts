@@ -1,175 +1,118 @@
-import { createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { parseAgentConfig, type AgentConfig } from "./agent-config.ts";
+import { resolve } from "node:path";
+import { parseArgs } from "node:util";
 import { createAgentController } from "./agent-controller.ts";
-import type { AgentOperationWorker, AgentRuntime, AgentTurnRequest } from "./agent-operation.ts";
-import { createClaudeAgent } from "./claude-agent.ts";
-import { claudeRuntime, claudeSessionCheckpoint } from "./claude-runtime.ts";
-import { createCodexAgent } from "./codex-agent.ts";
-import { codexRuntime, codexSessionCheckpoint } from "./codex-runtime.ts";
-import { object } from "./github-data.ts";
-import { createLocalAgentExecution } from "./local-agent-execution.ts";
+import type { ExecutionIntent } from "./agent-store.ts";
 import { WorkflowStore } from "./store.ts";
-import { createWorktreeManager } from "./worktree.ts";
+
+const usage = [
+  "agent run --provider codex|claude-code [--cwd DIR] [--model MODEL] [--config-dir DIR] --prompt FILE [--schema FILE]",
+  "agent run --session SESSION_ID --prompt FILE [--schema FILE]",
+  "agent status EXECUTION_ID",
+  "agent recover",
+].join("\n");
 
 export async function runAgentCommand(args: string[], dbPath: string): Promise<boolean> {
-  const [command, argument] = args;
-  if (command !== "--agent-turn" && command !== "--agent-status" && command !== "--recover")
-    return false;
-  if (args.length !== (command === "--recover" ? 1 : 2))
-    throw new Error("Usage: --agent-turn INPUT.json, --agent-status OPERATION_ID, or --recover");
-  const store = new WorkflowStore(dbPath);
-  try {
-    if (command === "--recover") {
-      console.info(JSON.stringify(store.recover()));
-      return true;
+  if (args[0] !== "agent") return false;
+
+  const [, command, ...rest] = args;
+  if (command === "run") {
+    const { values } = parseArgs({
+      args: rest,
+      options: {
+        provider: { type: "string" },
+        cwd: { type: "string" },
+        model: { type: "string" },
+        "config-dir": { type: "string" },
+        session: { type: "string" },
+        prompt: { type: "string" },
+        schema: { type: "string" },
+        assignment: { type: "string" },
+        execution: { type: "string" },
+      },
+    });
+    const { provider, cwd, model, session, prompt, schema } = values;
+    const configDirectory = values["config-dir"];
+    if (
+      !prompt ||
+      (session !== undefined &&
+        (!session ||
+          provider !== undefined ||
+          cwd !== undefined ||
+          model !== undefined ||
+          configDirectory !== undefined))
+    )
+      throw new Error(usage);
+    const id = values.execution ?? randomUUID();
+    const assignmentId = values.assignment ?? id;
+    let intent: ExecutionIntent;
+    if (session) {
+      intent = { id, assignmentId, sessionId: session };
+    } else {
+      if (provider !== "codex" && provider !== "claude-code") throw new Error(usage);
+      intent = {
+        id,
+        assignmentId,
+        context: {
+          provider,
+          workingDirectory: resolve(cwd ?? "."),
+          ...(model === undefined ? {} : { model }),
+          ...(configDirectory === undefined ? {} : { configDirectory: resolve(configDirectory) }),
+        },
+      };
     }
-    if (command === "--agent-status") {
-      const operations = store.agentOperations();
-      const operation = operations.get(argument!);
-      if (!operation) throw new Error("Agent operation does not exist.");
-      console.info(
-        JSON.stringify({ operation, session: operations.session(operation.intent.workflowId) }),
-      );
-      return true;
+    const promptText = readFileSync(prompt, "utf8");
+    let outputSchema: Record<string, unknown> | undefined;
+    if (schema !== undefined) {
+      const raw = readFileSync(schema, "utf8");
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        throw new Error("The response schema must be a JSON object.");
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+        throw new Error("The response schema must be a JSON object.");
+      outputSchema = parsed as Record<string, unknown>;
     }
 
-    let config;
-    try {
-      config = object(JSON.parse(readFileSync(argument!, "utf8")));
-    } catch {
-      throw new Error("Agent request must be a readable JSON file.");
-    }
-    if (!config) throw new Error("Agent request must be a JSON object.");
-    const fields = [
-      "repositoryDirectory",
-      "worktreeRoot",
-      "operationId",
-      "workflowId",
-      "branch",
-      "expectedPullRequestHead",
-      "expectedHead",
-      "prompt",
-    ] as const;
-    for (const field of fields) {
-      if (typeof config[field] !== "string" || !config[field].trim())
-        throw new Error(`Agent request requires ${field}.`);
-    }
-    const agent = parseAgentConfig(config);
-    const {
-      repositoryDirectory,
-      worktreeRoot,
-      operationId,
-      workflowId,
-      branch,
-      expectedPullRequestHead,
-      expectedHead,
-      prompt,
-    } = config as Record<(typeof fields)[number], string>;
-    const request: AgentTurnRequest = {
-      operationId,
-      workflowId,
-      branch,
-      expectedPullRequestHead,
-      expectedHead,
-      prompt,
-    };
-    const controller = createAgentController(
-      store,
-      localAgentWorker({ repositoryDirectory, worktreeRoot, ...agent }),
-    );
+    const store = new WorkflowStore(dbPath);
     const abort = new AbortController();
     const stop = () => abort.abort();
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
+    process.on("SIGINT", stop);
+    process.on("SIGTERM", stop);
     try {
-      const operation = await controller.runTurn(request, abort.signal);
-      console.info(JSON.stringify(operation));
-      if (operation.status !== "completed" || operation.error) process.exitCode = 1;
+      const execution = await createAgentController(store.agentExecutions()).execute({
+        ...intent,
+        prompt: promptText,
+        signal: abort.signal,
+        ...(outputSchema === undefined ? {} : { outputSchema }),
+      });
+      console.info(JSON.stringify(execution));
+      if (execution.execution.status !== "completed") process.exitCode = 1;
     } finally {
       process.removeListener("SIGINT", stop);
       process.removeListener("SIGTERM", stop);
+      store.close();
     }
     return true;
+  }
+
+  if ((command !== "status" || rest.length !== 1) && (command !== "recover" || rest.length !== 0))
+    throw new Error(usage);
+  const store = new WorkflowStore(dbPath);
+  try {
+    const executions = store.agentExecutions();
+    if (command === "recover") {
+      console.info(JSON.stringify({ unknownExecutions: executions.recover() }));
+    } else {
+      const execution = executions.get(rest[0]!);
+      if (!execution) throw new Error("Execution record not found.");
+      console.info(JSON.stringify({ execution, session: executions.session(execution.sessionId) }));
+    }
   } finally {
     store.close();
   }
-}
-
-export function localCodexWorker({
-  repositoryDirectory,
-  worktreeRoot,
-  codexHome,
-  model,
-  readOnly = false,
-}: {
-  repositoryDirectory: string;
-  worktreeRoot: string;
-  codexHome: string;
-  model: string;
-  readOnly?: boolean;
-}): AgentOperationWorker {
-  const apiKey = process.env.OPENAI_API_KEY?.trim();
-  let identity: AgentRuntime;
-  const configurationId = createHash("sha256")
-    .update(JSON.stringify([repositoryDirectory, worktreeRoot, codexHome, model]))
-    .digest("hex");
-  return {
-    configurationId,
-    runtime: () => (identity = codexRuntime(model, codexHome, apiKey)),
-    execute: (input) => {
-      const worktrees = createWorktreeManager({ repositoryDirectory, worktreeRoot });
-      const agent = createCodexAgent({
-        model,
-        readOnly,
-        codexHome: identity.home,
-        ...(apiKey ? { apiKey } : {}),
-      });
-      return createLocalAgentExecution(
-        worktrees,
-        agent,
-        (id, path) => codexSessionCheckpoint(identity.home, id, path),
-        readOnly,
-      ).execute(input);
-    },
-  };
-}
-
-export function localAgentWorker(
-  config: AgentConfig & {
-    repositoryDirectory: string;
-    worktreeRoot: string;
-    readOnly?: boolean;
-  },
-): AgentOperationWorker {
-  if (config.provider !== "claude-code") return localCodexWorker(config);
-  const { model, claude, repositoryDirectory, worktreeRoot, readOnly } = config;
-  const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
-  let identity: ReturnType<typeof claudeRuntime>;
-  const configurationId = createHash("sha256")
-    .update(JSON.stringify([repositoryDirectory, worktreeRoot, config.provider, model, claude]))
-    .digest("hex");
-  return {
-    configurationId,
-    runtime: () => (identity = claudeRuntime(model, claude, apiKey)).runtime,
-    execute: (input) => {
-      const worktrees = createWorktreeManager({ repositoryDirectory, worktreeRoot });
-      const agent = createClaudeAgent(
-        {
-          ...claude,
-          ...identity,
-          home: identity.runtime.home,
-          model,
-          ...(readOnly ? { readOnly } : {}),
-        },
-        apiKey!,
-      );
-      return createLocalAgentExecution(
-        worktrees,
-        agent,
-        (id, path) => claudeSessionCheckpoint(identity.runtime.home, id, path),
-        readOnly,
-      ).execute(input);
-    },
-  };
+  return true;
 }

@@ -1,9 +1,8 @@
-import { createRemoteStore, remoteSchema } from "./remote-store.ts";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { createAgentOperationStore, recoverAgentOperations } from "./agent-store.ts";
+import { agentSchema, createAgentStore } from "./agent-store.ts";
 import type { GitHubRateLimits, GitHubRateLimitState } from "./github-app.ts";
 import type { PullRequestTarget } from "./github-api.ts";
 import { createReviewPublications } from "./review-publications.ts";
@@ -19,7 +18,6 @@ import {
 export type DeliveryStatus = "pending" | "processing" | "processed" | "failed";
 type InboxDelivery = { deliveryId: string; payload: unknown; workflowId: string | null };
 type DeliveryRow = { delivery_id: string; payload: string; workflow_id: string | null };
-export type OperationStatus = "pending" | "completed" | "failed" | "ambiguous";
 
 export type GitHubObservationWriter = {
   transition(id: string, command: WorkflowCommand): Workflow;
@@ -52,7 +50,7 @@ export function localProcessAlive(pid: number | null): boolean {
 }
 
 const applicationId = 0x53575944; // SWYD
-const schemaVersion = 16;
+const schemaVersion = 17;
 const unsupportedDatabase =
   "Unsupported Switchyard database identity or schema version. Use a fresh SWITCHYARD_DB_PATH for this implementation.";
 
@@ -92,20 +90,7 @@ const schema = `
     id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id TEXT NOT NULL REFERENCES workflows(id),
     name TEXT NOT NULL, sha TEXT NOT NULL, outcome TEXT NOT NULL, captured_at TEXT NOT NULL
   );
-  CREATE TABLE agent_sessions (
-    workflow_id TEXT PRIMARY KEY REFERENCES workflows(id), session_id TEXT, execution TEXT NOT NULL
-  );
-  CREATE TABLE worktrees (
-    workflow_id TEXT PRIMARY KEY REFERENCES workflows(id), path TEXT NOT NULL, execution TEXT NOT NULL
-  );
-  CREATE TABLE operations (
-    operation_id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL REFERENCES workflows(id),
-    kind TEXT NOT NULL, status TEXT NOT NULL, input TEXT NOT NULL, result TEXT,
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT, owner_pid INTEGER
-  );
-  CREATE INDEX agent_operations_by_workflow ON operations(workflow_id, status) WHERE kind='durable_agent_turn';
-  CREATE UNIQUE INDEX one_unresolved_agent_operation ON operations(workflow_id)
-    WHERE kind='durable_agent_turn' AND status IN ('requested','dispatching','running','unknown','interrupted','manual_reconciliation');
+  ${agentSchema}
   CREATE TABLE github_rate_limits (
     scope TEXT PRIMARY KEY NOT NULL, retry_at INTEGER NOT NULL, throttled_attempts INTEGER NOT NULL,
     retry_request TEXT
@@ -117,7 +102,6 @@ const schema = `
   );
   CREATE TABLE unattended_worker (slot INTEGER PRIMARY KEY CHECK(slot=1), record TEXT NOT NULL);
   ${reviewSchema}
-  ${remoteSchema}
   PRAGMA application_id = ${applicationId};
   PRAGMA user_version = ${schemaVersion};
 `;
@@ -310,58 +294,13 @@ export class WorkflowStore {
     };
   }
 
-  #agentOperationStore(transaction: <T>(run: () => T) => T) {
-    return createAgentOperationStore(this.#db, {
-      transaction,
-      getWorkflow: (id) => this.getWorkflow(id),
-      transition: (id, command) => this.#transition(id, command),
-    });
-  }
-
-  remoteWorkers(now = Date.now) {
-    return createRemoteStore(
-      this.#db,
-      (run) => this.#transaction(run),
-      // Remote claims and their agent transitions share the enclosing transaction.
-      this.#agentOperationStore((run) => run()),
-      (id) => this.getWorkflow(id),
-      now,
-    );
-  }
-
-  agentOperations() {
-    return this.#agentOperationStore((run) => this.#transaction(run));
+  agentExecutions() {
+    return createAgentStore(this.#db, (run) => this.#transaction(run), localProcessAlive);
   }
 
   #transition(id: string, command: WorkflowCommand): Workflow {
     const current = this.getWorkflow(id);
     if (!current) throw new Error(`Workflow ${id} does not exist.`);
-    if (
-      command.type === "github_pull_request" &&
-      command.state === "open" &&
-      current.closedByGitHub
-    ) {
-      const unresolved = this.#db
-        .prepare(
-          "SELECT DISTINCT status FROM operations WHERE workflow_id=? AND status IN ('pending','ambiguous','dispatching','running','unknown','interrupted','manual_reconciliation')",
-        )
-        .all(id);
-      if (
-        unresolved.some(({ status }) =>
-          ["ambiguous", "unknown", "interrupted", "manual_reconciliation"].includes(String(status)),
-        )
-      ) {
-        command = {
-          type: "escalate",
-          reason: "An external operation has an ambiguous outcome.",
-          observedHeadSha: command.sha,
-        };
-      } else if (unresolved.length) {
-        throw new Error(
-          "Cannot resume a reopened pull request while an external operation is pending.",
-        );
-      }
-    }
     const review = command.type === "review_received" ? command.evidence : current.review;
     const hasBlockingFindings =
       review?.outcome === "completed_clean" &&
@@ -390,7 +329,6 @@ export class WorkflowStore {
         "INSERT INTO transitions (workflow_id, from_state, to_state, reason, head_sha, created_at) VALUES (?, ?, ?, ?, ?, ?)",
       )
       .run(id, result.from, result.to, result.reason, result.headSha, now);
-    this.#agentOperationStore((run) => run()).retireRevokedRemoteRequests(id);
     if (w.headSha !== current.headSha || w.state === "stopped" || w.state === "escalated")
       this.#db
         .prepare("UPDATE review_runs SET eligible=0 WHERE workflow_id=? AND eligible=1")
@@ -538,103 +476,13 @@ export class WorkflowStore {
     if (changed.changes !== 1) throw new Error(`Delivery ${deliveryId} is not processing.`);
   }
 
-  createOperation(operationId: string, workflowId: string, kind: string, input: unknown): boolean {
-    if (kind === "durable_agent_turn")
-      throw new Error("Use the agent operation store to request a turn.");
-    return this.#transaction(() => {
-      if (
-        this.#db
-          .prepare(
-            "SELECT 1 FROM operations WHERE workflow_id=? AND kind='durable_agent_turn' AND status!='completed'",
-          )
-          .get(workflowId)
-      )
-        throw new Error("Workflow already has an unresolved agent operation.");
-      const now = new Date().toISOString();
-      return (
-        this.#db
-          .prepare(
-            "INSERT OR IGNORE INTO operations (operation_id, workflow_id, kind, status, input, created_at, updated_at) VALUES (?, ?, ?, 'pending', ?, ?, ?)",
-          )
-          .run(operationId, workflowId, kind, JSON.stringify(input), now, now).changes === 1
-      );
-    });
-  }
-
-  finishOperation(
-    operationId: string,
-    status: Exclude<OperationStatus, "pending">,
-    result?: unknown,
-    error?: string,
-  ): void {
-    const updated = this.#db
-      .prepare(
-        "UPDATE operations SET status=?, result=?, error=?, updated_at=? WHERE operation_id=? AND status='pending' AND kind!='durable_agent_turn'",
-      )
-      .run(
-        status,
-        result === undefined ? null : JSON.stringify(result),
-        error ?? null,
-        new Date().toISOString(),
-        operationId,
-      );
-    if (updated.changes !== 1)
-      throw new Error(`Operation ${operationId} is missing or no longer pending.`);
-  }
-
-  recover(): {
-    deliveries: number;
-    ambiguousOperations: number;
-    unverifiedAgentOperations?: string[];
-  } {
-    const expiredRemote = this.remoteWorkers().expire();
-    return this.#transaction(() => {
-      const deliveries = Number(
-        this.#db.prepare("UPDATE deliveries SET status='pending' WHERE status='processing'").run()
-          .changes,
-      );
-      const ambiguousLegacyOperations = Number(
-        this.#db
-          .prepare(
-            "UPDATE operations SET status='ambiguous', error='Process restarted before outcome was recorded.', updated_at=? WHERE status='pending'",
-          )
-          .run(new Date().toISOString()).changes,
-      );
-      const { recovered, unverified } = recoverAgentOperations(this.#db);
-      const affected = this.#db
-        .prepare(
-          "SELECT DISTINCT workflow_id FROM operations WHERE status IN ('ambiguous','unknown')",
-        )
-        .all() as Array<{ workflow_id: string }>;
-      this.#escalateAmbiguousWorkflows(
-        affected.map(({ workflow_id }) => workflow_id),
-        "An external operation has an ambiguous outcome after restart.",
-      );
-      return {
-        deliveries,
-        ambiguousOperations: ambiguousLegacyOperations + recovered.length + expiredRemote,
-        ...(unverified.length ? { unverifiedAgentOperations: unverified } : {}),
-      };
-    });
-  }
-
-  recoverAgentClaims(): number {
-    return this.#transaction(() => {
-      const { recovered } = recoverAgentOperations(this.#db);
-      this.#escalateAmbiguousWorkflows(
-        recovered,
-        "An agent owner exited without a recorded outcome.",
-      );
-      return recovered.length;
-    });
-  }
-
-  #escalateAmbiguousWorkflows(ids: string[], reason: string): void {
-    for (const id of ids) {
-      const w = this.getWorkflow(id);
-      if (w && (w.state !== "stopped" || w.closedByGitHub) && w.state !== "escalated")
-        this.#transition(id, { type: "escalate", reason });
-    }
+  recover(): { deliveries: number; unknownExecutions: number } {
+    const unknownExecutions = this.agentExecutions().recover();
+    const deliveries = Number(
+      this.#db.prepare("UPDATE deliveries SET status='pending' WHERE status='processing'").run()
+        .changes,
+    );
+    return { deliveries, unknownExecutions };
   }
 
   transitions(id: string): Array<{ from: string; to: string; reason: string; headSha: string }> {

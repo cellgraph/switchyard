@@ -310,15 +310,6 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
         const active = activeRun(workflowId);
         if (active?.status === "running" && active.source === "operator")
           throw new Error("A review run already awaits an outcome for this workflow.");
-        if (
-          db
-            .prepare(
-              `SELECT 1 FROM operations WHERE workflow_id=? AND
-          status IN ('pending','requested','dispatching','running') LIMIT 1`,
-            )
-            .get(workflowId)
-        )
-          throw new Error("A workflow operation is already in progress.");
         db.prepare("UPDATE review_runs SET eligible=0 WHERE workflow_id=? AND eligible=1").run(
           workflowId,
         );

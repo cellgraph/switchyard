@@ -271,7 +271,7 @@ describe("unattended polling", () => {
       checks: [{ name: "CI", outcome: "passed", sha: reviewed }],
     });
     using db = new DatabaseSync(path, { readOnly: true });
-    expect(db.prepare("SELECT COUNT(*) AS count FROM operations").get()?.count).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM agent_executions").get()?.count).toBe(0);
   });
 
   it.each(["SIGINT", "SIGTERM"] as const)(

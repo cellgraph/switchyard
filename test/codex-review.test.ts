@@ -283,17 +283,6 @@ describe("Codex review marker evidence", () => {
           review: { outcome: "in_progress" },
           checks: [],
         });
-        expect(() =>
-          store.agentOperations().request({
-            operationId: "stale-fix",
-            workflowId,
-            branch: "fix/fixture",
-            expectedHead: reviewed,
-            expectedPullRequestHead: reviewed,
-            promptDigest: "prompt",
-            configurationId: "config",
-          }),
-        ).toThrow(/not eligible/);
       } finally {
         store.close();
       }

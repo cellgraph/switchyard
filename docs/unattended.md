@@ -36,4 +36,4 @@ Use a [fresh SQLite path](state-model.md#sqlite-baseline). In a second terminal 
 
 Press Ctrl-C or send SIGINT or SIGTERM to the launcher or worker PID shown in status. The worker drains active GitHub reads and skips queued reads and later pages. A duplicate worker exits while the recorded owner is live. A replacement can claim the database after the owner exits. GitHub retry deadlines persist across restarts. A rejected credential pauses requests for its installation for five minutes. The worker logs the installation ID and retry deadline.
 
-This mode uses polling only. Use the [GitHub App controller](github-app.md#run-the-controller) for webhook intake or a manual refresh. [Agent turns](agent-sessions.md) are requested separately.
+This mode uses polling only. Use the [GitHub App controller](github-app.md#run-the-controller) for webhook intake or a manual refresh. Use the [local execution CLI](agent-sessions.md) to run an explicit assignment.
