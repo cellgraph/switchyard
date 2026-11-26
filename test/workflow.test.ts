@@ -21,7 +21,6 @@ function fixture(): Workflow {
     state: "awaiting_review",
     headSha: "abc",
     requiredChecks: null,
-    review: null,
     checks: [],
     escalationReason: null,
   };
@@ -34,31 +33,8 @@ function memoryStore(): WorkflowStore {
 }
 
 describe("workflow state and durable store", () => {
-  it("requires clean review and every configured passing check for the current SHA", () => {
+  it("records configured checks and history while leaving a passing head awaiting review", () => {
     const db = memoryStore();
-    db.transition("wf-1", {
-      type: "review_received",
-      evidence: { sha: "abc", outcome: "completed_clean" },
-    });
-    expect(db.getWorkflow("wf-1")?.state).toBe("awaiting_review");
-    for (const outcome of ["pending", "failed", "unknown"] as const) {
-      db.transition("wf-1", {
-        type: "checks_received",
-        evidence: [
-          { name: "lint", sha: "abc", outcome: "passed" },
-          { name: "tests", sha: "abc", outcome },
-        ],
-        configuredNames: ["lint", "tests"],
-      });
-      expect(db.getWorkflow("wf-1")?.state).toBe("awaiting_review");
-    }
-    db.transition("wf-1", {
-      type: "checks_received",
-      evidence: [{ name: "lint", sha: "abc", outcome: "passed" }],
-      configuredNames: ["lint", "tests"],
-    });
-    expect(db.getWorkflow("wf-1")?.state).toBe("awaiting_review");
-    expect(db.getWorkflow("wf-1")?.state).toBe("awaiting_review");
     db.transition("wf-1", {
       type: "checks_received",
       evidence: [
@@ -67,22 +43,19 @@ describe("workflow state and durable store", () => {
       ],
       configuredNames: ["lint", "tests"],
     });
-    expect(db.getWorkflow("wf-1")?.state).toBe("ready_for_human");
+    expect(db.getWorkflow("wf-1")).toMatchObject({
+      state: "awaiting_review",
+      requiredChecks: ["lint", "tests"],
+    });
     expect(db.transitions("wf-1").at(-1)).toMatchObject({
-      to: "ready_for_human",
+      to: "awaiting_review",
       reason: "checks_received for abc: lint=passed, tests=passed",
       headSha: "abc",
     });
   });
 
-  it("rejects stale review and check evidence, and invalidates evidence on a new head", () => {
+  it("rejects stale check evidence and clears current evidence on a new head", () => {
     const db = memoryStore();
-    expect(() =>
-      db.transition("wf-1", {
-        type: "review_received",
-        evidence: { sha: "old", outcome: "completed_clean" },
-      }),
-    ).toThrow(InvalidTransitionError);
     expect(() =>
       db.transition("wf-1", {
         type: "checks_received",
@@ -90,10 +63,6 @@ describe("workflow state and durable store", () => {
         configuredNames: ["ci"],
       }),
     ).toThrow(InvalidTransitionError);
-    db.transition("wf-1", {
-      type: "review_received",
-      evidence: { sha: "abc", outcome: "completed_clean" },
-    });
     db.transition("wf-1", {
       type: "checks_received",
       evidence: [{ name: "ci", sha: "abc", outcome: "passed" }],
@@ -103,7 +72,6 @@ describe("workflow state and durable store", () => {
     expect(db.getWorkflow("wf-1")).toMatchObject({
       state: "awaiting_review",
       headSha: "def",
-      review: null,
       checks: [],
     });
   });

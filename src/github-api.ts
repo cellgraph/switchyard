@@ -19,14 +19,6 @@ export type PullRequestState = {
 export interface GitHubReader {
   completeReconciliation(target: PullRequestTarget): void;
   readPullRequest(target: PullRequestTarget, signal?: AbortSignal): Promise<PullRequestState>;
-  readReviewInputs(
-    target: PullRequestTarget,
-    signal?: AbortSignal,
-  ): Promise<{
-    reviews: unknown[];
-    reviewComments: unknown[];
-    issueComments: unknown[];
-  }>;
   readChecks(
     target: PullRequestTarget,
     headSha: string,
@@ -61,11 +53,13 @@ export function createGitHubReader(
     throw new Error(`GitHub pagination limit exceeded for ${path}.`);
   }
 
-  const readReviewComments = (target: PullRequestTarget, signal?: AbortSignal) =>
-    list(target, `/pulls/${target.pullRequest}/comments`, signal);
-
   return {
-    readReviewComments,
+    readReviews: (target: PullRequestTarget, signal?: AbortSignal) =>
+      list(target, `/pulls/${target.pullRequest}/reviews`, signal),
+    readReviewComments: (target: PullRequestTarget, signal?: AbortSignal) =>
+      list(target, `/pulls/${target.pullRequest}/comments`, signal),
+    readIssueComments: (target: PullRequestTarget, signal?: AbortSignal) =>
+      list(target, `/issues/${target.pullRequest}/comments`, signal),
     completeReconciliation(target: PullRequestTarget) {
       client.completeReconciliation(target, target.pullRequest);
     },
@@ -101,15 +95,6 @@ export function createGitHubReader(
           ? { headDefaultBranch: repository.default_branch }
           : {}),
       };
-    },
-
-    async readReviewInputs(target: PullRequestTarget, signal?: AbortSignal) {
-      const [reviews, reviewComments, issueComments] = await readAll(
-        list(target, `/pulls/${target.pullRequest}/reviews`, signal),
-        readReviewComments(target, signal),
-        list(target, `/issues/${target.pullRequest}/comments`, signal),
-      );
-      return { reviews, reviewComments, issueComments };
     },
 
     async readChecks(target: PullRequestTarget, headSha: string, signal?: AbortSignal) {
@@ -149,7 +134,7 @@ export function createGitHubReader(
       }
       return [...checks.values()].sort((left, right) => left.name.localeCompare(right.name, "en"));
     },
-  } satisfies GitHubReader & { readReviewComments: typeof readReviewComments };
+  } satisfies GitHubReader & Record<string, unknown>;
 }
 
 async function readAll<T extends unknown[]>(

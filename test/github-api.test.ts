@@ -9,7 +9,7 @@ import { createGitHubReader, type GitHubReader } from "../src/github-api.ts";
 import {
   createGitHubAppClient,
   GitHubTransientError,
-  GitHubWriteRejected,
+  GitHubAuthenticationError,
   resumeGitHubAfterSecondaryLimit,
   tokenRetryKey,
 } from "../src/github-app.ts";
@@ -121,7 +121,7 @@ describe("GitHub App and REST adapter", () => {
     expect(exchanges).toBe(3);
   });
 
-  it("recognizes an auth cooldown recorded during token exchange as an unsent comment", async () => {
+  it("recognizes an auth cooldown recorded during token exchange before starting a repository read", async () => {
     const now = Date.UTC(2026, 0, 1);
     let retryAt: number | undefined;
     const fetcher = vi.fn<typeof fetch>(async () => {
@@ -133,15 +133,12 @@ describe("GitHub App and REST adapter", () => {
       privateKey,
       fetcher,
       now: () => now,
-      reviewWrites: true,
       retryDeadlines: {
         get: (key) => (key.startsWith("auth:") ? retryAt : undefined),
         extend: vi.fn(),
       },
     });
-    await expect(
-      client.postReviewComment(target, null, { body: "fixture" }),
-    ).rejects.toBeInstanceOf(GitHubWriteRejected);
+    await expect(client.get(target, "/pulls/7")).rejects.toBeInstanceOf(GitHubAuthenticationError);
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(requestUrl(fetcher.mock.calls[0]![0]).pathname).toContain("/access_tokens");
   });
@@ -653,12 +650,14 @@ describe("GitHub App and REST adapter", () => {
             ],
           });
         }
-        if (path.endsWith("/status")) return Response.json({ sha, statuses: [] });
-        if (path.endsWith("/reviews") && failure === "evidence retry deadline" && now === resetAt)
-          return Response.json(
-            { message: "Resource not accessible by integration" },
-            { status: 403 },
-          );
+        if (path.endsWith("/status")) {
+          if (failure === "evidence retry deadline" && now === resetAt)
+            return Response.json(
+              { message: "Resource not accessible by integration" },
+              { status: 403 },
+            );
+          return Response.json({ sha, statuses: [] });
+        }
         return Response.json([]);
       });
       try {
@@ -770,7 +769,6 @@ describe("GitHub App and REST adapter", () => {
           .fn<GitHubReader["readChecks"]>()
           .mockRejectedValueOnce(new GitHubTransientError("HTTP 503", { retryAt: now + 120_000 }))
           .mockResolvedValue([{ name: "build", sha, outcome: "passed" }]),
-        readReviewInputs: async () => ({ reviews: [], reviewComments: [], issueComments: [] }),
         completeReconciliation: vi.fn(),
       };
       try {
@@ -893,7 +891,7 @@ describe("GitHub App and REST adapter", () => {
 
         now = retryAt;
         expect(await runPass()).toBe(true);
-        expect(readsForTarget()).toBe(reads + 7);
+        expect(readsForTarget()).toBe(reads + 4);
         expect(store.deliveryStatus("deferred-delivery")).toMatchObject({
           status: "processed",
           attempts: 1,
@@ -1066,7 +1064,7 @@ describe("GitHub App and REST adapter", () => {
       });
       for (const id of ["close", "reopen"])
         expect(store.deliveryStatus(id)).toMatchObject({ status: "processed", attempts: 1 });
-      expect(fetcher).toHaveBeenCalledTimes(11);
+      expect(fetcher).toHaveBeenCalledTimes(8);
     } finally {
       store.close();
     }
@@ -1241,11 +1239,9 @@ describe("GitHub App and REST adapter", () => {
     const client = createGitHubAppClient({ clientId: "fixture-client-id", privateKey, fetcher });
     const api = createGitHubReader(client);
     expect(await api.readPullRequest(target)).toEqual({ headSha: sha, state: "open" });
-    expect(await api.readReviewInputs(target)).toEqual({
-      reviews: [{ id: 1 }, { id: 2 }],
-      reviewComments: [{ id: 3 }],
-      issueComments: [{ id: 4, body: "edited" }],
-    });
+    expect(await api.readReviews(target)).toEqual([{ id: 1 }, { id: 2 }]);
+    expect(await api.readReviewComments(target)).toEqual([{ id: 3 }]);
+    expect(await api.readIssueComments(target)).toEqual([{ id: 4, body: "edited" }]);
     expect(await api.readChecks(target, sha)).toEqual([
       { name: "Build", sha, outcome: "pending" },
       { name: "Legacy", sha, outcome: "failed" },
@@ -1255,6 +1251,60 @@ describe("GitHub App and REST adapter", () => {
     ]);
     expect(pagesSeen).toContain("/pulls/7/reviews:2");
     expect(pagesSeen).toContain(`/commits/${sha}/check-runs:2`);
+  });
+
+  it("reads a referenced thread with a paginated GraphQL query and read-only credentials", async () => {
+    const seenCursors: (string | null)[] = [];
+    const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+      const path = requestUrl(input).pathname;
+      expect(options?.method).toBe("POST");
+      const body = JSON.parse(String(options?.body));
+      if (path === "/app/installations/42/access_tokens") {
+        expect(body).toEqual({
+          repositories: ["repo"],
+          permissions: { pull_requests: "read", checks: "read", statuses: "read" },
+        });
+        return Response.json({
+          token: "fixture-token",
+          expires_at: new Date(Date.now() + 3_600_000),
+        });
+      }
+      expect(path).toBe("/graphql");
+      expect(new Headers(options?.headers).get("authorization")).toBe("Bearer fixture-token");
+      expect(body.query).toMatch(/^query SwitchyardReviewThread\(/);
+      const after = seenCursors.length === 0 ? null : "next-cursor";
+      expect(body.variables).toEqual({ owner: "owner", repo: "repo", pr: 7, after });
+      seenCursors.push(after);
+      return Response.json({
+        data: {
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                nodes: after
+                  ? [
+                      {
+                        id: "thread-2",
+                        isResolved: false,
+                        isOutdated: true,
+                        comments: { nodes: [{ fullDatabaseId: "202" }] },
+                      },
+                    ]
+                  : [],
+                pageInfo: { hasNextPage: after === null, endCursor: "next-cursor" },
+              },
+            },
+          },
+        },
+      });
+    });
+    const client = createGitHubAppClient({ clientId: "fixture-client-id", privateKey, fetcher });
+    expect(await client.readReviewThread(target, 202)).toEqual({
+      id: "thread-2",
+      resolved: false,
+      outdated: true,
+    });
+    expect(seenCursors).toEqual([null, "next-cursor"]);
+    expect(fetcher).toHaveBeenCalledTimes(3);
   });
 
   it("rejects legacy statuses resolved to a different SHA", async () => {
@@ -1272,73 +1322,64 @@ describe("GitHub App and REST adapter", () => {
     await expect(api.readChecks(target, sha)).rejects.toThrow("different SHA");
   });
 
-  it.each(["checks", "reviews"] as const)(
-    "waits for a late %s backoff before a run-once pass can close the store",
-    async (group) => {
-      const now = Date.UTC(2026, 0, 1);
-      const retryAt = now + 120_000;
-      const store = new WorkflowStore();
-      const delayed = Promise.withResolvers<Response>();
-      const started = Promise.withResolvers<void>();
-      const fetcher = vi.fn<typeof fetch>(async (input, options) => {
-        if (options?.method === "POST")
-          return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
-        const path = requestUrl(input).pathname;
-        if (path.endsWith("/pulls/7"))
-          return Response.json({ number: 7, state: "open", head: { sha } });
-        const failsEarly =
-          group === "checks" ? path.endsWith("/check-runs") : path.endsWith("/reviews");
-        const failsLate =
-          group === "checks" ? path.endsWith("/status") : path.endsWith("/issues/7/comments");
-        if (failsEarly) return new Response(null, { status: 500 });
-        if (failsLate) {
-          started.resolve();
-          return delayed.promise;
-        }
-        if (path.endsWith("/check-runs")) return Response.json({ check_runs: [] });
-        if (path.endsWith("/status")) return Response.json({ sha, statuses: [] });
-        return Response.json([]);
+  it("waits for a late CI backoff before a run-once pass can close the store", async () => {
+    const now = Date.UTC(2026, 0, 1);
+    const retryAt = now + 120_000;
+    const store = new WorkflowStore();
+    const delayed = Promise.withResolvers<Response>();
+    const started = Promise.withResolvers<void>();
+    const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+      if (options?.method === "POST")
+        return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+      const path = requestUrl(input).pathname;
+      if (path.endsWith("/pulls/7"))
+        return Response.json({ number: 7, state: "open", head: { sha } });
+      if (path.endsWith("/check-runs")) return new Response(null, { status: 500 });
+      if (path.endsWith("/status")) {
+        started.resolve();
+        return delayed.promise;
+      }
+      throw new Error(`Unexpected fixture endpoint ${path}`);
+    });
+    try {
+      const rateLimits = store.githubRateLimits();
+      const client = createGitHubAppClient({
+        clientId: "fixture-client-id",
+        privateKey,
+        fetcher,
+        rateLimits,
+        now: () => now,
+      });
+      const controller = createController({
+        store,
+        targets: [target],
+        reconcile: createReconciler(store, createGitHubReader(client)),
+        reportError: vi.fn(),
+        reconcileIntervalMs: 0,
+        now: () => now,
+      });
+      store.receiveDelivery("fixture-delivery", target);
+      let settled = false;
+      const pass = controller.runPass().finally(() => {
+        settled = true;
       });
       try {
-        const rateLimits = store.githubRateLimits();
-        const client = createGitHubAppClient({
-          clientId: "fixture-client-id",
-          privateKey,
-          fetcher,
-          rateLimits,
-          now: () => now,
-        });
-        const controller = createController({
-          store,
-          targets: [target],
-          reconcile: createReconciler(store, createGitHubReader(client)),
-          reportError: vi.fn(),
-          reconcileIntervalMs: 0,
-          now: () => now,
-        });
-        store.receiveDelivery("fixture-delivery", target);
-        let settled = false;
-        const pass = controller.runPass().finally(() => {
-          settled = true;
-        });
-        try {
-          await started.promise;
-          await setImmediate();
-          expect(settled).toBe(false);
-        } finally {
-          delayed.resolve(new Response(null, { status: 429, headers: { "retry-after": "120" } }));
-          expect(await pass).toBe(false);
-        }
-        expect(rateLimits.get("secondary")?.retryAt).toBe(retryAt);
-        expect(store.deliveryStatus("fixture-delivery")).toMatchObject({
-          status: "failed",
-          retryAt,
-        });
+        await started.promise;
+        await setImmediate();
+        expect(settled).toBe(false);
       } finally {
-        store.close();
+        delayed.resolve(new Response(null, { status: 429, headers: { "retry-after": "120" } }));
+        expect(await pass).toBe(false);
       }
-    },
-  );
+      expect(rateLimits.get("secondary")?.retryAt).toBe(retryAt);
+      expect(store.deliveryStatus("fixture-delivery")).toMatchObject({
+        status: "failed",
+        retryAt,
+      });
+    } finally {
+      store.close();
+    }
+  });
 
   it("preserves the GitHub retry deadline when discarding a throttled response body fails", async () => {
     const store = new WorkflowStore();
@@ -1385,74 +1426,49 @@ describe("GitHub App and REST adapter", () => {
     }
   });
 
-  it.each(["check head", "comment page"] as const)(
-    "clears a throttle for an obsolete %s after the same PR reconciles successfully",
-    async (resource) => {
-      const store = new WorkflowStore();
-      let now = Date.UTC(2026, 0, 1);
-      let headSha = sha;
-      let throttle = true;
-      const fetcher = vi.fn<typeof fetch>(async (input, options) => {
-        if (options?.method === "POST")
-          return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
-        const url = requestUrl(input);
-        const prNumber = /\/pulls\/(\d+)$/.exec(url.pathname)?.[1];
-        if (prNumber)
-          return Response.json({ number: Number(prNumber), state: "open", head: { sha: headSha } });
-        if (url.pathname.endsWith("/status")) return Response.json({ sha: headSha, statuses: [] });
-        if (url.pathname.endsWith("/check-runs"))
-          return resource === "check head" && throttle
-            ? new Response(null, { status: 429 })
-            : Response.json({ check_runs: [] });
-        if (
-          url.pathname.endsWith("/issues/7/comments") &&
-          resource === "comment page" &&
-          throttle
-        ) {
-          if (url.searchParams.get("page") === "2") return new Response(null, { status: 429 });
-          return Response.json([], {
-            headers: {
-              link: '<https://api.github.com/repos/owner/repo/issues/7/comments?page=2>; rel="next"',
-            },
-          });
-        }
-        return Response.json([]);
+  it("clears a throttle for an obsolete check head after the same PR reconciles successfully", async () => {
+    const store = new WorkflowStore();
+    let now = Date.UTC(2026, 0, 1);
+    let headSha = sha;
+    let throttle = true;
+    const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+      if (options?.method === "POST")
+        return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+      const url = requestUrl(input);
+      const prNumber = /\/pulls\/(\d+)$/.exec(url.pathname)?.[1];
+      if (prNumber)
+        return Response.json({ number: Number(prNumber), state: "open", head: { sha: headSha } });
+      if (url.pathname.endsWith("/status")) return Response.json({ sha: headSha, statuses: [] });
+      if (url.pathname.endsWith("/check-runs"))
+        return throttle ? new Response(null, { status: 429 }) : Response.json({ check_runs: [] });
+      throw new Error(`Unexpected fixture endpoint ${url.pathname}`);
+    });
+    try {
+      const rateLimits = store.githubRateLimits();
+      const client = createGitHubAppClient({
+        clientId: "fixture-client-id",
+        privateKey,
+        fetcher,
+        rateLimits,
+        now: () => now,
       });
-      try {
-        const rateLimits = store.githubRateLimits();
-        const client = createGitHubAppClient({
-          clientId: "fixture-client-id",
-          privateKey,
-          fetcher,
-          rateLimits,
-          now: () => now,
-        });
-        const reconcile = createReconciler(store, createGitHubReader(client));
-        for (const digit of ["b", "c", "d", "e", "f"]) {
-          const retryAt = now + 60_000;
-          await expect(reconcile(target)).rejects.toMatchObject({ retryAt });
-          if (digit === "b") {
-            // Existing databases can have a narrower retry key from an earlier controller.
-            const retryRequest =
-              resource === "check head"
-                ? "checks:42:owner/repo:7"
-                : "42:GET:/repos/owner/repo/issues/7/comments?per_page=100&page=2";
-            rateLimits.set("secondary", { retryAt, throttledAttempts: 1, retryRequest });
-          }
-          now = retryAt;
-          if (resource === "check head") headSha = digit.repeat(40);
-          throttle = false;
-          await reconcile({ ...target, pullRequest: 8 });
-          expect(rateLimits.get("secondary")?.throttledAttempts).toBe(1);
-          await reconcile(target);
-          expect(rateLimits.get("secondary")?.throttledAttempts).toBe(0);
-          throttle = true;
-        }
-      } finally {
-        store.close();
+      const reconcile = createReconciler(store, createGitHubReader(client));
+      for (const digit of ["b", "c", "d", "e", "f"]) {
+        const retryAt = now + 60_000;
+        await expect(reconcile(target)).rejects.toMatchObject({ retryAt });
+        now = retryAt;
+        headSha = digit.repeat(40);
+        throttle = false;
+        await reconcile({ ...target, pullRequest: 8 });
+        expect(rateLimits.get("secondary")?.throttledAttempts).toBe(1);
+        await reconcile(target);
+        expect(rateLimits.get("secondary")?.throttledAttempts).toBe(0);
+        throttle = true;
       }
-    },
-  );
+    } finally {
+      store.close();
+    }
+  });
 
   it("doubles the retry delay when alternating reads still throttle the same reconciliation", async () => {
     const store = new WorkflowStore();
@@ -1485,7 +1501,7 @@ describe("GitHub App and REST adapter", () => {
       for (const minutes of [1, 2, 4, 8, 16]) {
         const retryAt = now + minutes * 60_000;
         await expect(reconcile(target)).rejects.toMatchObject({ retryAt });
-        resource = resource === "status" ? "reviews" : "status";
+        resource = resource === "status" ? "check-runs" : "status";
         now = retryAt;
       }
       const requests = fetcher.mock.calls.length;
@@ -1933,7 +1949,6 @@ describe("GitHub App and REST adapter", () => {
   it.each([
     ["pr:42:owner/repo:7", 4],
     ["token:42:owner/repo", 4],
-    ["checks:42:owner/repo:7", 4],
     ["pr:84:other/repo:8", 5],
   ] as const)(
     "preserves tracked retries and operator pauses at startup (%s)",

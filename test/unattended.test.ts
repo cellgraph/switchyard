@@ -12,7 +12,6 @@ import { createGitHubReader, type GitHubReader } from "../src/github-api.ts";
 import { createGitHubAppClient, GitHubTransientError } from "../src/github-app.ts";
 import { WorkflowStore } from "../src/store.ts";
 import { runUnattended, workerStatus } from "../src/unattended.ts";
-import reviewFixture from "./fixtures/codex-pr51.json" with { type: "json" };
 
 const first = { repository: "owner/one", pullRequest: 1, installationId: 1 };
 const second = { repository: "owner/two", pullRequest: 2, installationId: 2 };
@@ -41,7 +40,6 @@ describe("unattended polling", () => {
         headSha: oldHead,
       })),
       readChecks: vi.fn(async () => []),
-      readReviewInputs: vi.fn(async () => ({ reviews: [], reviewComments: [], issueComments: [] })),
     };
     stop = new AbortController();
     now = 1_000;
@@ -120,7 +118,6 @@ describe("unattended polling", () => {
     await worker(() => stop.abort());
     expect(store.findWorkflow(first.repository, 1)).toMatchObject({
       headSha: newHead,
-      review: null,
       checks: [],
     });
     expect(store.findWorkflow(second.repository, 2)).not.toBeNull();
@@ -142,7 +139,6 @@ describe("unattended polling", () => {
       throw new Error("Shutdown must skip the polling delay.");
     });
     expect(reader.readChecks).not.toHaveBeenCalled();
-    expect(reader.readReviewInputs).not.toHaveBeenCalled();
     expect(reader.completeReconciliation).not.toHaveBeenCalled();
     expect(workerStatus(store)).toMatchObject({
       state: "stopped",
@@ -242,13 +238,11 @@ describe("unattended polling", () => {
     expect(requests.filter((request) => request.includes("/installations/1/"))).toHaveLength(2);
   });
 
-  it("observes required checks and findings without dispatching agent work", async () => {
-    const { clean, reviewed, ...inputs } = reviewFixture;
+  it("observes passing required checks without readiness or agent dispatch", async () => {
     vi.mocked(reader.readPullRequest).mockImplementation(async ({ pullRequest }) => ({
       state: "open",
-      headSha: pullRequest === 1 ? reviewed : clean,
+      headSha: pullRequest === 1 ? oldHead : newHead,
     }));
-    vi.mocked(reader.readReviewInputs).mockResolvedValue(inputs);
     vi.mocked(reader.readChecks).mockImplementation(async (_target, sha) => [
       { name: "CI", outcome: "passed", sha },
     ]);
@@ -263,12 +257,12 @@ describe("unattended polling", () => {
       },
     });
     expect(workerStatus(store).pullRequests).toMatchObject([
-      { state: "review_findings", attention: "review_findings" },
-      { state: "ready_for_human" },
+      { state: "awaiting_review", attention: null },
+      { state: "awaiting_review", attention: null },
     ]);
     expect(store.findWorkflow(first.repository, 1)).toMatchObject({
       requiredChecks: ["CI"],
-      checks: [{ name: "CI", outcome: "passed", sha: reviewed }],
+      checks: [{ name: "CI", outcome: "passed", sha: oldHead }],
     });
     using db = new DatabaseSync(path, { readOnly: true });
     expect(db.prepare("SELECT COUNT(*) AS count FROM agent_executions").get()?.count).toBe(0);

@@ -10,7 +10,6 @@ import { createGitHubReader, type PullRequestTarget } from "./github-api.ts";
 import { createGitHubAppClient, resumeGitHubAfterSecondaryLimit } from "./github-app.ts";
 import { positiveInteger } from "./github-data.ts";
 import { canReconcilePullRequest, createReconciler } from "./reconcile.ts";
-import { runReviewCommand } from "./review-command.ts";
 import { WorkflowStore } from "./store.ts";
 import { runUnattended, workerStatus } from "./unattended.ts";
 import { createWebhookServer } from "./webhook.ts";
@@ -57,8 +56,26 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const dbPath = process.env.SWITCHYARD_DB_PATH ?? "switchyard.sqlite";
   process.umask(0o077);
-  if (await runReviewCommand(args, dbPath, (path) => loadConfig(path).targets)) return;
   if (await runAgentCommand(args, dbPath)) return;
+  if (args[0] === "--review-status") {
+    const workflowId = args[1];
+    if (args.length !== 2 || !workflowId) throw new Error("Usage: --review-status WORKFLOW_ID");
+    const store = new WorkflowStore(dbPath);
+    try {
+      const workflow = store.getWorkflow(workflowId);
+      if (!workflow) throw new Error(`Workflow ${workflowId} does not exist.`);
+      console.info(
+        JSON.stringify({
+          workflowId,
+          headSha: workflow.headSha,
+          reviews: store.reviews().list(workflowId),
+        }),
+      );
+    } finally {
+      store.close();
+    }
+    return;
+  }
   if (args[0] === "--worker-status") {
     if (args.length !== 1) throw new Error("Usage: --worker-status");
     const store = new WorkflowStore(dbPath);
@@ -93,7 +110,7 @@ async function main(): Promise<void> {
     args.length !== (onceOnly || unattended ? 2 : 1)
   )
     throw new Error(
-      "Usage: npm start -- [--once | --worker] CONFIG.json or npm start -- --worker-status | --resume-github",
+      "Usage: npm start -- [--once | --worker] CONFIG.json or npm start -- --worker-status | --resume-github | --review-status WORKFLOW_ID",
     );
   if (unattended && !supervised) return superviseWorker(configPath);
   if (supervised && !process.connected) return;

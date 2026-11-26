@@ -1,6 +1,6 @@
 # Unattended polling
 
-The unattended worker observes configured GitHub PRs. It refreshes workflow, review and CI evidence and reports when a finding or workflow state needs attention. See the [GitHub App guide](github-app.md) for authentication and the [architecture overview](architecture.md#current-implementation) for the current execution paths.
+The unattended worker observes configured GitHub PRs. It refreshes lifecycle and exact-head CI evidence and reports operator stops and escalations. Review-driven readiness is unavailable in Phase B1. See the [GitHub App guide](github-app.md) for authentication and the [architecture overview](architecture.md#current-implementation) for the current execution paths.
 
 ## Configuration
 
@@ -19,7 +19,7 @@ List repositories, App installation IDs and exact PR numbers. The worker polls a
 }
 ```
 
-The optional `requiredChecks` map uses configured lowercase `owner/repo#PR` keys and nonempty lists of unique check names. A PR without an entry still has CI evidence recorded and remains ineligible for handoff. Keep the App private key outside the configuration file.
+The optional `requiredChecks` map uses configured lowercase `owner/repo#PR` keys and nonempty lists of unique check names. CI evidence is recorded for all configured PRs. Keep the App private key outside the configuration file.
 
 ## Run and inspect
 
@@ -30,7 +30,7 @@ export GITHUB_APP_PRIVATE_KEY_PATH=/absolute/path/to/github-app.pem
 npm start -- --worker /absolute/path/to/config.json
 ```
 
-Use a [fresh SQLite path](state-model.md#sqlite-baseline). In a second terminal with the same path, run `npm start -- --worker-status` to inspect the last run, poll timestamps, PR heads and review outcomes. Use [review commands](reviews.md) for evidence and finding details. Worker stdout emits JSON events for poll outcomes, changes to PR state and requests for operator attention.
+Use a [fresh SQLite path](state-model.md#sqlite-baseline). In a second terminal with the same path, run `npm start -- --worker-status` to inspect the last run, poll timestamps, PR heads, lifecycle state and any attention reason. Worker stdout emits JSON events for poll outcomes, changes to PR state and requests for operator attention.
 
 ## Stop and restart
 
