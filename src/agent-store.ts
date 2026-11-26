@@ -1,419 +1,268 @@
+import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { isDeepStrictEqual } from "node:util";
-import type {
-  AgentOperation,
-  AgentOperationStatus,
-  AgentRuntime,
-  AgentSessionBinding,
-  AgentTurnEvidence,
-  AgentTurnIntent,
-} from "./agent-operation.ts";
-import type { Worktree } from "./worktree.ts";
-import type { Workflow, WorkflowCommand } from "./workflow.ts";
+import type { AgentContext, AgentFailure, AgentProvider } from "./agent.ts";
 
-type OperationRow = {
-  input: string;
-  status: AgentOperationStatus;
-  result: string | null;
-  error: string | null;
-  created_at: string;
-  updated_at: string;
+export type SessionRecord = {
+  id: string;
+  placement: "local";
+  context: AgentContext;
+  nativeId: string | null;
+  createdAt: string;
 };
-type SessionRecord = Omit<AgentSessionBinding, "reference">;
 
-function decode<T>(json: string): T {
-  return JSON.parse(json) as T;
-}
+export type ExecutionIntent = {
+  id: string;
+  assignmentId: string;
+} & ({ context: AgentContext; sessionId?: never } | { sessionId: string; context?: never });
 
-function eligible(workflow: Workflow | null, expectedPullRequestHead: string): boolean {
-  return workflow?.state === "awaiting_review" && workflow.headSha === expectedPullRequestHead;
-}
+export type ExecutionRecord = {
+  id: string;
+  assignmentId: string;
+  sessionId: string;
+  status: "running" | "completed" | AgentFailure["outcome"];
+  reason: string | null;
+  claimedAt: string;
+  finishedAt: string | null;
+};
 
-export function recoverAgentOperations(db: DatabaseSync) {
-  const now = new Date().toISOString();
-  const claims = db
-    .prepare(
-      `SELECT operation_id, workflow_id, owner_pid FROM operations
-     WHERE kind='durable_agent_turn' AND status IN ('dispatching','running') AND json_extract(input, '$.remote') IS NULL`,
-    )
-    .all() as { operation_id: string; workflow_id: string; owner_pid: number | null }[];
-  const holdSession = db.prepare(
-    `UPDATE agent_sessions SET execution=json_set(execution, '$.status', 'held', '$.updatedAt', ?)
-     WHERE workflow_id=? AND execution IS NOT NULL`,
+type Outcome = { outcome: "completed" } | AgentFailure;
+
+export const agentSchema = `
+  CREATE TABLE agent_sessions (
+    id TEXT PRIMARY KEY NOT NULL,
+    placement TEXT NOT NULL,
+    provider TEXT NOT NULL CHECK(provider IN ('codex','claude-code')),
+    working_directory TEXT NOT NULL,
+    model TEXT,
+    config_directory TEXT,
+    native_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(placement, provider, native_id)
   );
-  const markUnknown = db.prepare(
-    `UPDATE operations SET status='unknown', error='Agent owner exited without a recorded outcome.',
-     updated_at=? WHERE operation_id=?`,
+  CREATE TABLE agent_executions (
+    id TEXT PRIMARY KEY NOT NULL,
+    assignment_id TEXT NOT NULL,
+    session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+    status TEXT NOT NULL CHECK(status IN ('running','completed','not_started','failed','unknown')),
+    owner_pid INTEGER,
+    reason TEXT,
+    claimed_at TEXT NOT NULL,
+    finished_at TEXT
   );
-  const recovered: string[] = [];
-  const unverified: string[] = [];
-  for (const claim of claims) {
-    // A reused PID or missing ownership evidence is ambiguous. Only ESRCH proves
-    // there is no local process left that could still commit the outcome.
-    if (!claim.owner_pid || claim.owner_pid < 1) {
-      unverified.push(claim.operation_id);
-      continue;
-    }
-    try {
-      process.kill(claim.owner_pid, 0);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "EPERM") continue;
-      if (code !== "ESRCH") throw error;
-      holdSession.run(now, claim.workflow_id);
-      markUnknown.run(now, claim.operation_id);
-      recovered.push(claim.workflow_id);
-    }
-  }
-  return { recovered, unverified };
-}
+  CREATE UNIQUE INDEX one_dispatched_attempt_per_assignment ON agent_executions(assignment_id)
+    WHERE status != 'not_started';
+  CREATE UNIQUE INDEX one_unresolved_attempt_per_session ON agent_executions(session_id)
+    WHERE status IN ('running','unknown');
+`;
 
-export function createAgentOperationStore(
+export function createAgentStore(
   db: DatabaseSync,
-  {
-    transaction,
-    getWorkflow,
-    transition,
-  }: {
-    transaction: <T>(run: () => T) => T;
-    getWorkflow: (id: string) => Workflow | null;
-    transition: (id: string, command: WorkflowCommand) => Workflow;
-  },
+  transaction: <T>(run: () => T) => T,
+  ownerAlive: (pid: number) => boolean,
 ) {
-  function get(id: string): AgentOperation | null {
-    const row = db
-      .prepare("SELECT * FROM operations WHERE operation_id=? AND kind='durable_agent_turn'")
-      .get(id) as OperationRow | undefined;
-    return row
-      ? {
-          intent: decode(row.input),
-          status: row.status,
-          evidence: row.result === null ? null : decode(row.result),
-          error: row.error,
-          createdAt: row.created_at,
-          updatedAt: row.updated_at,
-        }
-      : null;
+  function get(id: string): ExecutionRecord | null {
+    return (
+      (db
+        .prepare(
+          `
+        SELECT id, assignment_id AS assignmentId, session_id AS sessionId, status,
+               reason, claimed_at AS claimedAt, finished_at AS finishedAt
+        FROM agent_executions WHERE id=?
+      `,
+        )
+        .get(id) as ExecutionRecord | undefined) ?? null
+    );
   }
 
-  function session(workflowId: string): AgentSessionBinding | null {
+  function session(id: string): SessionRecord | null {
     const row = db
       .prepare(
-        `SELECT s.session_id AS thread, s.execution AS session, w.execution AS worktree FROM agent_sessions s
-       LEFT JOIN worktrees w USING (workflow_id) WHERE s.workflow_id=?`,
+        `
+      SELECT id, placement, provider, working_directory AS workingDirectory, model,
+             config_directory AS configDirectory, native_id AS nativeId, created_at AS createdAt
+      FROM agent_sessions WHERE id=?
+    `,
       )
-      .get(workflowId) as
-      { thread: string | null; session: string | null; worktree: string | null } | undefined;
-    if (!row?.session) return null;
-    const record = decode<SessionRecord>(row.session);
+      .get(id) as
+      | (Omit<SessionRecord, "context"> & {
+          provider: AgentProvider;
+          workingDirectory: string;
+          model: string | null;
+          configDirectory: string | null;
+        })
+      | undefined;
+    if (!row) return null;
+    const { provider, workingDirectory, model, configDirectory, ...record } = row;
     return {
       ...record,
-      reference:
-        row.thread && record.runtime && row.worktree
-          ? {
-              agent: { id: row.thread, provider: record.runtime.provider },
-              worktree: decode<Worktree>(row.worktree),
-            }
-          : null,
+      context: {
+        provider,
+        workingDirectory,
+        ...(model === null ? {} : { model }),
+        ...(configDirectory === null ? {} : { configDirectory }),
+      },
     };
   }
 
-  function saveSession(workflowId: string, binding: AgentSessionBinding): void {
-    const { reference, ...record } = binding;
-    const providerThread = reference?.agent.id ?? null;
-    db.prepare(
-      `INSERT INTO agent_sessions (workflow_id, session_id, execution) VALUES (?, ?, ?)
-       ON CONFLICT(workflow_id) DO UPDATE SET session_id=excluded.session_id, execution=excluded.execution`,
-    ).run(workflowId, providerThread, JSON.stringify(record));
-    if (reference) {
-      db.prepare(
-        `INSERT INTO worktrees (workflow_id, path, execution) VALUES (?, ?, ?)
-         ON CONFLICT(workflow_id) DO UPDATE SET path=excluded.path, execution=excluded.execution`,
-      ).run(workflowId, reference.worktree.path, JSON.stringify(reference.worktree));
-    }
-  }
-
-  function setStatus(
-    id: string,
-    from: AgentOperationStatus,
-    to: AgentOperationStatus,
-    evidence: AgentTurnEvidence | null,
-    error: string | null = null,
-  ): boolean {
-    return (
-      db
-        .prepare(
-          `UPDATE operations SET status=?, result=?, error=?, updated_at=?
-       WHERE operation_id=? AND kind='durable_agent_turn' AND status=?`,
-        )
-        .run(to, evidence && JSON.stringify(evidence), error, new Date().toISOString(), id, from)
-        .changes === 1
-    );
-  }
-
-  function assertNoLegacyOperation(workflowId: string): void {
-    if (
-      db
-        .prepare(
-          "SELECT 1 FROM operations WHERE workflow_id=? AND status IN ('pending','ambiguous') LIMIT 1",
-        )
-        .get(workflowId)
-    )
-      throw new Error("Workflow has an unresolved external operation.");
-  }
-
-  // A close/reopen or head change can invalidate an authorization even if the
-  // workflow later returns to the original state and SHA.
-  function workflowRevision(id: string): number {
-    return (
-      db
-        .prepare(
-          `SELECT COALESCE(MAX(id), 0) AS revision FROM transitions WHERE workflow_id=?
-       AND (from_state!=to_state OR reason LIKE 'head_changed to %' OR reason LIKE 'github_pull_request %')`,
-        )
-        .get(id) as { revision: number }
-    ).revision;
-  }
-
-  function authorized(workflow: Workflow | null, intent: AgentTurnIntent): boolean {
-    return (
-      eligible(workflow, intent.expectedPullRequestHead) &&
-      workflowRevision(intent.workflowId) === intent.workflowRevision
-    );
-  }
-
-  function retireIfRevoked(operation: AgentOperation): boolean {
-    const { intent } = operation;
-    return (
-      !authorized(getWorkflow(intent.workflowId), intent) &&
-      setStatus(
-        intent.operationId,
-        "requested",
-        "completed",
-        null,
-        "Workflow authorization changed before dispatch.",
+  function finish(id: string, outcome: Outcome): ExecutionRecord {
+    const changed = db
+      .prepare(
+        `
+      UPDATE agent_executions
+      SET status=?, reason=?, finished_at=?, owner_pid=NULL
+      WHERE id=? AND status='running'
+    `,
       )
-    );
+      .run(
+        outcome.outcome,
+        "reason" in outcome ? outcome.reason : null,
+        new Date().toISOString(),
+        id,
+      );
+    if (changed.changes !== 1) throw new Error("Execution no longer has an active claim.");
+    return get(id)!;
+  }
+
+  function recordSession(executionId: string, nativeId: string): void {
+    const changed = db
+      .prepare(
+        `
+        UPDATE agent_sessions SET native_id=?
+        WHERE id=(
+          SELECT session_id FROM agent_executions WHERE id=? AND status='running' AND owner_pid=?
+        ) AND (native_id IS NULL OR native_id=?)
+      `,
+      )
+      .run(nativeId, executionId, process.pid, nativeId);
+    if (changed.changes !== 1)
+      throw new Error("Could not associate the native session with the active execution.");
   }
 
   return {
     get,
     session,
-    retireRevokedRemoteRequests(workflowId?: string) {
-      transaction(() => {
-        const query = `SELECT t.operation_id FROM remote_turns t JOIN operations o USING(operation_id)
-          WHERE o.status='requested' AND t.prompt IS NOT NULL`;
-        const rows = (
-          workflowId === undefined
-            ? db.prepare(query).all()
-            : db.prepare(query + " AND o.workflow_id=?").all(workflowId)
-        ) as { operation_id: string }[];
-        const clear = db.prepare("UPDATE remote_turns SET prompt=NULL WHERE operation_id=?");
-        for (const { operation_id } of rows) {
-          if (retireIfRevoked(get(operation_id)!)) clear.run(operation_id);
-        }
-      });
-    },
-
-    request(input: Omit<AgentTurnIntent, "workflowRevision">): AgentOperation {
+    claim(input: ExecutionIntent) {
       return transaction(() => {
-        const existing = get(input.operationId);
+        const existing = get(input.id);
         if (existing) {
+          const recorded = session(existing.sessionId)!;
           if (
-            !isDeepStrictEqual(existing.intent, {
-              ...input,
-              workflowRevision: existing.intent.workflowRevision,
-            })
+            existing.assignmentId !== input.assignmentId ||
+            (input.sessionId !== undefined
+              ? existing.sessionId !== input.sessionId
+              : recorded.context.provider !== input.context.provider ||
+                recorded.context.workingDirectory !== input.context.workingDirectory ||
+                recorded.context.model !== input.context.model ||
+                recorded.context.configDirectory !== input.context.configDirectory)
           )
-            throw new Error("Operation ID is already bound to a different request.");
-          return existing;
+            throw new Error("Execution ID already belongs to a different assignment or context.");
+          return { claimed: false, execution: existing, session: recorded };
         }
-        if (db.prepare("SELECT 1 FROM operations WHERE operation_id=?").get(input.operationId))
-          throw new Error("Operation ID is already in use.");
-        const workflow = getWorkflow(input.workflowId);
-        if (workflow?.state !== "awaiting_review")
-          throw new Error("Workflow is not eligible for an agent turn.");
-        const intent: AgentTurnIntent = {
-          ...input,
-          workflowRevision: workflowRevision(workflow.id),
-        };
-        if (intent.remote && intent.expectedHead !== intent.expectedPullRequestHead)
-          throw new Error("Remote checkout and pull request heads must match.");
-        if (workflow.headSha !== input.expectedPullRequestHead)
-          throw new Error("Workflow head does not match the request.");
-        assertNoLegacyOperation(workflow.id);
         if (
           db
             .prepare(
-              `SELECT 1 FROM operations WHERE workflow_id=? AND kind='durable_agent_turn' AND status!='completed' LIMIT 1`,
+              `
+          SELECT 1 FROM agent_executions WHERE assignment_id=? AND status != 'not_started'
+        `,
             )
-            .get(workflow.id)
+            .get(input.assignmentId)
         )
-          throw new Error("Workflow already has an unresolved agent operation.");
-        const previous = session(workflow.id);
-        if (!previous && db.prepare("SELECT 1 FROM worktrees WHERE workflow_id=?").get(workflow.id))
-          throw new Error("An unbound worktree requires inspection before dispatch.");
-        if (previous && Boolean(previous.remoteWorkerId) !== Boolean(intent.remote))
-          throw new Error("The agent session belongs to a different execution location.");
-        if (previous?.status === "held" || previous?.status === "starting")
-          throw new Error("Agent session requires manual reconciliation.");
-        if (!previous && intent.expectedHead !== workflow.headSha)
-          throw new Error("The first agent turn must start at the recorded pull request head.");
-        if (
-          previous &&
-          (previous.head !== intent.expectedHead ||
-            previous.reference?.worktree.branch !== intent.branch)
-        )
-          throw new Error("Requested checkout does not match the recorded agent session.");
+          throw new Error("Assignment already has a dispatched or unresolved attempt.");
 
         const now = new Date().toISOString();
-        db.prepare(
-          `INSERT INTO operations (operation_id, workflow_id, kind, status, input, created_at, updated_at)
-           VALUES (?, ?, 'durable_agent_turn', 'requested', ?, ?, ?)`,
-        ).run(intent.operationId, intent.workflowId, JSON.stringify(intent), now, now);
-        return get(intent.operationId)!;
-      });
-    },
-
-    claim(id: string, remoteWorkerId?: string): { previous: AgentSessionBinding | null } | null {
-      return transaction(() => {
-        const operation = get(id);
-        if (
-          operation?.status !== "requested" ||
-          Boolean(operation.intent.remote) !== Boolean(remoteWorkerId)
-        )
-          return null;
-        const { intent } = operation;
-        if (retireIfRevoked(operation)) return null;
-        assertNoLegacyOperation(intent.workflowId);
-        const previous = session(intent.workflowId);
-        if (previous && previous.remoteWorkerId !== remoteWorkerId) return null;
-        if (!setStatus(id, "requested", "dispatching", operation.evidence)) return null;
-        if (!remoteWorkerId)
-          db.prepare("UPDATE operations SET owner_pid=? WHERE operation_id=?").run(process.pid, id);
-        if (!previous) {
-          const now = new Date().toISOString();
-          saveSession(intent.workflowId, {
-            ...(remoteWorkerId ? { remoteWorkerId } : {}),
-            initialOperationId: id,
-            lastOperationId: id,
-            status: "starting",
-            baseHead: intent.expectedHead,
-            runtime: null,
-            reference: null,
-            head: null,
-            checkpoint: null,
-            createdAt: now,
-            updatedAt: now,
-          });
+        let record: SessionRecord;
+        if (input.sessionId !== undefined) {
+          const saved = session(input.sessionId);
+          if (!saved?.nativeId)
+            throw new Error("A recorded native session is required for continuation.");
+          if (
+            db
+              .prepare(
+                `
+            SELECT 1 FROM agent_executions WHERE session_id=? AND status IN ('running','unknown')
+          `,
+              )
+              .get(saved.id)
+          )
+            throw new Error("Session has an unresolved execution. Inspect it before continuing.");
+          record = saved;
+        } else {
+          const { provider, workingDirectory, model, configDirectory } = input.context;
+          const id = randomUUID();
+          db.prepare(
+            `
+            INSERT INTO agent_sessions (id, placement, provider, working_directory, model, config_directory, created_at)
+            VALUES (?, 'local', ?, ?, ?, ?, ?)
+          `,
+          ).run(id, provider, workingDirectory, model ?? null, configDirectory ?? null, now);
+          record = session(id)!;
         }
-        return { previous };
+        // The insert records intent and takes the dispatch claim in the same transaction.
+        db.prepare(
+          `
+          INSERT INTO agent_executions (id, assignment_id, session_id, status, owner_pid, claimed_at)
+          VALUES (?, ?, ?, 'running', ?, ?)
+        `,
+        ).run(input.id, input.assignmentId, record.id, process.pid, now);
+        return { claimed: true, execution: get(input.id)!, session: record };
       });
     },
-
-    start(id: string, runtime: AgentRuntime): boolean {
+    recordSession,
+    finish(id: string, outcome: Outcome, nativeId: string | null) {
       return transaction(() => {
-        const operation = get(id);
-        return (
-          operation?.status === "dispatching" &&
-          authorized(getWorkflow(operation.intent.workflowId), operation.intent) &&
-          setStatus(id, "dispatching", "running", { ...operation.evidence, runtime })
-        );
+        const execution = get(id);
+        const owner = db.prepare("SELECT owner_pid FROM agent_executions WHERE id=?").get(id);
+        if (execution?.status !== "running" || owner?.owner_pid !== process.pid)
+          throw new Error("Execution no longer belongs to this process.");
+        if (outcome.outcome === "completed" && nativeId === null)
+          throw new Error("Completion requires a native session reference.");
+        const saved = session(execution.sessionId)!;
+        if (saved.nativeId !== nativeId) {
+          if (nativeId === null)
+            throw new Error("The recorded native session differs from the execution evidence.");
+          recordSession(id, nativeId);
+        }
+        return { execution: finish(id, outcome), session: session(execution.sessionId)! };
       });
     },
-
-    authorizeLaunch(id: string): boolean {
+    confirmFinish(claim: ExecutionRecord, outcome: Outcome, nativeId: string | null) {
+      // A connection may see its own writes even when their commit failed.
+      if (db.isTransaction) return null;
+      const execution = get(claim.id);
+      if (
+        !execution?.finishedAt ||
+        execution.assignmentId !== claim.assignmentId ||
+        execution.sessionId !== claim.sessionId ||
+        execution.claimedAt !== claim.claimedAt ||
+        execution.status !== outcome.outcome ||
+        execution.reason !== ("reason" in outcome ? outcome.reason : null)
+      )
+        return null;
+      const recordedSession = session(claim.sessionId);
+      return recordedSession?.nativeId === nativeId
+        ? { execution, session: recordedSession }
+        : null;
+    },
+    recover(): number {
       return transaction(() => {
-        const operation = get(id);
-        if (
-          operation?.status !== "running" ||
-          operation.evidence?.launchAuthorizedAt ||
-          !authorized(getWorkflow(operation.intent.workflowId), operation.intent)
-        )
-          return false;
-        return setStatus(id, "running", "running", {
-          ...operation.evidence,
-          launchAuthorizedAt: new Date().toISOString(),
-        });
-      });
-    },
-
-    progress(
-      id: string,
-      evidence: Pick<AgentTurnEvidence, "reference" | "worktree" | "expectedWorktree">,
-    ): void {
-      transaction(() => {
-        const current = get(id);
-        if (
-          current?.status !== "running" ||
-          !setStatus(id, "running", "running", { ...current.evidence, ...evidence })
-        )
-          throw new Error("Agent operation lost its dispatch authorization.");
-      });
-    },
-
-    finish(id: string, evidence: AgentTurnEvidence): AgentOperation {
-      return transaction(() => {
-        const current = get(id);
-        if (!current || (current.status !== "running" && current.status !== "dispatching"))
-          throw new Error("Agent operation is no longer in flight.");
-        evidence = { ...current.evidence, ...evidence };
-        const { intent } = current;
-        const workflow = getWorkflow(intent.workflowId);
-        const binding = session(intent.workflowId)!;
-        const error =
-          evidence.error ??
-          (evidence.workspace && "error" in evidence.workspace
-            ? evidence.workspace.error
-            : undefined) ??
-          evidence.agent?.reason ??
-          (!authorized(workflow, intent)
-            ? "Workflow authorization changed before outcome was recorded."
-            : undefined) ??
-          (binding.reference && !isDeepStrictEqual(binding.reference, evidence.reference)
-            ? "Worker returned a different session or checkout."
-            : undefined) ??
-          (evidence.reference &&
-          (evidence.reference.agent.provider !== evidence.runtime?.provider ||
-            evidence.reference.worktree.workflowId !== intent.workflowId ||
-            evidence.reference.worktree.branch !== intent.branch ||
-            !isDeepStrictEqual(evidence.reference.worktree, evidence.worktree))
-            ? "Worker returned conflicting session and checkout evidence."
-            : undefined) ??
-          (!evidence.runtime || !evidence.reference || !evidence.checkpoint || !evidence.workspace
-            ? "Agent did not return the session and checkout evidence needed for continuation."
-            : undefined);
-        const outcome = evidence.agent?.outcome;
-        const confirmed =
-          Boolean(current.evidence?.launchAuthorizedAt) && outcome === "completed" && !error;
-        let status: AgentOperationStatus = "manual_reconciliation";
-        if (confirmed || outcome === "failed") status = "completed";
-        if (outcome === "interrupted" || outcome === "unknown") status = outcome;
-        const reason = confirmed ? null : (error ?? "Agent turn requires manual reconciliation.");
-        if (!setStatus(id, current.status, status, evidence, reason))
-          throw new Error("Agent operation lost its dispatch authorization.");
-        saveSession(intent.workflowId, {
-          ...binding,
-          lastOperationId: id,
-          status: confirmed ? "active" : "held",
-          runtime: binding.runtime ?? evidence.runtime ?? null,
-          reference: binding.reference ?? evidence.reference ?? null,
-          head:
-            confirmed && evidence.workspace && "head" in evidence.workspace
-              ? evidence.workspace.head
-              : binding.head,
-          checkpoint: confirmed ? evidence.checkpoint! : binding.checkpoint,
-          updatedAt: new Date().toISOString(),
-        });
-
-        if (
-          reason &&
-          workflow &&
-          workflow.state !== "escalated" &&
-          (workflow.state !== "stopped" || workflow.closedByGitHub)
-        )
-          transition(intent.workflowId, { type: "escalate", reason });
-        return get(id)!;
+        const running = db
+          .prepare(
+            `
+          SELECT id, owner_pid AS ownerPid FROM agent_executions WHERE status='running'
+        `,
+          )
+          .all() as { id: string; ownerPid: number }[];
+        let recovered = 0;
+        for (const { id, ownerPid } of running) {
+          // A live or reused PID does not prove the native outcome.
+          if (ownerAlive(ownerPid)) continue;
+          finish(id, {
+            outcome: "unknown",
+            reason: "Execution owner exited before recording an outcome.",
+          });
+          recovered++;
+        }
+        return recovered;
       });
     },
   };

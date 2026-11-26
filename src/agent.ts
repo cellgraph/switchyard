@@ -1,50 +1,42 @@
-export type AgentWorkspace = { workingDirectory: string };
+export type AgentProvider = "codex" | "claude-code";
 
-export type AgentSessionReference = { provider: string; id: string };
-
-export type AgentEvent = {
-  kind: "session_started" | "turn_started" | "progress" | "turn_completed" | "turn_failed";
-  provider: string;
-  data: unknown;
+export type AgentContext = {
+  provider: AgentProvider;
+  workingDirectory: string;
+  model?: string;
+  configDirectory?: string;
 };
 
 export type AgentTurn = {
   prompt: string;
   outputSchema?: Record<string, unknown>;
   signal?: AbortSignal;
-  checkLaunch?: () => void;
-  onEvent?: (event: AgentEvent) => void;
+  onSession: (nativeId: string) => void;
 };
 
-export type AgentUsage = {
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadInputTokens?: number;
-  cacheCreationInputTokens?: number;
+export type AgentFailure = {
+  outcome: "not_started" | "failed" | "unknown";
+  reason: string;
 };
 
-export type AgentTurnTelemetry = {
-  usage?: AgentUsage;
-  sessionCostUsd?: number;
-  model?: string;
-};
-
-export type AgentTurnResult = AgentTurnTelemetry &
-  (
-    | { outcome: "completed"; response: string; structuredOutput?: unknown }
-    | { outcome: "failed" | "interrupted" | "unknown"; reason: string }
-  );
-
-export interface AgentSession {
-  readonly reference: AgentSessionReference | null;
-  runTurn(turn: AgentTurn): Promise<AgentTurnResult>;
-}
+export type AgentResult =
+  { outcome: "completed"; response: string; structuredOutput?: unknown } | AgentFailure;
 
 export interface AgentAdapter {
-  startSession(workspace: AgentWorkspace): AgentSession;
-  resumeSession(workspace: AgentWorkspace, reference: AgentSessionReference): AgentSession;
+  start(turn: AgentTurn): Promise<AgentResult>;
+  resume(nativeId: string, turn: AgentTurn): Promise<AgentResult>;
 }
 
-export function agentTokenCount(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+export function validNativeId(id: unknown): id is string {
+  return typeof id === "string" && /^[a-z0-9][a-z0-9._:-]{0,199}$/i.test(id);
+}
+
+// Return fixed diagnostics. Native errors may include prompts, output or credentials.
+export function authenticationFailure(message: unknown): boolean {
+  return (
+    typeof message === "string" &&
+    /authentication_error|failed to authenticate|unauthorized|not logged in|please (?:log|sign) in|invalid (?:api key|x-api-key|access token)|\b(?:401 Unauthorized|status(?: code)?:? 401)\b/i.test(
+      message,
+    )
+  );
 }

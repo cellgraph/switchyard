@@ -1,6 +1,8 @@
 import type { ThreadEvent } from "@openai/codex-sdk";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, expect, it, vi } from "vitest";
+import { createAgentController } from "../src/agent-controller.ts";
 import { createCodexAgent } from "../src/codex-agent.ts";
+import { WorkflowStore } from "../src/store.ts";
 
 const sdk = vi.hoisted(() => ({
   create: vi.fn(),
@@ -19,16 +21,8 @@ vi.mock("@openai/codex-sdk", () => ({
   },
 }));
 
-const workspace = { workingDirectory: "/tmp/worktree" };
-const settings = { model: "configured-model", codexHome: "/tmp/codex-home" };
-const options = {
-  workingDirectory: workspace.workingDirectory,
-  model: settings.model,
-  sandboxMode: "workspace-write",
-  approvalPolicy: "never",
-  networkAccessEnabled: false,
-  webSearchMode: "disabled",
-};
+const context = { provider: "codex", workingDirectory: "/repo" } as const;
+const thread = { type: "thread.started", thread_id: "native-id" } as const;
 const completed = {
   type: "turn.completed",
   usage: {
@@ -40,6 +34,10 @@ const completed = {
   },
 } satisfies ThreadEvent;
 
+function message(text: string): ThreadEvent {
+  return { type: "item.completed", item: { id: "1", type: "agent_message", text } };
+}
+
 function stream(events: ThreadEvent[], error?: Error) {
   sdk.runStreamed.mockImplementationOnce(async () => ({
     events: (async function* () {
@@ -49,151 +47,186 @@ function stream(events: ThreadEvent[], error?: Error) {
   }));
 }
 
-describe("Codex SDK adapter", () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    for (const open of [sdk.startThread, sdk.resumeThread])
-      open.mockReturnValue({ runStreamed: sdk.runStreamed });
+beforeEach(() => {
+  vi.resetAllMocks();
+  for (const open of [sdk.startThread, sdk.resumeThread])
+    open.mockReturnValue({ runStreamed: sdk.runStreamed });
+});
+
+it("starts a native thread and passes through the prompt and schema using native defaults", async () => {
+  const adapter = createCodexAgent(context);
+  const outputSchema = { type: "object", properties: { ok: { const: true } } };
+  const onSession = vi.fn();
+  stream([thread, message('{"ok":true}'), completed]);
+  expect(await adapter.start({ prompt: "test", outputSchema, onSession })).toEqual({
+    outcome: "completed",
+    response: '{"ok":true}',
+    structuredOutput: { ok: true },
   });
+  expect(sdk.create).toHaveBeenCalledWith(undefined);
+  expect(sdk.startThread).toHaveBeenCalledWith({ workingDirectory: "/repo" });
+  expect(sdk.runStreamed).toHaveBeenCalledWith("test", { outputSchema });
+  expect(onSession).toHaveBeenCalledExactlyOnceWith(thread.thread_id);
+});
 
-  it("uses the read-only sandbox for remote profiles", () => {
-    createCodexAgent({ ...settings, readOnly: true }).startSession(workspace);
-    expect(sdk.startThread).toHaveBeenCalledWith({ ...options, sandboxMode: "read-only" });
+it("continues the recorded thread with an optional model and config directory", async () => {
+  const adapter = createCodexAgent({ ...context, model: "configured", configDirectory: "/codex" });
+  const onSession = vi.fn();
+  stream([thread, message("continued"), completed]);
+  expect(await adapter.resume(thread.thread_id, { prompt: "continue", onSession })).toEqual({
+    outcome: "completed",
+    response: "continued",
   });
-
-  it("scopes SDK execution and streams native events while exposing structured output", async () => {
-    const adapter = createCodexAgent(settings);
-    const session = adapter.startSession(workspace);
-    expect(sdk.startThread).toHaveBeenCalledWith(options);
-    const { env, config } = sdk.create.mock.calls[0]![0] as Record<string, unknown>;
-    expect(env).toEqual(expect.objectContaining({ CODEX_HOME: settings.codexHome }));
-    expect(
-      Object.keys(env as object).every((key) =>
-        ["HOME", "CODEX_HOME", "PATH", "TMPDIR", "LANG", "LC_ALL"].includes(key),
-      ),
-    ).toBe(true);
-    expect(config).toMatchObject({
-      sandbox_workspace_write: {
-        writable_roots: [],
-        exclude_slash_tmp: true,
-        exclude_tmpdir_env_var: true,
-      },
-    });
-    expect(session.reference).toBeNull();
-    const outputSchema = { type: "object" };
-    const response = '{"summary":"done"}';
-    const message = {
-      type: "item.completed",
-      item: { id: "1", type: "agent_message", text: response },
-    } as const;
-    const onEvent = vi.fn();
-    stream([
-      { type: "thread.started", thread_id: "opaque" },
-      { type: "turn.started" },
-      message,
-      completed,
-    ]);
-    expect(await session.runTurn({ prompt: "test", outputSchema, onEvent })).toEqual({
-      outcome: "completed",
-      response,
-      structuredOutput: { summary: "done" },
-      usage: { inputTokens: 1, outputTokens: 2 },
-    });
-    expect(sdk.runStreamed).toHaveBeenCalledWith("test", { outputSchema });
-    expect(onEvent.mock.calls.map(([event]) => event.kind)).toEqual([
-      "session_started",
-      "turn_started",
-      "progress",
-      "turn_completed",
-    ]);
-    expect(onEvent).toHaveBeenCalledWith({ provider: "codex", kind: "progress", data: message });
-    expect(session.reference).toEqual({ provider: "codex", id: "opaque" });
-  });
-
-  it("resumes the opaque provider reference and rejects a replacement thread", async () => {
-    const adapter = createCodexAgent(settings);
-    expect(() => adapter.resumeSession(workspace, { provider: "other", id: "opaque" })).toThrow(
-      "Codex session",
-    );
-    const reference = { provider: "codex", id: "opaque" };
-    const session = adapter.resumeSession(workspace, reference);
-    expect(sdk.resumeThread).toHaveBeenCalledWith(reference.id, options);
-    stream([{ type: "thread.started", thread_id: "different" }, completed]);
-    expect((await session.runTurn({ prompt: "test" })).outcome).toBe("unknown");
-    expect(session.reference).toEqual(reference);
-  });
-
-  it("distinguishes explicit failure, cancellation, and lost completion", async () => {
-    const session = createCodexAgent(settings).startSession(workspace);
-    const failure = { type: "turn.failed", error: { message: "provider denied request" } } as const;
-    const onEvent = vi.fn();
-    stream([failure], new Error("stderr with sensitive details"));
-    const result = await session.runTurn({ prompt: "test", onEvent });
-    expect(result).toEqual({ outcome: "failed", reason: "Codex reported a turn error." });
-    expect(onEvent).toHaveBeenCalledWith({ provider: "codex", kind: "turn_failed", data: failure });
-
-    stream([{ type: "turn.started" }]);
-    expect((await session.runTurn({ prompt: "test" })).outcome).toBe("unknown");
-
-    stream([completed], new Error("transport lost after terminal event"));
-    expect((await session.runTurn({ prompt: "test" })).outcome).toBe("unknown");
-
-    const controller = new AbortController();
-    const signal = controller.signal;
-    stream([{ type: "turn.started" }], new Error("aborted"));
-    const interrupted = await session.runTurn({
-      prompt: "test",
-      signal,
-      onEvent: () => controller.abort(),
-    });
-    expect(interrupted.outcome).toBe("interrupted");
-    expect(sdk.runStreamed).toHaveBeenLastCalledWith("test", { signal });
-    expect((await session.runTurn({ prompt: "skip", signal })).outcome).toBe("interrupted");
-    expect(sdk.runStreamed).not.toHaveBeenCalledWith("skip", expect.anything());
-  });
-
-  it.each([false, true])(
-    "keeps a diagnostic followed by stream loss uncertain (cancelled: %s)",
-    async (cancelled) => {
-      const session = createCodexAgent(settings).startSession(workspace);
-      const controller = new AbortController();
-      const diagnostic = {
-        type: "error",
-        message: "permission denied: sensitive provider details",
-      } as const;
-      stream([{ type: "turn.started" }, diagnostic], new Error("lost stream"));
-      const onEvent = vi.fn((event) => {
-        if (cancelled && event.data === diagnostic) controller.abort();
-      });
-      const result = await session.runTurn({ prompt: "test", signal: controller.signal, onEvent });
-      expect(result).toEqual({
-        outcome: cancelled ? "interrupted" : "unknown",
-        reason: cancelled
-          ? "Codex execution was canceled. Codex denied permission to run the request."
-          : "The Codex event stream ended with an error. Codex denied permission to run the request.",
-      });
-      expect(onEvent).toHaveBeenCalledWith({
-        kind: "progress",
-        provider: "codex",
-        data: diagnostic,
-      });
-    },
+  const { env } = sdk.create.mock.calls[0]![0];
+  expect(Object.keys(env).sort()).toEqual(
+    Object.keys({ ...process.env, CODEX_HOME: "/codex" }).sort(),
   );
-
-  it("reports invalid structured output and startup errors", async () => {
-    const session = createCodexAgent(settings).startSession(workspace);
-    stream([{ type: "thread.started", thread_id: "opaque" }, completed]);
-    expect(await session.runTurn({ prompt: "test", outputSchema: {} })).toEqual({
-      outcome: "failed",
-      reason: "Codex returned invalid structured JSON.",
-      usage: { inputTokens: 1, outputTokens: 2 },
-    });
-    stream([], Object.assign(new Error("missing executable"), { code: "ENOENT" }));
-    expect(
-      await createCodexAgent(settings).startSession(workspace).runTurn({ prompt: "test" }),
-    ).toEqual({
-      outcome: "failed",
-      reason: "Could not launch Codex (ENOENT).",
-    });
+  expect(env.CODEX_HOME).toBe("/codex");
+  expect(sdk.resumeThread).toHaveBeenCalledWith(thread.thread_id, {
+    workingDirectory: "/repo",
+    model: "configured",
   });
+  expect(onSession).toHaveBeenCalledExactlyOnceWith(thread.thread_id);
+
+  onSession.mockClear();
+  stream([{ ...thread, thread_id: "different-id" }, message("unexpected"), completed]);
+  expect((await adapter.resume(thread.thread_id, { prompt: "continue", onSession })).outcome).toBe(
+    "unknown",
+  );
+  expect(onSession).not.toHaveBeenCalled();
+});
+
+it("distinguishes launch failure, native failure and authentication with fixed reasons", async () => {
+  const adapter = createCodexAgent(context);
+  const turn = { prompt: "test", onSession: vi.fn() };
+  stream(
+    [],
+    Object.assign(new Error("sensitive path"), { code: "ENOENT", syscall: "spawn codex" }),
+  );
+  expect(await adapter.start(turn)).toEqual({
+    outcome: "not_started",
+    reason: "Could not launch the Codex CLI.",
+  });
+  stream(
+    [{ type: "turn.failed", error: { message: "private details" } }],
+    new Error("private stderr"),
+  );
+  expect(await adapter.start(turn)).toEqual({
+    outcome: "failed",
+    reason: "Codex reported a turn failure.",
+  });
+  stream([{ type: "turn.failed", error: { message: "401 Unauthorized: private details" } }]);
+  expect(await adapter.start(turn)).toEqual({
+    outcome: "failed",
+    reason: "Codex could not authenticate.",
+  });
+  stream([], new Error("401 Unauthorized: private details"));
+  expect(await adapter.start(turn)).toEqual({
+    outcome: "unknown",
+    reason: "Codex reported an authentication error without a confirmed terminal result.",
+  });
+});
+
+it("holds missing or conflicting terminal evidence and reports invalid structured JSON", async () => {
+  const adapter = createCodexAgent(context);
+  const turn = { prompt: "test", onSession: vi.fn() };
+  for (const events of [
+    [thread, message("partial")],
+    [message("response"), completed],
+    [thread, message("response"), completed, completed],
+  ]) {
+    stream(events);
+    expect((await adapter.start(turn)).outcome).toBe("unknown");
+  }
+  stream([thread], new Error("lost stream after tool stderr mentioned Unauthorized"));
+  expect((await adapter.start(turn)).outcome).toBe("unknown");
+  stream([], Object.assign(new Error("stream I/O"), { code: "EACCES", syscall: "read" }));
+  expect((await adapter.start(turn)).outcome).toBe("unknown");
+  stream([thread, message("not JSON"), completed]);
+  expect(await adapter.start({ ...turn, outputSchema: {} })).toEqual({
+    outcome: "failed",
+    reason: "Codex returned invalid structured JSON.",
+  });
+
+  stream([thread, message("confirmed"), completed], new Error("stream disconnected after result"));
+  expect(await adapter.start(turn)).toEqual({ outcome: "completed", response: "confirmed" });
+});
+
+it("holds continuation when an auth diagnostic is followed by a disconnected stream", async () => {
+  const store = new WorkflowStore();
+  try {
+    const executions = store.agentExecutions();
+    const { execute } = createAgentController(executions);
+    stream(
+      [
+        thread,
+        { type: "turn.started" },
+        { type: "error", message: "401 Unauthorized: private details" },
+      ],
+      new Error("disconnected"),
+    );
+    const run = await execute({ id: "first", assignmentId: "first", context, prompt: "test" });
+    expect(executions.get("first")).toMatchObject({
+      status: "unknown",
+      reason: "Codex reported an authentication error without a confirmed terminal result.",
+    });
+    expect(run.session.nativeId).toBe(thread.thread_id);
+    await expect(
+      execute({
+        id: "later",
+        assignmentId: "later",
+        sessionId: run.session.id,
+        prompt: "continue",
+      }),
+    ).rejects.toThrow("unresolved execution");
+    expect(sdk.runStreamed).toHaveBeenCalledTimes(1);
+  } finally {
+    store.close();
+  }
+});
+
+it("fails a confirmed turn without a response, blocks replay and allows a new assignment to resume", async () => {
+  const store = new WorkflowStore();
+  try {
+    const executions = store.agentExecutions();
+    const { execute } = createAgentController(executions);
+    const request = { id: "first", assignmentId: "first", context, prompt: "test" };
+    stream([thread, completed]);
+    const run = await execute(request);
+    expect(executions.get("first")).toMatchObject({
+      status: "failed",
+      reason: "Codex omitted the required response.",
+    });
+    expect(run).not.toHaveProperty("result");
+    await expect(execute({ ...request, id: "retry" })).rejects.toThrow("already has");
+    stream([thread, message("confirmed"), completed]);
+    const next = await execute({
+      id: "later",
+      assignmentId: "later",
+      sessionId: run.session.id,
+      prompt: "continue",
+    });
+    expect(next.execution.status).toBe("completed");
+    expect(next.session).toEqual(run.session);
+    expect(sdk.runStreamed).toHaveBeenCalledTimes(2);
+  } finally {
+    store.close();
+  }
+});
+
+it("forwards cancellation and holds a dispatched turn without a terminal result", async () => {
+  const adapter = createCodexAgent(context);
+  const abort = new AbortController();
+  stream([thread], new Error("aborted"));
+  const turn = { prompt: "test", signal: abort.signal, onSession: () => abort.abort() };
+  expect(await adapter.start(turn)).toEqual({
+    outcome: "unknown",
+    reason: "Cancellation was requested without a complete Codex result.",
+  });
+  expect(sdk.runStreamed).toHaveBeenCalledWith(
+    "test",
+    expect.objectContaining({ signal: abort.signal }),
+  );
+  expect((await adapter.start(turn)).outcome).toBe("not_started");
+  expect(sdk.runStreamed).toHaveBeenCalledTimes(1);
 });

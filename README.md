@@ -10,9 +10,9 @@ A persistent VM controller uses SQLite and reads GitHub state. Authenticated web
 
 ## Status and setup
 
-Phase A, Increment 1 leaves configured GitHub PR observation, authenticated webhooks, exact-head review and CI evidence, and explicit native agent turns available. For setup and commands, see the [GitHub App guide](docs/github-app.md), [unattended polling](docs/unattended.md), and [agent sessions](docs/agent-sessions.md).
+Phase A2 supports configured GitHub PR observation, authenticated webhooks, exact-head review and CI evidence, and explicit local Codex and Claude Code assignments. Local assignments can start or continue native sessions without a PR. For setup and commands, see the [GitHub App guide](docs/github-app.md), [unattended polling](docs/unattended.md), and [agent sessions](docs/agent-sessions.md).
 
-The controller-owned fix pipeline has been removed, including automated fix advancement, local validation, and commits and pushes. The Reviewer, Adjudicator and Implementer workflow and its execution limits are planned work. [ADR-0006](docs/adr/0006-orchestrate-through-native-tools.md) records the accepted architecture, [Plan 003](docs/plans/003-architectural-simplification.md) sequences implementation, and the [architecture overview](docs/architecture.md#current-implementation) describes the current behavior.
+Phase A removed the controller-owned fix pipeline, worktree management, runtime verification, and the [HTTP remote worker](docs/distributed-workers.md). The remaining Phase A work is [live verification with both native accounts](docs/agent-sessions.md#remaining-phase-a-verification). The Reviewer, Adjudicator and Implementer workflow and its execution limits are planned work. [ADR-0006](docs/adr/0006-orchestrate-through-native-tools.md) records the accepted architecture, [Plan 003](docs/plans/003-architectural-simplification.md) sequences implementation, and the [architecture overview](docs/architecture.md#current-implementation) describes the current behavior.
 
 Development and testing use a fresh SQLite database. Deployment cutover is planned for Phase D. See the [state model](docs/state-model.md#sqlite-baseline).
 

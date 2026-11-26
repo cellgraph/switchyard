@@ -10,7 +10,6 @@ import { createGitHubReader, type PullRequestTarget } from "./github-api.ts";
 import { createGitHubAppClient, resumeGitHubAfterSecondaryLimit } from "./github-app.ts";
 import { positiveInteger } from "./github-data.ts";
 import { canReconcilePullRequest, createReconciler } from "./reconcile.ts";
-import { runRemoteCommand } from "./remote-command.ts";
 import { runReviewCommand } from "./review-command.ts";
 import { WorkflowStore } from "./store.ts";
 import { runUnattended, workerStatus } from "./unattended.ts";
@@ -35,8 +34,7 @@ function makeReader(store: WorkflowStore, targets: PullRequestTarget[]) {
 }
 
 async function superviseWorker(configPath: string): Promise<void> {
-  // The SDK starts Codex in its caller's process group. Keep the worker and
-  // its children out of the terminal group and translate Ctrl-C into a drain.
+  // Let the polling worker drain its current GitHub request on Ctrl-C.
   const child = fork(fileURLToPath(import.meta.url), ["--worker-process", configPath], {
     detached: true,
     stdio: ["inherit", "inherit", "inherit", "ipc"],
@@ -59,7 +57,6 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const dbPath = process.env.SWITCHYARD_DB_PATH ?? "switchyard.sqlite";
   process.umask(0o077);
-  if (await runRemoteCommand(args, dbPath)) return;
   if (await runReviewCommand(args, dbPath, (path) => loadConfig(path).targets)) return;
   if (await runAgentCommand(args, dbPath)) return;
   if (args[0] === "--worker-status") {
@@ -126,11 +123,7 @@ async function main(): Promise<void> {
       return;
     }
     const recovered = store.recover();
-    if (
-      recovered.deliveries ||
-      recovered.ambiguousOperations ||
-      recovered.unverifiedAgentOperations
-    )
+    if (recovered.deliveries || recovered.unknownExecutions)
       console.info(`Recovered SQLite state ${JSON.stringify(recovered)}`);
     const controller = createController({
       ...config,

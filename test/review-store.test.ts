@@ -53,22 +53,22 @@ describe("durable review runs", () => {
   it("sets both identity and version for a fresh database", () => {
     using raw = new DatabaseSync(path, { readOnly: true });
     expect(raw.prepare("PRAGMA application_id").get()?.application_id).toBe(0x53575944);
-    expect(raw.prepare("PRAGMA user_version").get()?.user_version).toBe(16);
+    expect(raw.prepare("PRAGMA user_version").get()?.user_version).toBe(17);
   });
 
   it.each([
     [
       "same version without an application ID",
-      "PRAGMA user_version = 16; CREATE TABLE data (value TEXT);",
+      "PRAGMA user_version = 17; CREATE TABLE data (value TEXT);",
     ],
     [
       "same version with a foreign application ID",
-      "PRAGMA application_id = 42; PRAGMA user_version = 16; CREATE TABLE data (value TEXT);",
+      "PRAGMA application_id = 42; PRAGMA user_version = 17; CREATE TABLE data (value TEXT);",
     ],
     ["foreign application ID on an empty schema", "PRAGMA application_id = 42;"],
     [
       "Switchyard identity with an unsupported version",
-      "PRAGMA application_id = 0x53575944; PRAGMA user_version = 15;",
+      "PRAGMA application_id = 0x53575944; PRAGMA user_version = 16;",
     ],
   ])("rejects %s without modifying the database", (_scenario, setup) => {
     const foreignPath = join(directory, "foreign.sqlite");
@@ -91,7 +91,7 @@ describe("durable review runs", () => {
       `
         import { DatabaseSync } from "node:sqlite";
         const db = new DatabaseSync(process.argv[1]);
-        db.exec("PRAGMA user_version = 16; PRAGMA application_id = 42; CREATE TABLE data (value TEXT)");
+        db.exec("PRAGMA user_version = 17; PRAGMA application_id = 42; CREATE TABLE data (value TEXT)");
         db.exec("PRAGMA journal_mode = WAL; INSERT INTO data VALUES ('saved')");
         process.kill(process.pid, "SIGKILL");
       `,

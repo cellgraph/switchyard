@@ -1,94 +1,106 @@
-import { createHash } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
-import type {
-  AgentOperation,
-  AgentOperationWorker,
-  AgentTurnEvidence,
-  AgentTurnRequest,
-} from "./agent-operation.ts";
-import { describeError } from "./controller.ts";
-import type { WorkflowStore } from "./store.ts";
+import { isAbsolute } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import {
+  validNativeId,
+  type AgentAdapter,
+  type AgentContext,
+  type AgentResult,
+  type AgentTurn,
+} from "./agent.ts";
+import { type createAgentStore, type ExecutionIntent } from "./agent-store.ts";
+import { createClaudeAgent } from "./claude-agent.ts";
+import { createCodexAgent } from "./codex-agent.ts";
 
-export function createAgentController(store: WorkflowStore, worker: AgentOperationWorker) {
-  const operations = store.agentOperations();
+type Assignment = ExecutionIntent & Pick<AgentTurn, "prompt" | "outputSchema" | "signal">;
 
-  function request({
-    operationId,
-    workflowId,
-    branch,
-    expectedPullRequestHead,
-    expectedHead,
-    prompt,
-  }: AgentTurnRequest) {
-    if (
-      ![operationId, workflowId, branch, expectedPullRequestHead, expectedHead, prompt].every(
-        (value) => typeof value === "string" && value.trim(),
-      )
-    )
-      throw new Error(
-        "An agent turn requires an operation ID, workflow, branch, both head SHAs, and a prompt.",
-      );
-    if (
-      ![expectedHead, expectedPullRequestHead].every((sha) =>
-        /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(sha),
-      )
-    )
-      throw new Error("Agent turns require full Git commit SHAs.");
-    return operations.request({
-      operationId,
-      workflowId,
-      branch,
-      expectedPullRequestHead,
-      expectedHead,
-      configurationId: worker.configurationId,
-      promptDigest: createHash("sha256").update(prompt).digest("hex"),
-    });
-  }
+const persistenceRetryDelays = [25, 75];
 
+function sqliteContention(error: unknown): boolean {
+  const { code, errcode } = (error as { code?: string; errcode?: number } | null) ?? {};
+  if (code !== "ERR_SQLITE_ERROR" || typeof errcode !== "number") return false;
+  // Extended result codes keep SQLITE_BUSY and SQLITE_LOCKED in the low byte.
+  return [5, 6].includes(errcode & 0xff);
+}
+
+export function createAgentController(
+  executions: ReturnType<typeof createAgentStore>,
+  adapterFor: (context: AgentContext) => AgentAdapter = (context) =>
+    context.provider === "codex" ? createCodexAgent(context) : createClaudeAgent(context),
+) {
   return {
-    request,
-    async runTurn(input: AgentTurnRequest, signal?: AbortSignal): Promise<AgentOperation> {
-      const operation = request(input);
-      const { operationId, workflowId, branch, expectedHead, prompt } = input;
-      if (signal?.aborted || operation.status !== "requested") return operation;
-      const claim = operations.claim(operationId);
-      if (!claim) return operations.get(operationId)!;
+    async execute(assignment: Assignment) {
+      const { id, assignmentId, context, prompt, outputSchema, signal } = assignment;
+      if (![id, assignmentId].every((value) => /^[a-z0-9][a-z0-9._:-]{0,199}$/i.test(value)))
+        throw new Error("Execution and assignment IDs must be short identifiers.");
+      if (!prompt.trim()) throw new Error("An assignment prompt is required.");
+      if (
+        context &&
+        (!isAbsolute(context.workingDirectory) ||
+          (context.configDirectory !== undefined && !isAbsolute(context.configDirectory)))
+      )
+        throw new Error(
+          "The working directory and any native config directory must be absolute paths.",
+        );
 
-      let evidence: AgentTurnEvidence;
+      const claim = executions.claim(assignment);
+      if (!claim.claimed) return { execution: claim.execution, session: claim.session };
+
+      let nativeId = claim.session.nativeId;
+      let conflictingSession = false;
+      const turn: AgentTurn = {
+        prompt,
+        ...(outputSchema === undefined ? {} : { outputSchema }),
+        ...(signal === undefined ? {} : { signal }),
+        onSession(reportedId) {
+          if (!validNativeId(reportedId) || (nativeId !== null && nativeId !== reportedId)) {
+            conflictingSession = true;
+            return;
+          }
+          if (nativeId === reportedId) return;
+          nativeId = reportedId;
+          try {
+            executions.recordSession(id, nativeId);
+          } catch {
+            // Keep the observed ID for finalization if the early write could not be confirmed.
+          }
+        },
+      };
+      let result: AgentResult;
       try {
-        const { previous } = claim;
-        const runtime = worker.runtime();
-        if (
-          previous &&
-          (previous.status !== "active" ||
-            !previous.reference ||
-            !previous.checkpoint ||
-            !previous.runtime ||
-            !isDeepStrictEqual(previous.runtime, runtime))
-        )
-          throw new Error("Recorded agent runtime or session is incompatible with continuation.");
-        if (!operations.start(operationId, runtime))
-          throw new Error("Workflow authorization changed before the worker started.");
-        evidence = await worker.execute({
-          operationId,
-          target: { workflowId, branch, expectedHead },
-          prompt,
-          previous,
-          ...(signal === undefined ? {} : { signal }),
-          authorizeLaunch() {
-            if (!operations.authorizeLaunch(operationId))
-              throw new Error("Workflow authorization changed before the agent launched.");
-          },
-          recordExpectedWorktree: (expectedWorktree) =>
-            operations.progress(operationId, { expectedWorktree }),
-          recordWorkspace: (worktree) => operations.progress(operationId, { worktree }),
-          recordSession: (reference) => operations.progress(operationId, { reference }),
-        });
-      } catch (error) {
-        evidence = { error: describeError(error) };
+        const adapter = adapterFor(claim.session.context);
+        result = claim.session.nativeId
+          ? await adapter.resume(claim.session.nativeId, turn)
+          : await adapter.start(turn);
+      } catch {
+        result = {
+          outcome: "unknown",
+          reason: "Native execution ended without a confirmed outcome.",
+        };
       }
-      // If this write fails, keep the existing intent so restart recovery holds the workflow.
-      return operations.finish(operationId, evidence);
+      if (conflictingSession || (result.outcome === "completed" && nativeId === null))
+        result = { outcome: "unknown", reason: "Could not confirm and record the native session." };
+
+      // Only coordination metadata crosses the SQLite boundary.
+      const outcome = result.outcome === "completed" ? { outcome: result.outcome } : result;
+      for (let attempt = 0; ; attempt++) {
+        let saved;
+        try {
+          saved = executions.finish(id, outcome, nativeId);
+        } catch (error) {
+          try {
+            saved = executions.confirmFinish(claim.execution, outcome, nativeId);
+          } catch (readError) {
+            if (!sqliteContention(readError)) throw readError;
+          }
+          if (!saved) {
+            const retryDelay = persistenceRetryDelays[attempt];
+            if (retryDelay === undefined || !sqliteContention(error)) throw error;
+            await delay(retryDelay);
+            continue;
+          }
+        }
+        return { ...saved, ...(result.outcome === "completed" ? { result } : {}) };
+      }
     },
   };
 }

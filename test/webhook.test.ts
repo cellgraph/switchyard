@@ -12,6 +12,7 @@ import { createReconciler } from "../src/reconcile.ts";
 import { WorkflowStore } from "../src/store.ts";
 import { createWebhookServer } from "../src/webhook.ts";
 import type { CheckEvidence } from "../src/workflow.ts";
+import { crashAfterSession } from "./fixtures/execution.ts";
 import codexReview from "./fixtures/codex-pr51.json" with { type: "json" };
 
 type Fixture = { id: string; event: string; payload: Record<string, unknown> };
@@ -278,7 +279,7 @@ describe("GitHub webhook intake and reconciliation", () => {
 
     store.close();
     store = new WorkflowStore(dbPath);
-    expect(store.recover()).toEqual({ deliveries: 0, ambiguousOperations: 0 });
+    expect(store.recover()).toEqual({ deliveries: 0, unknownExecutions: 0 });
     const restarted = controller();
     now += 29_999;
     await restarted.runPass();
@@ -415,56 +416,36 @@ describe("GitHub webhook intake and reconciliation", () => {
     expect(workflow()?.closedByGitHub).toBeUndefined();
   });
 
-  it("escalates an ambiguous operation across a close, restart, and reopen", async () => {
+  it("observes closure and reopening across a restart while an independent execution stays held", async () => {
     const { runPass } = controller();
     await runPass();
     const id = workflow()!.id;
-    store.createOperation("operation-1", id, "agent_turn", {});
     state.state = "closed";
     await send("closed");
     await runPass();
     expect(workflow()).toMatchObject({ state: "stopped", closedByGitHub: true });
 
+    const interrupted = crashAfterSession(dbPath);
+    expect(interrupted.signal, interrupted.stderr).toBe("SIGKILL");
     store.close();
     store = new WorkflowStore(dbPath);
-    expect(store.recover()).toEqual({ deliveries: 0, ambiguousOperations: 1 });
-    state.state = "open";
-    await createReconciler(store, github)(target);
-    expect(workflow()).toMatchObject({
-      state: "escalated",
-      escalationReason: "An external operation has an ambiguous outcome after restart.",
-    });
-    expect(workflow()?.closedByGitHub).toBeUndefined();
-  });
-
-  it("blocks reopening until a pending operation has a known outcome", async () => {
-    const { runPass } = controller();
-    await runPass();
-    const id = workflow()!.id;
-    store.createOperation("operation-1", id, "agent_turn", {});
-    state.state = "closed";
-    await send("closed");
-    await runPass();
-
-    state.state = "open";
-    const reconcile = createReconciler(store, github);
-    await expect(reconcile(target)).rejects.toThrow("external operation is pending");
+    expect(store.recover()).toEqual({ deliveries: 0, unknownExecutions: 1 });
     expect(workflow()).toMatchObject({ state: "stopped", closedByGitHub: true });
 
-    store.finishOperation("operation-1", "ambiguous");
-    state.headSha = headB;
-    await reconcile(target);
-    expect(workflow()).toMatchObject({
-      state: "escalated",
-      headSha: headB,
-      review: null,
-      checks: [],
-      escalationReason: "An external operation has an ambiguous outcome.",
-    });
-    expect(store.transitions(id).at(-1)).toMatchObject({
-      from: "stopped",
-      to: "escalated",
-      headSha: headB,
+    state = { state: "open", headSha: headB };
+    await createReconciler(store, github)(target);
+    expect(workflow()).toMatchObject({ state: "awaiting_review", headSha: headB });
+    expect(workflow()?.closedByGitHub).toBeUndefined();
+    expect(store.transitions(id)).toContainEqual(
+      expect.objectContaining({
+        from: "stopped",
+        to: "awaiting_review",
+        headSha: headB,
+      }),
+    );
+    expect(store.agentExecutions().get("interrupted")).toMatchObject({
+      status: "unknown",
+      reason: expect.stringContaining("owner exited"),
     });
   });
 
@@ -515,7 +496,7 @@ describe("GitHub webhook intake and reconciliation", () => {
     insert.run("opaque-delivery", null, "null", "pending", new Date(now).toISOString());
     db.close();
     store = new WorkflowStore(dbPath);
-    expect(store.recover()).toEqual({ deliveries: 1, ambiguousOperations: 0 });
+    expect(store.recover()).toEqual({ deliveries: 1, unknownExecutions: 0 });
     const deliveryIds = ["linked-review", "unlinked-open", "opaque-delivery"];
     expect(store.dueDeliveryIds(now, 25)).toEqual(deliveryIds);
     state.headSha = headB;

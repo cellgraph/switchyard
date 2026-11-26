@@ -1,56 +1,49 @@
-# Local agent sessions
+# Local agent execution
 
-**Implementation status.** This guide describes the existing implementation. [ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture, and [Plan 003](plans/003-architectural-simplification.md) describes the pending replacement.
+The development CLI runs assignments directly through the Codex TypeScript SDK or native Claude Code CLI. An assignment can run in a regular local clone with no PR or GitHub App credentials.
 
-Start by reconciling the PR through the existing GitHub App configuration so the workflow and its current head appear in the Switchyard database. Use a trusted clone of that repository, a dedicated worktree root outside Git checkouts, and a persistent Codex home that this controller owns. Sign in to Codex in that home or make `OPENAI_API_KEY` available to the controller. Configured credentials must have access to the requested model.
+Prepare the working directory, dependencies, and native agent account and permissions on the local host. Use the native runtime's ordinary settings for credentials, tools and billing. The runtime and agent handle worktrees, validation, commits and publication as required by the assignment. Preserve the local native profile and session history for continuation.
 
-Submit an explicit turn for a workflow in `awaiting_review` to the database used for GitHub reconciliation. Use absolute paths, the current full PR head SHA, and a semantic workflow branch. For an initial turn, use the recorded PR head for both SHAs. For a follow-up, use the latest recorded PR head and the local head returned by the previous turn. Follow-ups use a new operation ID and the same checkout, Codex home, and model. Keep request files private and omit secrets from prompts.
+## Run and continue
 
-```json
-{
-  "operationId": "pr-42-first-turn",
-  "workflowId": "owner/repo#42",
-  "repositoryDirectory": "/absolute/path/to/repo",
-  "worktreeRoot": "/absolute/path/to/worktrees",
-  "codexHome": "/absolute/path/to/codex-home",
-  "model": "MODEL_AVAILABLE_TO_YOUR_ACCOUNT",
-  "branch": "feat/workflow-42",
-  "expectedPullRequestHead": "FULL_PR_HEAD_SHA",
-  "expectedHead": "FULL_LOCAL_HEAD_SHA",
-  "prompt": "Inspect the implementation and summarize what needs to change."
-}
-```
+Point `SWITCHYARD_DB_PATH` at a fresh development database. On each invocation, write the assignment prompt in a private text file. When a response schema is needed, supply a JSON Schema object in a separate file.
 
 ```sh
-export SWITCHYARD_DB_PATH=/absolute/path/to/switchyard.sqlite
-npm start -- --agent-turn /absolute/path/to/request.json
-npm start -- --agent-status pr-42-first-turn
+export SWITCHYARD_DB_PATH=/absolute/path/to/switchyard-dev.sqlite
+
+npm start -- agent run --provider codex --cwd /path/to/clone \
+  --execution codex-first --prompt /path/to/first.txt
+
+npm start -- agent status codex-first
+
+npm start -- agent run --session SESSION_ID \
+  --execution codex-next --prompt /path/to/next.txt --schema /path/to/schema.json
 ```
 
-Reusing an operation ID with the same content returns the durable record or dispatches a still-authorized `requested` turn. The command exits with an error if the result requires attention. For a successful continuation, the database retains local and PR heads, the checkout and provider identifiers, a checkpoint of the checkout and Codex session file, and the observed changed paths. SQLite records the turn outcome and sanitized error reason. Codex retains the transcript in its own home.
+Use the Switchyard ID in `session.id` for `--session`. The adapter resumes the native reference in `session.nativeId` using the stored provider and invocation context. Each continuation submits a new assignment by default. Set `--model` to override the native default and `--config-dir` to select a Codex home or [Claude Code configuration directory](claude-code.md) when starting a session. Omit `--cwd` to use the current directory. When model or configuration directory is omitted, the provider uses its normal defaults and inherited environment.
 
-The GitHub controller automatically checks recovery when it starts. For a CLI-only run, use `npm start -- --recover`. This also recovers the webhook inbox. An agent claim with a live owner stays in flight so the owner can commit its outcome. A reused PID can leave a claim unresolved. Recovery reports claims missing owner evidence by operation ID under `unverifiedAgentOperations` and retains them for inspection. If an operation becomes unknown, inspect the operation record, Codex processes and rollout, and checkout before making any manual decision. The record includes the expected checkout location if Git could have created it. Treat a held session as unavailable. Leave the worktree and Codex files intact while investigating.
+Before dispatch, `agent run` prints its execution ID to stderr, including when the command generates the ID. Use `agent status EXECUTION_ID` with that ID to inspect an interrupted run. The command's stdout carries one JSON result with an `execution` and a `session` when the record is available. When the current invocation completes, it also returns `result.response` and any `result.structuredOutput`. Treat stdout as potentially sensitive. SQLite and `agent status` retain coordination metadata and the reference only. Keep secrets out of prompts, schemas and labels.
 
-Use the workflow checkout and Codex thread exclusively through Switchyard. The checkout checkpoint supports up to 10,000 entries and 64 MiB of content, including ignored files. The rollout checkpoint supports files up to 64 MiB. Codex must have an active rollout indexed in the state database in the configured Codex home. A managed override for the SQLite location requires inspection. Exceeding either limit or changing the checkout, thread, runtime configuration, or SDK/CLI version requires inspection. The evidence check is local and assumes the checkout and Codex home are on a trusted filesystem.
+Supply `--execution ID` to reserve an ID you can inspect after a crash. The execution ID also serves as the assignment ID unless you pass `--assignment ID`. Reusing a recorded execution ID with the same assignment and context returns its metadata, with no dispatch or stored response. Use a new execution ID with the same assignment ID for an explicit retry after `not_started`.
 
-## Claude Code
+## Recovery
 
-An explicit turn can select Claude Code with its own model, profile and execution limits. See [Claude Code setup, recovery, and smoke test](claude-code.md).
+| Status        | Meaning                                                                                                      |
+| ------------- | ------------------------------------------------------------------------------------------------------------ |
+| `running`     | SQLite committed the intent and claimed dispatch. The owner may still record an outcome.                     |
+| `completed`   | The runtime supplied the required completion result, and Switchyard recorded the terminal status.            |
+| `not_started` | Switchyard has evidence of non-execution, such as pre-launch cancellation or failure to spawn the runtime.   |
+| `failed`      | The runtime reported a failure or returned unusable result data after a known turn. Side effects can remain. |
+| `unknown`     | The outcome could not be established. The assignment and any associated session are held for inspection.     |
 
-## SQLite baseline
+`agent run` exits nonzero when the stored execution status is anything other than `completed`. Native errors appear as fixed diagnostics. Ctrl-C requests cancellation through the native interface. If cancellation leaves no authoritative result, the status is `unknown`.
 
-Use a fresh SQLite database for this implementation. The existing operation and session records apply to turns submitted in that database. See the [state model](state-model.md#sqlite-baseline).
+A confirmed turn that omits required output or returns unusable output fails the assignment. A later assignment can still use the recorded session. If SQLite is briefly busy or locked, the current owner retries saving the observed ID and outcome. The CLI returns a native result only after the write is confirmed. A persistent write failure leaves the claim held for recovery.
 
-## Verification
+Run `npm start -- agent recover` to mark claims whose local owner exited before recording an outcome. A live or reused PID leaves the claim intact. A crash can leave native processes or external effects in progress. Inspect the execution record, native session and any external effects using the runtime and environment. The development CLI keeps uncertain assignments and sessions held. Use the database on the same persistent local host as the execution processes.
 
-The ordinary test suite exercises duplicate operation claims across SQLite connections, head and checkout changes, missing or incompatible runtime and session bindings, startup recovery during a live turn, and child-process termination at dispatch, checkout creation, execution, and just before outcome persistence.
+## Remaining Phase A verification
 
-The live acceptance test uses a temporary repository, SQLite database, and Codex home. It starts two separate Node.js controller invocations with recovery between them. The first turn edits the checkout and remembers a token. The second turn writes the token using the original thread and dirty checkout. It verifies the original thread ID and checkout identity, and the clean primary checkout. The test passed on macOS with Codex SDK and CLI `0.171.0` using `gpt-6.2-sol`. Routine CI skips it.
+The offline suite covers both adapters and the durable lifecycle using fixtures. In the operator's preconfigured environments, start a session with each native provider, record a harmless test phrase, and continue the same session in another process after running recovery. Ask the second assignment to return the phrase without repeating it in the prompt. Exercise structured output and check the durable terminal state and native ID across invocations. Verify cancellation and inspection behavior in a disposable environment and record any limitations. Record the observed native account and continuation behavior separately from the offline tests. Use the operator's existing accounts and configurations for this verification.
 
-```sh
-SWITCHYARD_CODEX_SMOKE=1 \
-  SWITCHYARD_SMOKE_MODEL=MODEL_AVAILABLE_TO_YOUR_ACCOUNT \
-  npm test -- test/codex-resume.smoke.test.ts
-```
-
-Set `OPENAI_API_KEY` in the environment or provide `SWITCHYARD_SMOKE_AUTH_FILE` pointing to an existing Codex `auth.json`. The smoke test copies that file into the private temporary home and removes the home afterward. The test covers successful start and continuation.
+[Codex TypeScript SDK](https://github.com/openai/codex/tree/main/sdk/typescript) · [Claude Code programmatic usage](https://code.claude.com/docs/en/headless)

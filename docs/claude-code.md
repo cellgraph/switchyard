@@ -1,107 +1,13 @@
 # Claude Code execution
 
-**Implementation status.** This guide describes the existing implementation. [ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture, and [Plan 003](plans/003-architectural-simplification.md) describes the pending replacement.
-
-Switchyard can use Claude Code for an explicit `--agent-turn` request. Add these settings alongside the existing checkout and workflow settings. Supply a model ID or alias available to your Anthropic API account.
-
-```json
-{
-  "provider": "claude-code",
-  "model": "MODEL_AVAILABLE_TO_YOUR_ACCOUNT",
-  "claude": {
-    "executable": "/absolute/path/to/claude",
-    "home": "/absolute/path/to/private/claude-profile",
-    "timeoutMs": 900000,
-    "maxBudgetUsd": 2
-  }
-}
-```
-
-Use the trusted, native Claude Code CLI version **2.1.330** on an unmanaged Linux or macOS host. The pin covers the restricted tool behavior, stream format, and transcript format. Set up an empty controller-owned profile directory with `mkdir -m 700 /absolute/path/to/private/claude-profile`. Keep the profile outside worktrees and reserve it for Switchyard. Supply an unmanaged Anthropic Console API key as `ANTHROPIC_API_KEY` in the controller's private environment. The launcher relays only that credential using Claude Code's supported key helper and a fixed executable. Use the provider's own authentication setup for the key. CLI subscriptions and managed Claude installations are outside this profile. Switchyard refuses known endpoint-managed and cached remote policy sources. The helper authentication profile receives no server-managed settings. [CLI reference](https://code.claude.com/docs/en/cli-reference) · [Managed settings](https://code.claude.com/docs/en/managed-settings) · [Server-managed settings](https://code.claude.com/docs/en/server-managed-settings)
-
-Omit `codexHome` for Claude Code requests. A request without `provider` or with `"provider": "codex"` uses the existing Codex profile settings. `timeoutMs` defaults to 15 minutes and accepts 1 ms through 1 hour. `maxBudgetUsd` is an optional positive USD estimate limit enforced by Claude Code per invocation. An authenticated account must be able to call the configured model.
-
-## Current permissions
-
-This guide describes the retained API-key adapter. [ADR-0006](adr/0006-orchestrate-through-native-tools.md) assigns authentication and permissions to the native runtime and operator. The remaining Phase A work will simplify this launcher.
-
-Claude Code's OS sandbox wraps its Bash tool. This adapter uses restricted mode and a file-tool allowlist, with Bash and other command, browser, subagent, and network tools excluded. It uses `dontAsk` with no permission responder, disables custom hooks and connectors, loads no user or repository settings, and supplies an empty MCP configuration by using strict MCP mode with no servers. Switchyard checks that the initialization frame reports the expected checkout, executable version, key source, permissions, and tools before accepting evidence. The CLI itself communicates with Anthropic. [Claude Code sandboxing](https://code.claude.com/docs/en/sandboxing) · [Claude Code permissions](https://code.claude.com/docs/en/permissions)
-
-The configured `--tools` list is an upper bound of `Read`, `Glob`, `Grep`, `Edit`, and `Write`. The native 2.1.330 CLI reported an effective set of `Edit` and `Read` with these flags, plus `StructuredOutput` when a schema was supplied. The mock CLI tests exercise Switchyard's policy checks. Use the native initialization frame to verify availability.
-
-Standalone local turns can edit ordinary files in their workflow checkout. The adapter restricts access to Git metadata and edits to Claude settings. Use a checkout with regular files on a trusted filesystem. Switchyard rejects linked files, cross-device entries, and special files. Keep credentials in the controller environment outside the worktree.
-
-## Evidence and restart
-
-Review `--agent-status OPERATION_ID` for the configured provider and model, the CLI-reported model where available, the session identifier, the outcome, and bounded, sanitized diagnostics. The result can include input and output token counts for this invocation. The input count includes reported cache tokens. `sessionCostUsd` is Claude Code's cumulative estimate for the session, including restored spend. Use the latest value for a session total. Prompts, raw streams, arbitrary model text, and credentials stay out of operation records and logs. Claude Code's own transcripts can contain prompts, tool inputs and results, and patches. Keep the profile private. [Claude Code usage and cost](https://code.claude.com/docs/en/agent-sdk/cost-tracking)
-
-A completed invocation requires matching initialization and terminal result frames, a clean process exit, successful Git observation, and a transcript checkpoint in the configured profile. Switchyard resumes only a recorded active session with the same runtime, worktree identity, checkout content, and transcript file and digest. It passes the exact transcript path to Claude Code. Transcripts over 64 MiB or project paths over 200 encoded characters require operator inspection. Preserve the original profile and install when restarting. [Claude Code session storage](https://code.claude.com/docs/en/agent-sdk/sessions)
-
-Cancellation and timeout send SIGTERM to the provider process group. Switchyard retains the operation claim until the CLI closes and the group is gone or has been sent SIGKILL after a short grace period. A signaling failure leaves an unknown outcome for inspection. Missing or inconsistent evidence, a changed transcript or checkout, and interrupted turns hold the workflow. A hard controller crash can leave the CLI alive. Recovery detects lost operation owners and holds the worktree even if it finds a transcript or edits, since those cannot confirm the operation's outcome. Inspect the worktree, transcript, and local processes before making a manual decision. Use a fresh workflow binding for a provider change.
-
-## Manual smoke test
-
-Use a disposable, reconciled PR with an `awaiting_review` workflow in a test database and its head available in a trusted clone. Use a fresh private profile and worktree root. Enable the real API key in the controller environment. Each `npm start` invocation runs a new controller process.
-
-1. Use the [agent request example](agent-sessions.md), substituting the Claude Code settings above. Have Claude remember an arbitrary test marker and replace the content of one existing tracked file with `first`. Ask it to keep the marker out of the checkout. Run `npm start -- --agent-turn request.json`. Verify exit zero and inspect the recorded provider, session, usage and changed paths. Confirm the primary checkout stays clean.
-2. Run `npm start -- --recover`. Submit a new operation ID with both head SHAs from the first turn and otherwise identical settings. Ask Claude to replace `first` with the remembered marker, without putting the marker in the new prompt. Verify the same session and checkout identity, and read the tracked file to confirm the marker.
-3. In another disposable workflow, use a short `timeoutMs` or interrupt the controller after a session is reported. Inspect the terminal operation and held binding. Run recovery and submit the same request ID. Verify Switchyard returns the saved result without replaying the turn.
-
-Automated CI substitutes local mock CLI processes and needs no Anthropic credentials.
-
-### Verify the effective native tools
-
-From the Switchyard checkout, set `SMOKE_CLAUDE` to the absolute native executable path, `SMOKE_CHECKOUT` to a disposable checkout, `SMOKE_PROFILE` to a separate empty private directory, and `SMOKE_MODEL` to the configured model. Export these variables alongside the API key. Run the plain and structured probes below. Save the two output lines with the smoke-test record. Expect `Edit` and `Read` for the plain probe and `Edit`, `Read`, and `StructuredOutput` for the schema probe. Investigate a different tool set before enabling the provider. The probe prints only the CLI version and tool names from each initialization frame.
+Install the native `claude` CLI on the trusted local host and make it available on `PATH`. Set up the account and permissions with Claude Code's normal facilities. Switchyard inherits that configuration. Optionally pass `--model` for a native model name or alias and `--config-dir` for the directory selected by `CLAUDE_CONFIG_DIR`. Prepare the working directory before starting the assignment.
 
 ```sh
-node --input-type=module <<'JS'
-import { spawnSync } from "node:child_process";
-import { realpathSync } from "node:fs";
-import { assertClaudePolicy, claudeEnvironment } from "./src/claude-runtime.ts";
-
-const { SMOKE_CLAUDE, SMOKE_CHECKOUT, SMOKE_PROFILE, SMOKE_MODEL, ANTHROPIC_API_KEY } = process.env;
-if (![SMOKE_CLAUDE, SMOKE_CHECKOUT, SMOKE_PROFILE, SMOKE_MODEL, ANTHROPIC_API_KEY].every(Boolean))
-  throw new Error("Missing native smoke-test configuration.");
-const home = realpathSync(SMOKE_PROFILE);
-assertClaudePolicy(home);
-const settings = {
-  apiKeyHelper: "/usr/bin/printenv SWITCHYARD_CLAUDE_API_KEY",
-  disableAllHooks: true,
-  disableClaudeAiConnectors: true,
-  permissions: {
-    deny: ["Edit(.git)", "Read(.git)", "Edit(.claude)"],
-    disableBypassPermissionsMode: "disable",
-    disableAutoMode: "disable",
-  },
-};
-const flags = [
-  "--print", "--output-format", "stream-json", "--verbose",
-  "--bare", "--restricted", "--safe-mode", "--setting-sources", "",
-  "--disable-slash-commands", "--no-chrome", "--strict-mcp-config",
-  "--tools", "Read,Glob,Grep,Edit,Write", "--allowedTools", "Edit(./**)",
-  "--permission-mode", "dontAsk", "--permission-prompts", "none",
-  "--settings", JSON.stringify(settings), "--model", SMOKE_MODEL,
-];
-const schema = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] };
-for (const [mode, extra] of [["plain", []], ["schema", ["--json-schema", JSON.stringify(schema)]]]) {
-  const { stdout, status } = spawnSync(SMOKE_CLAUDE, [...flags, ...extra], {
-    cwd: realpathSync(SMOKE_CHECKOUT),
-    env: { ...claudeEnvironment(home), SWITCHYARD_CLAUDE_API_KEY: ANTHROPIC_API_KEY },
-    input: 'Reply with {"ok":true} and leave the checkout alone.',
-    encoding: "utf8",
-    timeout: 60_000,
-  });
-  if (status !== 0) throw new Error(`Native ${mode} probe failed.`);
-  let init;
-  try {
-    init = stdout.trim().split("\n").map((line) => JSON.parse(line))
-      .find(({ type, subtype }) => type === "system" && subtype === "init");
-  } catch {
-    throw new Error(`Native ${mode} probe returned invalid stream data.`);
-  }
-  if (init?.claude_code_version !== "2.1.330" || !Array.isArray(init.tools))
-    throw new Error(`Native ${mode} initialization evidence is missing or incompatible.`);
-  console.log(JSON.stringify({ mode, version: init.claude_code_version, tools: init.tools.sort() }));
-}
-JS
+npm start -- agent run --provider claude-code --cwd /path/to/clone \
+  --prompt /path/to/assignment.txt --schema /path/to/schema.json
+npm start -- agent run --session SESSION_ID --prompt /path/to/follow-up.txt
 ```
+
+The adapter pipes the prompt to print mode, reads the native JSON event stream and passes an optional schema via `--json-schema`. It records the reported session ID and uses `--resume` with that ID for continuation. A terminal error or reported account authentication failure appears as an execution failure. Inspect a held execution using the [local execution guide](agent-sessions.md#recovery).
+
+Use the [Phase A verification procedure](agent-sessions.md#remaining-phase-a-verification) with the configured native account. [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference) · [Claude Code programmatic usage](https://code.claude.com/docs/en/headless)
