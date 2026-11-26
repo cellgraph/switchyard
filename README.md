@@ -4,26 +4,15 @@ Switchyard coordinates coding agents through the lifecycle of a software change.
 
 ## Scope and trust
 
-Switchyard is a personal orchestration tool for trusted, operator-controlled hosts. It coordinates workflows, selects agents and workers, and verifies worktree and session evidence. The operator provisions the host and native runtime, including credentials, permissions and extensions. Multitenant isolation and runtime policy administration are outside the project scope.
-
-Review turns expect an unchanged checkout. Switchyard can reject a result when the checkout differs, but that check cannot prevent or undo external side effects. Publication approvals gate actions the controller performs. An agent can act independently wherever the host and native runtime give it permission. See the [execution responsibility ADR](docs/adr/0005-trusted-execution-environments.md).
+Switchyard coordinates workflows on trusted, operator-controlled hosts. The accepted deployment uses a persistent VM controller with SQLite and configured local or remote workers. The operator manages host permissions and credentials. Agents use native runtimes for sessions and handle implementation, validation, commits, pushes, and review publication.
 
 ## First milestone
 
-Given a pull request produced by a Codex implementation session, Switchyard will:
-
-1. Receive GitHub webhook deliveries and record them durably and idempotently.
-2. Detect a completed Codex review and associate it with the current PR head SHA.
-3. Send actionable findings to the original Codex session in its isolated Git worktree.
-4. Record each fix cycle, validation result, commit SHA, and review outcome.
-5. Stop after three unsuccessful review/fix cycles or when human judgment is needed.
-6. Mark the workflow ready for human approval only after a clean review for the current head and required CI checks pass.
-
-No review comments is not evidence of a completed clean review. A new head commit invalidates prior review and CI evidence. There is no automatic merge path.
+The first workflow coordinates independent review and bounded fix cycles for GitHub PRs. It uses GitHub webhooks to trigger reconciliation, attaches review and CI evidence to the exact PR head, and hands off to a human once that head has an explicit clean review and passing required checks. Missing review comments never establish a clean review.
 
 ## Status
 
-The local workflow store, GitHub App integration, durable local agent sessions, and durable review evidence are implemented. See the [review operations guide](docs/reviews.md) for review runs, finding decisions, and GitHub synchronization. See the [local agent session guide](docs/agent-sessions.md) for running and recovering a Codex turn. See the [distributed worker guide](docs/distributed-workers.md) for remote read-only turns with Codex or Claude Code. See [CONTEXT.md](CONTEXT.md), [the architecture](docs/architecture.md), [ADR-0001](docs/adr/0001-local-controller-and-agent-boundary.md), and [implementation plan 001](docs/plans/001-pr-review-loop.md) for the current decisions and next steps.
+[ADR-0006](docs/adr/0006-orchestrate-through-native-tools.md) records the accepted architecture after PR #21. The [architecture overview](docs/architecture.md#current-implementation-after-pr-21) describes the shipped behavior, including the durable webhook inbox, controller-owned validation and publication, and remote standalone review turns. The remaining work in [Plan 001](docs/plans/001-pr-review-loop.md) and the proposal in [Plan 002](docs/plans/002-claude-code-authentication.md) need revision.
 
 ## Development environment
 

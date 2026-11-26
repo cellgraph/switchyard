@@ -1,6 +1,7 @@
 # ADR-0001: Local controller, durable state, and narrow agent boundary
 
 - Status: Accepted for the first milestone
+- Supersession: [ADR-0006](0006-orchestrate-through-native-tools.md) supersedes parts of this record. See its prior decisions table for details.
 - Date: 2026-11-15
 
 ## Context
