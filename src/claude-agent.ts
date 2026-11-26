@@ -33,40 +33,8 @@ type Options = {
   model: string;
   timeoutMs: number;
   maxBudgetUsd?: number;
-  allowedPaths?: string[];
   readOnly?: boolean;
 };
-
-export function claudeEditRules(paths: string[] | undefined) {
-  const deny = ["Edit(.git)", "Read(.git)", "Edit(.claude)"];
-  if (!paths) return { allow: ["Edit(./**)"], deny };
-  for (const path of paths) {
-    // Only accept literal path segments representable without gitignore metacharacters.
-    if (
-      !/^[a-zA-Z0-9_@.+-]+(?:\/[a-zA-Z0-9_@.+-]+)*\/?$/.test(path) ||
-      path.split("/").some((part) => [".", "..", ".git"].includes(part.toLowerCase()))
-    )
-      throw new Error(
-        "Claude Code edit scopes require literal path segments without pattern characters.",
-      );
-  }
-  const allow: string[] = [];
-  for (const path of new Set(paths)) {
-    if (path.endsWith("/")) {
-      allow.push(`Edit(/${path}**)`);
-      continue;
-    }
-    allow.push(`Edit(/${path})`);
-    const descendants = `${path}/`;
-    if (paths.some((scope) => scope.endsWith("/") && descendants.startsWith(scope))) continue;
-    if (paths.some((scope) => scope.startsWith(descendants)))
-      throw new Error(
-        "Claude Code edit scopes cannot treat an ancestor of another scope as a file.",
-      );
-    deny.push(`Edit(/${path}/**)`);
-  }
-  return { allow, deny };
-}
 
 function enabledTools(options: Options) {
   return options.readOnly
@@ -78,7 +46,7 @@ function command(
   options: Options,
   turn: AgentTurn,
   session: string[],
-  { allow, deny }: ReturnType<typeof claudeEditRules>,
+  { allow, deny }: { allow: string[]; deny: string[] },
 ) {
   return [
     "--print",
@@ -214,7 +182,7 @@ function launchIssue(options: Options, directory: string): string | undefined {
 export function createClaudeAgent(options: Options, apiKey: string): AgentAdapter {
   const rules = options.readOnly
     ? { allow: enabledTools(options), deny: ["Edit", "Write", "Read(.git)"] }
-    : claudeEditRules(options.allowedPaths);
+    : { allow: ["Edit(./**)"], deny: ["Edit(.git)", "Read(.git)", "Edit(.claude)"] };
   // Using the supported key helper keeps provider policy delivery off for this profile
   // and requires the CLI to load the same settings document as the permission rules.
   const env = { ...claudeEnvironment(options.home), SWITCHYARD_CLAUDE_API_KEY: apiKey };

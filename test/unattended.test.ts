@@ -5,12 +5,14 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { loadConfig, parseFixConfig } from "../src/config.ts";
+import { loadConfig } from "../src/config.ts";
 import { createGitHubReader, type GitHubReader } from "../src/github-api.ts";
 import { createGitHubAppClient, GitHubTransientError } from "../src/github-app.ts";
 import { WorkflowStore } from "../src/store.ts";
 import { runUnattended, workerStatus } from "../src/unattended.ts";
+import reviewFixture from "./fixtures/codex-pr51.json" with { type: "json" };
 
 const first = { repository: "owner/one", pullRequest: 1, installationId: 1 };
 const second = { repository: "owner/two", pullRequest: 2, installationId: 2 };
@@ -18,19 +20,6 @@ const targets = [first, second];
 const oldHead = "a".repeat(40);
 const newHead = "b".repeat(40);
 const interval = 10_000;
-
-function exampleFix(root: string) {
-  return parseFixConfig({
-    repositoryDirectory: root,
-    worktreeRoot: root,
-    codexHome: root,
-    model: "fixture",
-    localBranch: "fix/one",
-    allowedPaths: ["src/"],
-    requiredChecks: ["CI"],
-    validation: [{ id: "test", argv: ["npm", "test"] }],
-  });
-}
 
 describe("unattended polling", () => {
   let root: string;
@@ -70,7 +59,7 @@ describe("unattended polling", () => {
   ) {
     return runUnattended({
       store,
-      config: { targets, fixes: new Map(), reconcileIntervalMs: interval },
+      config: { targets, requiredChecks: new Map(), reconcileIntervalMs: interval },
       reader,
       signal: stop.signal,
       now: () => now,
@@ -124,17 +113,11 @@ describe("unattended polling", () => {
     expect(workerStatus(store)).toMatchObject({ state: "stopped", lastPollSucceeded: true });
   });
 
-  it("defers advancement when the head changes during evidence collection", async () => {
-    const advance = vi.fn();
-    const fixes = new Map([["owner/one#1", exampleFix(root)]]);
+  it("discards stale evidence when the head changes during unattended polling", async () => {
     vi.mocked(reader.readPullRequest)
       .mockResolvedValueOnce({ state: "open", headSha: oldHead })
       .mockResolvedValueOnce({ state: "open", headSha: newHead });
-    await worker(() => stop.abort(), {
-      config: { targets, fixes, reconcileIntervalMs: interval },
-      advance,
-    });
-    expect(advance).not.toHaveBeenCalled();
+    await worker(() => stop.abort());
     expect(store.findWorkflow(first.repository, 1)).toMatchObject({
       headSha: newHead,
       review: null,
@@ -150,26 +133,14 @@ describe("unattended polling", () => {
     );
   });
 
-  it("finishes an in-flight read and starts neither advancement nor another target after shutdown", async () => {
+  it("finishes an in-flight read and starts no new target after shutdown", async () => {
     vi.mocked(reader.readPullRequest).mockImplementationOnce(async () => {
       stop.abort();
       return { state: "open", headSha: oldHead };
     });
-    const advance = vi.fn();
-    await worker(
-      () => {
-        throw new Error("Shutdown must skip the polling delay.");
-      },
-      {
-        advance,
-        config: {
-          targets,
-          fixes: new Map([["owner/one#1", exampleFix(root)]]),
-          reconcileIntervalMs: interval,
-        },
-      },
-    );
-    expect(advance).not.toHaveBeenCalled();
+    await worker(() => {
+      throw new Error("Shutdown must skip the polling delay.");
+    });
     expect(reader.readChecks).not.toHaveBeenCalled();
     expect(reader.readReviewInputs).not.toHaveBeenCalled();
     expect(reader.completeReconciliation).not.toHaveBeenCalled();
@@ -241,7 +212,7 @@ describe("unattended polling", () => {
     };
     const config = {
       targets: [first, shared, unaffected],
-      fixes: new Map(),
+      requiredChecks: new Map(),
       reconcileIntervalMs: interval,
     };
     reader = app(fetcher);
@@ -271,27 +242,36 @@ describe("unattended polling", () => {
     expect(requests.filter((request) => request.includes("/installations/1/"))).toHaveLength(2);
   });
 
-  it("identifies invalid checkout configuration and keeps polling the other PRs", async () => {
+  it("observes required checks and findings without dispatching agent work", async () => {
+    const { clean, reviewed, ...inputs } = reviewFixture;
+    vi.mocked(reader.readPullRequest).mockImplementation(async ({ pullRequest }) => ({
+      state: "open",
+      headSha: pullRequest === 1 ? reviewed : clean,
+    }));
+    vi.mocked(reader.readReviewInputs).mockResolvedValue(inputs);
+    vi.mocked(reader.readChecks).mockImplementation(async (_target, sha) => [
+      { name: "CI", outcome: "passed", sha },
+    ]);
     await worker(() => stop.abort(), {
       config: {
         targets,
-        fixes: new Map([["owner/one#1", exampleFix(root)]]),
+        requiredChecks: new Map([
+          ["owner/one#1", ["CI"]],
+          ["owner/two#2", ["CI"]],
+        ]),
         reconcileIntervalMs: interval,
       },
     });
-    expect(reader.completeReconciliation).toHaveBeenCalledWith(first);
-    expect(reader.completeReconciliation).toHaveBeenCalledWith(second);
-    expect(store.findWorkflow(second.repository, 2)).not.toBeNull();
-    expect(log).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event: "target_failed",
-        stage: "fix_advance",
-        pullRequest: 1,
-        outcome: "repository_checkout_unavailable",
-        detail: expect.stringContaining("repositoryDirectory"),
-      }),
-    );
-    expect(JSON.stringify(log.mock.calls)).not.toContain(root);
+    expect(workerStatus(store).pullRequests).toMatchObject([
+      { state: "review_findings", attention: "review_findings" },
+      { state: "ready_for_human" },
+    ]);
+    expect(store.findWorkflow(first.repository, 1)).toMatchObject({
+      requiredChecks: ["CI"],
+      checks: [{ name: "CI", outcome: "passed", sha: reviewed }],
+    });
+    using db = new DatabaseSync(path, { readOnly: true });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM operations").get()?.count).toBe(0);
   });
 
   it.each(["SIGINT", "SIGTERM"] as const)(
@@ -396,24 +376,23 @@ describe("unattended polling", () => {
     }
   });
 
-  it("accepts per-PR fix config, preserves the single-PR form, and rejects out-of-scope settings", () => {
+  it("accepts per-PR required checks and rejects invalid entries", () => {
     const configPath = join(root, "config.json");
-    const fix = exampleFix(root);
-    const repository = (target: typeof first) => ({
-      repository: target.repository,
-      installationId: target.installationId,
-      pullRequests: [target.pullRequest],
-    });
-    const load = (config: object) => {
-      writeFileSync(configPath, JSON.stringify(config));
+    const repositories = targets.map(({ repository, installationId, pullRequest }) => ({
+      repository,
+      installationId,
+      pullRequests: [pullRequest],
+    }));
+    const load = (requiredChecks?: unknown) => {
+      writeFileSync(configPath, JSON.stringify({ repositories, requiredChecks }));
       return loadConfig(configPath);
     };
-    expect(
-      load({ repositories: targets.map(repository), fixes: { "owner/one#1": fix } }).fixes,
-    ).toEqual(new Map([["owner/one#1", expect.objectContaining(fix)]]));
-    expect(load({ repositories: [repository(first)], fix }).fixes.size).toBe(1);
-    expect(() =>
-      load({ repositories: targets.map(repository), fixes: { "owner/one#9": fix } }),
-    ).toThrow(/configured/);
+    expect(load().requiredChecks.size).toBe(0);
+    expect(load({ "owner/one#1": ["CI"] }).requiredChecks).toEqual(
+      new Map([["owner/one#1", ["CI"]]]),
+    );
+    expect(() => load({ "owner/one#9": ["CI"] })).toThrow(/configured/);
+    for (const names of [[], [""], ["CI", "CI"], ["CI", 1]])
+      expect(() => load({ "owner/one#1": names })).toThrow(/unique names/);
   });
 });

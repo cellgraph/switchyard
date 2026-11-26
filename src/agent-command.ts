@@ -139,25 +139,15 @@ export function localAgentWorker(
   config: AgentConfig & {
     repositoryDirectory: string;
     worktreeRoot: string;
-    allowedPaths?: string[];
     readOnly?: boolean;
   },
 ): AgentOperationWorker {
   if (config.provider !== "claude-code") return localCodexWorker(config);
-  const { model, claude, repositoryDirectory, worktreeRoot, allowedPaths, readOnly } = config;
+  const { model, claude, repositoryDirectory, worktreeRoot, readOnly } = config;
   const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
   let identity: ReturnType<typeof claudeRuntime>;
   const configurationId = createHash("sha256")
-    .update(
-      JSON.stringify([
-        repositoryDirectory,
-        worktreeRoot,
-        config.provider,
-        model,
-        claude,
-        allowedPaths,
-      ]),
-    )
+    .update(JSON.stringify([repositoryDirectory, worktreeRoot, config.provider, model, claude]))
     .digest("hex");
   return {
     configurationId,
@@ -171,7 +161,6 @@ export function localAgentWorker(
           home: identity.runtime.home,
           model,
           ...(readOnly ? { readOnly } : {}),
-          ...(allowedPaths === undefined ? {} : { allowedPaths }),
         },
         apiKey!,
       );

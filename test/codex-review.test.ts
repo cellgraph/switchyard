@@ -252,7 +252,7 @@ describe("Codex review marker evidence", () => {
   });
 
   it.each(["CI failure", "CI throttle", "final head read failure"])(
-    "revokes fixing after a %s",
+    "invalidates incomplete review evidence after a %s",
     async (mode) => {
       const store = new WorkflowStore();
       try {
@@ -261,7 +261,7 @@ describe("Codex review marker evidence", () => {
         const reconcile = createReconciler(store, reader);
         await reconcile(target);
         expect(store.getWorkflow(workflowId)).toMatchObject({
-          state: "fixing",
+          state: "review_findings",
           review: { outcome: "completed_with_findings" },
         });
         const error =

@@ -101,8 +101,6 @@ export async function runRemoteWorker({
       );
       if (
         !profile ||
-        intent.fix ||
-        intent.mode !== "awaiting_review" ||
         expectedHead !== intent.expectedPullRequestHead ||
         createHash("sha256").update(prompt).digest("hex") !== intent.promptDigest
       )

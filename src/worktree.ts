@@ -173,11 +173,7 @@ function checkoutStatus(path: string) {
   return { status, changedPaths };
 }
 
-function contentCheckpoint(
-  pathRoot: string,
-  hash = createHash("sha256"),
-  entries?: string[],
-): string {
+function contentCheckpoint(pathRoot: string, hash: ReturnType<typeof createHash>): string {
   // Include raw bytes, since Git status can report the same paths after edits.
   let remainingBytes = 64 * 1024 * 1024;
   let remainingEntries = 10_000;
@@ -198,11 +194,10 @@ function contentCheckpoint(
       hash.update(createHash("sha256").update(readFileSync(path)).digest());
     } else throw new Error("Worktree contains an unsupported file type.");
   }
-  for (const entry of entries ??
-    readdirSync(pathRoot)
-      .sort()
-      .filter((name) => name !== ".git"))
-    visit(join(pathRoot, entry.replace(/\/$/, "")));
+  for (const entry of readdirSync(pathRoot)
+    .sort()
+    .filter((name) => name !== ".git"))
+    visit(join(pathRoot, entry));
   return hash.digest("hex");
 }
 
@@ -404,29 +399,6 @@ export function createWorktreeManager({
         JSON.stringify([status, git(worktree.path, "ls-files", "--stage", "-z")]),
       );
       return contentCheckpoint(worktree.path, hash);
-    },
-
-    contentCheckpoint(worktree: Worktree, expectedHead: string): string {
-      validate(worktree, expectedHead);
-      return contentCheckpoint(worktree.path);
-    },
-
-    ignoredCheckpoint(worktree: Worktree, expectedHead: string): string {
-      validate(worktree, expectedHead);
-      const ignored = git(
-        worktree.path,
-        "ls-files",
-        "--others",
-        "--ignored",
-        "--exclude-standard",
-        "--directory",
-        "-z",
-      );
-      return contentCheckpoint(
-        worktree.path,
-        undefined,
-        ignored.split("\0").filter(Boolean).sort(),
-      );
     },
 
     observe(worktree: Worktree, beforeHead: string) {

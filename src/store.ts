@@ -1,18 +1,11 @@
-import { createRemoteStore, remoteMigration } from "./remote-store.ts";
+import { createRemoteStore, remoteSchema } from "./remote-store.ts";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { createAgentOperationStore, recoverAgentOperations } from "./agent-store.ts";
-import {
-  fixMigration,
-  readFixCycles,
-  readFixReview,
-  workflowAuthorizationRevision,
-  type FixCycle,
-} from "./fix-store.ts";
 import type { GitHubRateLimits, GitHubRateLimitState } from "./github-app.ts";
 import type { PullRequestTarget } from "./github-api.ts";
 import { createReviewPublications } from "./review-publications.ts";
-import { createReviewStore, reviewMigration } from "./review-store.ts";
+import { createReviewStore, reviewSchema } from "./review-store.ts";
 import {
   transitionWorkflow,
   type CheckEvidence,
@@ -25,16 +18,6 @@ export type DeliveryStatus = "pending" | "processing" | "processed" | "failed";
 type InboxDelivery = { deliveryId: string; payload: unknown; workflowId: string | null };
 type DeliveryRow = { delivery_id: string; payload: string; workflow_id: string | null };
 export type OperationStatus = "pending" | "completed" | "failed" | "ambiguous";
-
-export type FixStoreState = {
-  workflow: Workflow;
-  cycles: FixCycle[];
-  review: ReturnType<typeof readFixReview>;
-  revision: number;
-  save(cycle: FixCycle): FixCycle;
-  transition(command: WorkflowCommand): Workflow;
-  reanchor(cycle: FixCycle, workspace: string): void;
-};
 
 export type GitHubObservationWriter = {
   transition(id: string, command: WorkflowCommand): Workflow;
@@ -66,11 +49,12 @@ export function localProcessAlive(pid: number | null): boolean {
   }
 }
 
-const migrations = [
-  `CREATE TABLE workflows (
+const schemaVersion = 16;
+const schema = `
+  CREATE TABLE workflows (
     id TEXT PRIMARY KEY, repository TEXT NOT NULL, pull_request INTEGER NOT NULL,
     state TEXT NOT NULL, head_sha TEXT NOT NULL, required_checks TEXT,
-    review TEXT, checks TEXT NOT NULL DEFAULT '[]', fix_cycles INTEGER NOT NULL DEFAULT 0,
+    review TEXT, checks TEXT NOT NULL DEFAULT '[]', closed_by_github INTEGER NOT NULL DEFAULT 0,
     escalation_reason TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
     UNIQUE(repository, pull_request)
   );
@@ -82,70 +66,61 @@ const migrations = [
   CREATE TABLE deliveries (
     delivery_id TEXT PRIMARY KEY, workflow_id TEXT REFERENCES workflows(id),
     payload TEXT NOT NULL, status TEXT NOT NULL, received_at TEXT NOT NULL,
-    processed_at TEXT, error TEXT
+    processed_at TEXT, error TEXT, attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER
   );
   CREATE INDEX deliveries_pending ON deliveries(status, received_at);
+  CREATE INDEX deliveries_retry ON deliveries(status, retry_at);
   CREATE TABLE review_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id TEXT NOT NULL REFERENCES workflows(id),
-    sha TEXT NOT NULL, outcome TEXT NOT NULL, captured_at TEXT NOT NULL
+    sha TEXT NOT NULL, outcome TEXT NOT NULL, run_id TEXT REFERENCES review_runs(id), captured_at TEXT NOT NULL
   );
   CREATE TABLE check_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id TEXT NOT NULL REFERENCES workflows(id),
     name TEXT NOT NULL, sha TEXT NOT NULL, outcome TEXT NOT NULL, captured_at TEXT NOT NULL
   );
   CREATE TABLE agent_sessions (
-    workflow_id TEXT PRIMARY KEY REFERENCES workflows(id), session_id TEXT, metadata TEXT NOT NULL DEFAULT '{}'
+    workflow_id TEXT PRIMARY KEY REFERENCES workflows(id), session_id TEXT, execution TEXT NOT NULL
   );
   CREATE TABLE worktrees (
-    workflow_id TEXT PRIMARY KEY REFERENCES workflows(id), path TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}'
+    workflow_id TEXT PRIMARY KEY REFERENCES workflows(id), path TEXT NOT NULL, execution TEXT NOT NULL
   );
   CREATE TABLE operations (
     operation_id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL REFERENCES workflows(id),
     kind TEXT NOT NULL, status TEXT NOT NULL, input TEXT NOT NULL, result TEXT,
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT
-  );`,
-  "ALTER TABLE workflows ADD COLUMN cycle_awaiting_review INTEGER NOT NULL DEFAULT 0;",
-  "ALTER TABLE workflows ADD COLUMN validation_head_sha TEXT;",
-  `ALTER TABLE workflows ADD COLUMN closed_by_github INTEGER NOT NULL DEFAULT 0;
-  ALTER TABLE deliveries ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
-  ALTER TABLE deliveries ADD COLUMN retry_at INTEGER;
-  CREATE INDEX deliveries_retry ON deliveries(status, retry_at);`,
-  `CREATE TABLE github_rate_limits (
-    scope TEXT PRIMARY KEY NOT NULL, retry_at INTEGER NOT NULL, throttled_attempts INTEGER NOT NULL,
-    retry_request TEXT
-  );`,
-  // Earlier keys lack a PR or repository scope. Preserve their cooldown and any explicit pause.
-  `UPDATE github_rate_limits SET throttled_attempts = 0, retry_request = NULL
-   WHERE scope = 'secondary' AND throttled_attempts BETWEEN 1 AND 4
-   AND (retry_request GLOB '*:GET:/repos/*/commits/*'
-     OR retry_request GLOB '*:POST:/app/installations/*/access_tokens');`,
-  `CREATE TABLE reconciliation_retries (retry_key TEXT PRIMARY KEY NOT NULL, retry_at INTEGER NOT NULL);`,
-  `ALTER TABLE agent_sessions ADD COLUMN execution TEXT;
-  ALTER TABLE worktrees ADD COLUMN execution TEXT;
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT, owner_pid INTEGER
+  );
   CREATE INDEX agent_operations_by_workflow ON operations(workflow_id, status) WHERE kind='durable_agent_turn';
   CREATE UNIQUE INDEX one_unresolved_agent_operation ON operations(workflow_id)
-    WHERE kind='durable_agent_turn' AND status IN ('requested','dispatching','running','unknown','interrupted','manual_reconciliation');`,
-  "ALTER TABLE operations ADD COLUMN owner_pid INTEGER;",
-  reviewMigration,
-  "ALTER TABLE review_runs ADD COLUMN latest_summary TEXT;",
-  fixMigration,
-  `CREATE TABLE github_observation_generations (
+    WHERE kind='durable_agent_turn' AND status IN ('requested','dispatching','running','unknown','interrupted','manual_reconciliation');
+  CREATE TABLE github_rate_limits (
+    scope TEXT PRIMARY KEY NOT NULL, retry_at INTEGER NOT NULL, throttled_attempts INTEGER NOT NULL,
+    retry_request TEXT
+  );
+  CREATE TABLE reconciliation_retries (retry_key TEXT PRIMARY KEY NOT NULL, retry_at INTEGER NOT NULL);
+  CREATE TABLE github_observation_generations (
     repository TEXT NOT NULL COLLATE NOCASE, pull_request INTEGER NOT NULL, generation INTEGER NOT NULL,
     PRIMARY KEY (repository, pull_request)
-  );`,
-  "CREATE TABLE unattended_worker (slot INTEGER PRIMARY KEY CHECK(slot=1), record TEXT NOT NULL);",
-  remoteMigration,
-];
+  );
+  CREATE TABLE unattended_worker (slot INTEGER PRIMARY KEY CHECK(slot=1), record TEXT NOT NULL);
+  ${reviewSchema}
+  ${remoteSchema}
+  PRAGMA user_version = ${schemaVersion};
+`;
 
 export class WorkflowStore {
   readonly #db: DatabaseSync;
 
   constructor(path = ":memory:") {
     this.#db = new DatabaseSync(path, { timeout: 5_000 });
-    this.#db.exec(
-      "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;",
-    );
-    this.#migrate();
+    try {
+      this.#initialize();
+      this.#db.exec(
+        "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;",
+      );
+    } catch (error) {
+      this.#db.close();
+      throw error;
+    }
   }
 
   close(): void {
@@ -236,8 +211,8 @@ export class WorkflowStore {
     const now = new Date().toISOString();
     this.#db
       .prepare(
-        `INSERT INTO workflows (id, repository, pull_request, state, head_sha, required_checks, review, checks, fix_cycles, cycle_awaiting_review, validation_head_sha, escalation_reason, closed_by_github, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO workflows (id, repository, pull_request, state, head_sha, required_checks, review, checks, escalation_reason, closed_by_github, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         workflow.id,
@@ -248,9 +223,6 @@ export class WorkflowStore {
         JSON.stringify(workflow.requiredChecks),
         JSON.stringify(workflow.review),
         JSON.stringify(workflow.checks),
-        workflow.fixCycles,
-        workflow.cycleAwaitingReview ? 1 : 0,
-        workflow.validationHeadSha,
         workflow.escalationReason,
         workflow.closedByGitHub ? 1 : 0,
         now,
@@ -288,7 +260,6 @@ export class WorkflowStore {
   #reviews(transaction: <T>(run: () => T) => T) {
     return createReviewStore(this.#db, {
       transaction,
-      assertDispositionAllowed: (id, runId) => this.#assertPublicationUnclaimed(id, runId),
       getWorkflow: (id) => this.getWorkflow(id),
       transition: (id, command) => this.#transition(id, command),
     });
@@ -324,19 +295,6 @@ export class WorkflowStore {
     };
   }
 
-  #assertPublicationUnclaimed(id: string, runId?: string) {
-    const cycle = readFixCycles(this.#db, id).at(-1);
-    if (
-      cycle?.push &&
-      cycle.push !== "confirmed" &&
-      (runId === undefined || cycle.review.id === runId)
-    ) {
-      throw new Error(
-        "Publication has already started. Reconcile the push before changing its findings or stopping the workflow.",
-      );
-    }
-  }
-
   #agentOperationStore(transaction: <T>(run: () => T) => T) {
     return createAgentOperationStore(this.#db, {
       transaction,
@@ -360,70 +318,9 @@ export class WorkflowStore {
     return this.#agentOperationStore((run) => this.#transaction(run));
   }
 
-  fixes(workflowId: string) {
-    return {
-      read: () => readFixCycles(this.#db, workflowId),
-      edit: <T>(run: (state: FixStoreState) => T): T =>
-        this.#transaction(() => {
-          const workflow = this.getWorkflow(workflowId);
-          if (!workflow) throw new Error("Workflow does not exist. Reconcile GitHub first.");
-          return run({
-            workflow,
-            cycles: readFixCycles(this.#db, workflowId),
-            review: readFixReview(this.#db, workflow),
-            revision: workflowAuthorizationRevision(this.#db, workflowId),
-            save: (cycle) => this.#saveFix(cycle),
-            transition: (command) => this.#transition(workflowId, command),
-            reanchor: (cycle, workspace) => {
-              const result = this.#db
-                .prepare(
-                  `
-              UPDATE agent_sessions SET execution=json_set(execution, '$.head', ?, '$.checkpoint.workspace', ?, '$.updatedAt', ?)
-              WHERE workflow_id=? AND json_extract(execution, '$.status')='active'
-              AND json_extract(execution, '$.head')=? AND json_extract(execution, '$.lastOperationId')=?
-            `,
-                )
-                .run(
-                  cycle.commit!,
-                  workspace,
-                  new Date().toISOString(),
-                  workflowId,
-                  cycle.head,
-                  cycle.operationId,
-                );
-              if (result.changes !== 1)
-                throw new Error("Fix session changed before publication confirmation.");
-            },
-          });
-        }),
-    };
-  }
-
-  #saveFix(cycle: FixCycle): FixCycle {
-    cycle = { ...cycle, version: cycle.version + 1, updatedAt: new Date().toISOString() };
-    this.#db
-      .prepare(
-        `
-      DELETE FROM fix_cycles WHERE workflow_id=? AND head_sha=? AND id<>?
-      AND json_extract(record, '$.phase')='proposed'
-    `,
-      )
-      .run(cycle.workflowId, cycle.head, cycle.id);
-    this.#db
-      .prepare(
-        `
-      INSERT INTO fix_cycles(id, workflow_id, head_sha, record) VALUES (?,?,?,?)
-      ON CONFLICT(id) DO UPDATE SET record=excluded.record
-    `,
-      )
-      .run(cycle.id, cycle.workflowId, cycle.head, JSON.stringify(cycle));
-    return cycle;
-  }
-
   #transition(id: string, command: WorkflowCommand): Workflow {
     const current = this.getWorkflow(id);
     if (!current) throw new Error(`Workflow ${id} does not exist.`);
-    if (command.type === "stop") this.#assertPublicationUnclaimed(id);
     if (
       command.type === "github_pull_request" &&
       command.state === "open" &&
@@ -450,59 +347,17 @@ export class WorkflowStore {
         );
       }
     }
-    const cycle = readFixCycles(this.#db, id).at(-1);
-    if (
-      command.type === "late_publication_confirmed" &&
-      (cycle?.phase !== "escalated" ||
-        cycle.push !== "confirmed" ||
-        cycle.interruptedPushDeadline === undefined ||
-        cycle.commit !== command.sha)
-    )
-      throw new Error("Late publication does not match the recorded interrupted push.");
-    if (cycle && !["proposed", "finished", "escalated"].includes(cycle.phase)) {
-      const observed =
-        command.type === "github_pull_request" || command.type === "head_changed"
-          ? command.sha
-          : undefined;
-      const expectedPublication =
-        cycle.commit &&
-        ["pushing", "confirming"].includes(cycle.phase) &&
-        (current.headSha === cycle.head || current.headSha === cycle.commit);
-      const expectedHead = observed && expectedPublication && observed === cycle.commit;
-      const invalidHead = observed && observed !== current.headSha && !expectedHead;
-      const closed = command.type === "github_pull_request" && command.state === "closed";
-      const invalidReview =
-        current.headSha === cycle.head &&
-        (command.type === "review_invalidated" ||
-          (command.type === "review_received" &&
-            (command.evidence.runId !== cycle.review.id ||
-              command.evidence.outcome !== "completed_with_findings")));
-      if (invalidHead || closed || invalidReview) {
-        const reason = closed
-          ? "The pull request closed during an authorized fix."
-          : invalidHead
-            ? "The pull request head changed outside the authorized publication."
-            : "The review authorizing this fix changed. Inspect the retained worktree and review evidence.";
-        command = { type: "escalate", reason, ...(observed ? { observedHeadSha: observed } : {}) };
-      }
-      if (command.type === "escalate") {
-        this.#saveFix({
-          ...cycle,
-          phase: "escalated",
-          reason: command.reason,
-          validation: cycle.validation.map((attempt) =>
-            attempt.status === "running" ? { ...attempt, status: "unknown" } : attempt,
-          ),
-        });
-      }
-    }
-    const result = transitionWorkflow(current, command);
+    const review = command.type === "review_received" ? command.evidence : current.review;
+    const hasBlockingFindings =
+      review?.outcome === "completed_clean" &&
+      this.#reviews((run) => run()).hasBlockingFindings(id);
+    const result = transitionWorkflow(current, command, hasBlockingFindings);
     const w = result.workflow;
     if (JSON.stringify(w) === JSON.stringify(current)) return w;
     const now = new Date().toISOString();
     this.#db
       .prepare(
-        `UPDATE workflows SET state=?, head_sha=?, required_checks=?, review=?, checks=?, fix_cycles=?, cycle_awaiting_review=?, validation_head_sha=?, escalation_reason=?, closed_by_github=?, updated_at=? WHERE id=?`,
+        `UPDATE workflows SET state=?, head_sha=?, required_checks=?, review=?, checks=?, escalation_reason=?, closed_by_github=?, updated_at=? WHERE id=?`,
       )
       .run(
         w.state,
@@ -510,9 +365,6 @@ export class WorkflowStore {
         JSON.stringify(w.requiredChecks),
         JSON.stringify(w.review),
         JSON.stringify(w.checks),
-        w.fixCycles,
-        w.cycleAwaitingReview ? 1 : 0,
-        w.validationHeadSha,
         w.escalationReason,
         w.closedByGitHub ? 1 : 0,
         now,
@@ -531,9 +383,15 @@ export class WorkflowStore {
     if (command.type === "review_received")
       this.#db
         .prepare(
-          "INSERT INTO review_snapshots (workflow_id, sha, outcome, captured_at) VALUES (?, ?, ?, ?)",
+          "INSERT INTO review_snapshots (workflow_id, sha, outcome, run_id, captured_at) VALUES (?, ?, ?, ?, ?)",
         )
-        .run(id, command.evidence.sha, command.evidence.outcome, now);
+        .run(
+          id,
+          command.evidence.sha,
+          command.evidence.outcome,
+          command.evidence.runId ?? null,
+          now,
+        );
     if (command.type === "checks_received")
       for (const check of command.evidence)
         this.#db
@@ -779,20 +637,17 @@ export class WorkflowStore {
     }));
   }
 
-  #migrate(): void {
+  #initialize(): void {
     this.#transaction(() => {
-      this.#db.exec(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
-      );
-      const { version } = this.#db
-        .prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations")
-        .get() as { version: number };
-      for (let i = version; i < migrations.length; i++) {
-        this.#db.exec(migrations[i]!);
-        this.#db
-          .prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
-          .run(i + 1, new Date().toISOString());
-      }
+      const { user_version: version } = this.#db.prepare("PRAGMA user_version").get() as {
+        user_version: number;
+      };
+      if (version === schemaVersion) return;
+      if (version !== 0 || this.#db.prepare("SELECT 1 FROM sqlite_schema LIMIT 1").get())
+        throw new Error(
+          "Unsupported Switchyard database schema. Use a fresh SWITCHYARD_DB_PATH for this implementation.",
+        );
+      this.#db.exec(schema);
     });
   }
 }
@@ -815,9 +670,6 @@ function decodeWorkflow(row: Record<string, unknown>): Workflow {
       row.required_checks === null ? null : (JSON.parse(String(row.required_checks)) as string[]),
     review: row.review === null ? null : (JSON.parse(String(row.review)) as ReviewEvidence),
     checks: JSON.parse(String(row.checks)) as CheckEvidence[],
-    fixCycles: Number(row.fix_cycles),
-    cycleAwaitingReview: Number(row.cycle_awaiting_review) === 1,
-    validationHeadSha: row.validation_head_sha === null ? null : String(row.validation_head_sha),
     escalationReason: row.escalation_reason === null ? null : String(row.escalation_reason),
     ...(row.closed_by_github === 1 ? { closedByGitHub: true } : {}),
   };

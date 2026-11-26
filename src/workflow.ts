@@ -1,8 +1,7 @@
 export const workflowStates = [
   "awaiting_review",
   "review_running",
-  "fixing",
-  "validating",
+  "review_findings",
   "ready_for_human",
   "escalated",
   "stopped",
@@ -12,7 +11,6 @@ export type WorkflowState = (typeof workflowStates)[number];
 export type ReviewOutcome =
   "completed_with_findings" | "completed_clean" | "in_progress" | "indeterminate";
 export type CheckOutcome = "passed" | "failed" | "pending" | "unknown";
-export type CycleOutcome = "successful" | "unsuccessful";
 export type WorkflowIdentity = {
   repository: string;
   pullRequest: number;
@@ -27,9 +25,6 @@ export type Workflow = {
   requiredChecks: string[] | null;
   review: ReviewEvidence | null;
   checks: CheckEvidence[];
-  fixCycles: number;
-  cycleAwaitingReview: boolean;
-  validationHeadSha: string | null;
   escalationReason: string | null;
   closedByGitHub?: true;
 };
@@ -37,15 +32,10 @@ export type Workflow = {
 export type WorkflowCommand =
   | { type: "head_changed"; sha: string }
   | { type: "github_pull_request"; sha: string; state: "open" | "closed" }
-  | { type: "review_started" }
   | { type: "review_invalidated"; reason: string }
   | { type: "review_received"; evidence: ReviewEvidence }
   | { type: "checks_received"; evidence: CheckEvidence[]; configuredNames: string[] | null }
-  | { type: "fix_attention"; reason: string | null }
-  | { type: "fix_started" }
-  | { type: "validation_started" }
-  | { type: "cycle_finished"; outcome: CycleOutcome }
-  | { type: "late_publication_confirmed"; sha: string }
+  | { type: "findings_changed" }
   | { type: "escalate"; reason: string; observedHeadSha?: string }
   | { type: "stop"; reason: string };
 
@@ -64,7 +54,11 @@ export class InvalidTransitionError extends Error {
   }
 }
 
-export function transitionWorkflow(current: Workflow, command: WorkflowCommand): Transition {
+export function transitionWorkflow(
+  current: Workflow,
+  command: WorkflowCommand,
+  hasBlockingFindings: boolean,
+): Transition {
   const next: Workflow = { ...current, checks: [...current.checks] };
   const from = current.state;
   const reason = transitionReason(command, current.headSha);
@@ -74,10 +68,7 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
     (command.type === "github_pull_request" ||
       command.type === "escalate" ||
       command.type === "stop");
-  if (
-    (current.state === "stopped" && !mayChangeGitHubClosure) ||
-    (current.state === "escalated" && command.type !== "late_publication_confirmed")
-  ) {
+  if ((current.state === "stopped" && !mayChangeGitHubClosure) || current.state === "escalated") {
     throw new InvalidTransitionError(
       `Cannot transition a ${current.state} workflow without a future explicit recovery action.`,
     );
@@ -94,7 +85,6 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
         if (command.state === "closed") {
           next.state = "stopped";
           next.closedByGitHub = true;
-          next.validationHeadSha = null;
           next.escalationReason = "GitHub pull request is closed.";
         } else {
           next.state = "awaiting_review";
@@ -108,13 +98,9 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
         throw new InvalidTransitionError("A head change requires a new non-empty SHA.");
       setHead(next, command.sha);
       break;
-    case "review_started":
-      requireState(current, ["awaiting_review"]);
-      next.state = "review_running";
-      break;
     case "review_invalidated":
       next.review = null;
-      if (current.state !== "validating") next.state = "awaiting_review";
+      next.state = "awaiting_review";
       break;
     case "review_received":
       if (command.evidence.sha !== current.headSha)
@@ -133,111 +119,26 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
         };
       next.review = command.evidence;
       next.escalationReason = null;
-      if (command.evidence.outcome === "completed_with_findings") {
-        if (current.state !== "validating") {
-          if (current.cycleAwaitingReview) next.fixCycles += 1;
-          next.cycleAwaitingReview = false;
-          if (next.fixCycles >= 3) {
-            next.state = "escalated";
-            next.escalationReason = "Three fix cycles received findings in review.";
-          } else next.state = "fixing";
-        }
-      } else if (command.evidence.outcome === "in_progress")
-        next.state = current.state === "validating" ? "validating" : "review_running";
-      else if (command.evidence.outcome === "indeterminate") next.state = "escalated";
-      else {
-        next.cycleAwaitingReview = false;
-        next.state =
-          current.state === "validating"
-            ? "validating"
-            : isReady(next)
-              ? "ready_for_human"
-              : "awaiting_review";
-      }
-      if (command.evidence.outcome === "indeterminate")
+      if (command.evidence.outcome === "in_progress") {
+        next.state = "review_running";
+      } else if (command.evidence.outcome === "completed_with_findings") {
+        next.state = "review_findings";
+      } else if (command.evidence.outcome === "indeterminate") {
+        next.state = "escalated";
         next.escalationReason = "Review evidence is indeterminate.";
+      } else {
+        next.state = isReady(next, hasBlockingFindings) ? "ready_for_human" : "awaiting_review";
+      }
       break;
     case "checks_received":
       if (command.evidence.some((check) => check.sha !== current.headSha))
         throw new InvalidTransitionError("Check evidence must match the current head SHA.");
       next.checks = command.evidence;
       next.requiredChecks = command.configuredNames;
-      next.state =
-        current.state === "validating"
-          ? "validating"
-          : isReady(next)
-            ? "ready_for_human"
-            : current.state === "ready_for_human"
-              ? "awaiting_review"
-              : current.state;
+      updateReadiness();
       break;
-    case "fix_attention":
-      next.escalationReason = command.reason;
-      break;
-    case "fix_started":
-      requireState(current, ["fixing"]);
-      if (current.fixCycles >= 3)
-        throw new InvalidTransitionError(
-          "The maximum of three unsuccessful fix cycles has been reached.",
-        );
-      next.state = "fixing";
-      break;
-    case "validation_started":
-      requireState(current, ["fixing"]);
-      next.validationHeadSha = current.headSha;
-      next.state = "validating";
-      break;
-    case "cycle_finished":
-      requireState(current, ["validating"]);
-      if (command.outcome === "unsuccessful") next.fixCycles += 1;
-      if (
-        command.outcome === "successful" &&
-        current.validationHeadSha !== current.headSha &&
-        current.validationHeadSha !== null &&
-        current.review?.sha === current.headSha &&
-        current.review.outcome === "completed_with_findings"
-      )
-        next.fixCycles += 1;
-      next.validationHeadSha = null;
-      if (next.fixCycles >= 3 && command.outcome === "unsuccessful") {
-        next.state = "escalated";
-        next.escalationReason = "Three unsuccessful fix cycles.";
-      } else if (next.fixCycles >= 3 && command.outcome === "successful") {
-        next.cycleAwaitingReview = false;
-        next.state = "escalated";
-        next.escalationReason = "Three fix cycles received findings in review.";
-      } else if (
-        command.outcome === "successful" &&
-        current.validationHeadSha !== current.headSha &&
-        current.validationHeadSha !== null &&
-        current.review?.sha === current.headSha &&
-        current.review.outcome === "completed_with_findings"
-      ) {
-        next.cycleAwaitingReview = false;
-        next.state = "fixing";
-      } else if (
-        command.outcome === "successful" &&
-        current.review?.sha === current.headSha &&
-        current.review.outcome === "completed_clean"
-      ) {
-        next.cycleAwaitingReview = false;
-        next.state = isReady(next) ? "ready_for_human" : "awaiting_review";
-      } else if (command.outcome === "unsuccessful") {
-        next.cycleAwaitingReview = false;
-        next.state = "fixing";
-      } else {
-        next.cycleAwaitingReview = true;
-        next.state =
-          current.review?.outcome === "in_progress" ? "review_running" : "awaiting_review";
-      }
-      break;
-    case "late_publication_confirmed":
-      requireState(current, ["escalated"]);
-      next.headSha = command.sha;
-      next.review = null;
-      next.checks = [];
-      next.validationHeadSha = null;
-      next.cycleAwaitingReview = false;
+    case "findings_changed":
+      updateReadiness();
       break;
     case "escalate":
       if (!command.reason.trim())
@@ -258,15 +159,21 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
       delete next.closedByGitHub;
       break;
   }
-  if (next.state === "ready_for_human" && !isReady(next))
+  if (next.state === "ready_for_human" && !isReady(next, hasBlockingFindings))
     throw new InvalidTransitionError(
-      "Readiness requires explicit clean review and passing configured checks for the current SHA.",
+      "Readiness requires explicit clean review, resolved blocking findings, and passing configured checks for the current SHA.",
     );
   return { workflow: next, from, to: next.state, reason, headSha: next.headSha };
+
+  function updateReadiness() {
+    if (isReady(next, hasBlockingFindings)) next.state = "ready_for_human";
+    else if (current.state === "ready_for_human") next.state = "awaiting_review";
+  }
 }
 
-export function isReady(workflow: Workflow): boolean {
-  if (!workflow.requiredChecks || workflow.requiredChecks.length === 0) return false;
+function isReady(workflow: Workflow, hasBlockingFindings: boolean): boolean {
+  if (hasBlockingFindings || !workflow.requiredChecks || workflow.requiredChecks.length === 0)
+    return false;
   if (
     !workflow.review ||
     workflow.review.sha !== workflow.headSha ||
@@ -281,19 +188,12 @@ export function isReady(workflow: Workflow): boolean {
   return workflow.requiredChecks.every((name) => checks.get(name) === "passed");
 }
 
-function requireState(workflow: Workflow, allowed: WorkflowState[]): void {
-  if (!allowed.includes(workflow.state))
-    throw new InvalidTransitionError(
-      `Cannot apply this command while workflow is ${workflow.state}.`,
-    );
-}
-
 function setHead(workflow: Workflow, sha: string): void {
   workflow.headSha = sha;
   workflow.review = null;
   workflow.checks = [];
   workflow.escalationReason = null;
-  if (workflow.state !== "validating") workflow.state = "awaiting_review";
+  workflow.state = "awaiting_review";
 }
 
 function transitionReason(command: WorkflowCommand, headSha: string): string {
@@ -306,8 +206,6 @@ function transitionReason(command: WorkflowCommand, headSha: string): string {
       return `review_received: ${command.evidence.outcome} for ${command.evidence.sha}${command.evidence.runId ? ` (run ${command.evidence.runId})` : ""}`;
     case "checks_received":
       return `checks_received for ${headSha}: ${command.evidence.map((check) => `${check.name}=${check.outcome}`).join(", ") || "no check evidence"}`;
-    case "cycle_finished":
-      return `cycle_finished: ${command.outcome}`;
     case "escalate":
     case "stop":
     case "review_invalidated":

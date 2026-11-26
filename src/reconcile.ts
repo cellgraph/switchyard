@@ -1,7 +1,6 @@
 import { observeCodexReview } from "./codex-review.ts";
 import type { GitHubReader, PullRequestState, PullRequestTarget } from "./github-api.ts";
 import { checkGitHubDrain, GitHubRateLimitError, githubRetryError } from "./github-app.ts";
-import { canConfirmLatePush } from "./fix-store.ts";
 import type { GitHubObservationWriter, WorkflowStore } from "./store.ts";
 import type { CheckEvidence, Workflow } from "./workflow.ts";
 
@@ -27,17 +26,8 @@ export function canReconcilePullRequest(
   store: WorkflowStore,
   repository: string,
   pullRequest: number,
-  includeLatePush = false,
 ): boolean {
-  const workflow = store.findWorkflow(repository, pullRequest);
-  return (
-    !isReconciliationTerminal(workflow) ||
-    Boolean(
-      includeLatePush &&
-      workflow?.state === "escalated" &&
-      canConfirmLatePush(store.fixes(workflow.id).read().at(-1)),
-    )
-  );
+  return !isReconciliationTerminal(store.findWorkflow(repository, pullRequest));
 }
 
 export function createReconciler(
@@ -67,9 +57,6 @@ export function createReconciler(
           requiredChecks: null,
           review: null,
           checks: [],
-          fixCycles: 0,
-          cycleAwaitingReview: false,
-          validationHeadSha: null,
           escalationReason: null,
         });
       }

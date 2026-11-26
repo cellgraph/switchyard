@@ -8,7 +8,6 @@ import type {
   AgentTurnEvidence,
   AgentTurnIntent,
 } from "./agent-operation.ts";
-import { fixAgentAuthorized } from "./fix-store.ts";
 import type { Worktree } from "./worktree.ts";
 import type { Workflow, WorkflowCommand } from "./workflow.ts";
 
@@ -26,16 +25,8 @@ function decode<T>(json: string): T {
   return JSON.parse(json) as T;
 }
 
-function eligible(workflow: Workflow | null, intent: AgentTurnIntent): boolean {
-  return (
-    workflow?.state === intent.mode &&
-    workflow.headSha === intent.expectedPullRequestHead &&
-    (workflow.state !== "fixing" ||
-      (intent.expectedHead === workflow.headSha &&
-        workflow.fixCycles < 3 &&
-        workflow.review?.sha === workflow.headSha &&
-        workflow.review.outcome === "completed_with_findings"))
-  );
+function eligible(workflow: Workflow | null, expectedPullRequestHead: string): boolean {
+  return workflow?.state === "awaiting_review" && workflow.headSha === expectedPullRequestHead;
 }
 
 export function recoverAgentOperations(db: DatabaseSync) {
@@ -186,9 +177,7 @@ export function createAgentOperationStore(
 
   function authorized(workflow: Workflow | null, intent: AgentTurnIntent): boolean {
     return (
-      eligible(workflow, intent) &&
-      workflow !== null &&
-      fixAgentAuthorized(db, workflow, intent) &&
+      eligible(workflow, intent.expectedPullRequestHead) &&
       workflowRevision(intent.workflowId) === intent.workflowRevision
     );
   }
@@ -210,20 +199,6 @@ export function createAgentOperationStore(
   return {
     get,
     session,
-    hasUnresolved(workflowId: string): boolean {
-      return Boolean(
-        db
-          .prepare(
-            `
-        SELECT 1 FROM operations WHERE workflow_id=? AND (
-          (kind='durable_agent_turn' AND status<>'completed') OR status IN ('pending','ambiguous')
-        ) LIMIT 1
-      `,
-          )
-          .get(workflowId),
-      );
-    },
-
     retireRevokedRemoteRequests(workflowId?: string) {
       transaction(() => {
         const query = `SELECT t.operation_id FROM remote_turns t JOIN operations o USING(operation_id)
@@ -240,14 +215,13 @@ export function createAgentOperationStore(
       });
     },
 
-    request(input: Omit<AgentTurnIntent, "mode" | "workflowRevision">): AgentOperation {
+    request(input: Omit<AgentTurnIntent, "workflowRevision">): AgentOperation {
       return transaction(() => {
         const existing = get(input.operationId);
         if (existing) {
           if (
             !isDeepStrictEqual(existing.intent, {
               ...input,
-              mode: existing.intent.mode,
               workflowRevision: existing.intent.workflowRevision,
             })
           )
@@ -257,21 +231,16 @@ export function createAgentOperationStore(
         if (db.prepare("SELECT 1 FROM operations WHERE operation_id=?").get(input.operationId))
           throw new Error("Operation ID is already in use.");
         const workflow = getWorkflow(input.workflowId);
-        if (workflow?.state !== "awaiting_review" && workflow?.state !== "fixing")
+        if (workflow?.state !== "awaiting_review")
           throw new Error("Workflow is not eligible for an agent turn.");
         const intent: AgentTurnIntent = {
           ...input,
-          mode: workflow.state,
           workflowRevision: workflowRevision(workflow.id),
         };
-        if (intent.remote && (intent.fix || intent.mode !== "awaiting_review"))
-          throw new Error(
-            "Remote turns require a PR awaiting review and explicit standalone authorization.",
-          );
         if (intent.remote && intent.expectedHead !== intent.expectedPullRequestHead)
           throw new Error("Remote checkout and pull request heads must match.");
-        if (!eligible(workflow, intent) || !fixAgentAuthorized(db, workflow, intent))
-          throw new Error("Workflow head or fix authorization does not match the request.");
+        if (workflow.headSha !== input.expectedPullRequestHead)
+          throw new Error("Workflow head does not match the request.");
         assertNoLegacyOperation(workflow.id);
         if (
           db
@@ -282,22 +251,12 @@ export function createAgentOperationStore(
         )
           throw new Error("Workflow already has an unresolved agent operation.");
         const previous = session(workflow.id);
-        if (
-          !previous &&
-          db
-            .prepare(
-              `SELECT 1 FROM agent_sessions WHERE workflow_id=? AND session_id IS NOT NULL
-           UNION ALL SELECT 1 FROM worktrees WHERE workflow_id=?`,
-            )
-            .get(workflow.id, workflow.id)
-        )
-          throw new Error("Legacy agent session or worktree requires inspection before dispatch.");
+        if (!previous && db.prepare("SELECT 1 FROM worktrees WHERE workflow_id=?").get(workflow.id))
+          throw new Error("An unbound worktree requires inspection before dispatch.");
         if (previous && Boolean(previous.remoteWorkerId) !== Boolean(intent.remote))
           throw new Error("The agent session belongs to a different execution location.");
         if (previous?.status === "held" || previous?.status === "starting")
           throw new Error("Agent session requires manual reconciliation.");
-        if (!previous && intent.mode === "fixing" && !workflow.review?.runId)
-          throw new Error("A fix requires an active implementation session.");
         if (!previous && intent.expectedHead !== workflow.headSha)
           throw new Error("The first agent turn must start at the recorded pull request head.");
         if (
@@ -381,10 +340,7 @@ export function createAgentOperationStore(
 
     progress(
       id: string,
-      evidence: Pick<
-        AgentTurnEvidence,
-        "reference" | "worktree" | "expectedWorktree" | "prelaunchCheckpoint"
-      >,
+      evidence: Pick<AgentTurnEvidence, "reference" | "worktree" | "expectedWorktree">,
     ): void {
       transaction(() => {
         const current = get(id);
@@ -393,30 +349,6 @@ export function createAgentOperationStore(
           !setStatus(id, "running", "running", { ...current.evidence, ...evidence })
         )
           throw new Error("Agent operation lost its dispatch authorization.");
-      });
-    },
-
-    deferPrelaunch(id: string): boolean {
-      return transaction(() => {
-        const operation = get(id);
-        if (operation?.status !== "running" || !operation.intent.fix) return false;
-        const evidence = operation.evidence;
-        if (
-          !evidence?.worktree ||
-          !evidence.prelaunchCheckpoint ||
-          evidence.launchAuthorizedAt ||
-          evidence.reference
-        )
-          return false;
-        if (!authorized(getWorkflow(operation.intent.workflowId), operation.intent)) return false;
-        const binding = session(operation.intent.workflowId);
-        if (!setStatus(id, "running", "requested", evidence)) return false;
-        db.prepare("UPDATE operations SET owner_pid=NULL WHERE operation_id=?").run(id);
-        if (binding?.status === "starting" && binding.initialOperationId === id)
-          db.prepare("DELETE FROM agent_sessions WHERE workflow_id=?").run(
-            operation.intent.workflowId,
-          );
-        return true;
       });
     },
 
@@ -448,9 +380,6 @@ export function createAgentOperationStore(
             !isDeepStrictEqual(evidence.reference.worktree, evidence.worktree))
             ? "Worker returned conflicting session and checkout evidence."
             : undefined) ??
-          (intent.fix && !isDeepStrictEqual(evidence.addressedFindings, intent.fix.findingIds)
-            ? "Agent did not confirm addressing every accepted finding."
-            : undefined) ??
           (!evidence.runtime || !evidence.reference || !evidence.checkpoint || !evidence.workspace
             ? "Agent did not return the session and checkout evidence needed for continuation."
             : undefined);
@@ -477,9 +406,7 @@ export function createAgentOperationStore(
           updatedAt: new Date().toISOString(),
         });
 
-        if (confirmed && intent.mode === "fixing")
-          transition(intent.workflowId, { type: "validation_started" });
-        else if (
+        if (
           reason &&
           workflow &&
           workflow.state !== "escalated" &&

@@ -6,16 +6,10 @@ import type {
   AgentTurnEvidence,
   AgentTurnRequest,
 } from "./agent-operation.ts";
-import { GitHubDrainError, GitHubTransientError, GitHubRateLimitError } from "./github-app.ts";
-import { PullRequestHeadChangedError } from "./reconcile.ts";
 import { describeError } from "./controller.ts";
 import type { WorkflowStore } from "./store.ts";
 
-export function createAgentController(
-  store: WorkflowStore,
-  worker: AgentOperationWorker,
-  refreshLaunch?: () => Promise<void>,
-) {
+export function createAgentController(store: WorkflowStore, worker: AgentOperationWorker) {
   const operations = store.agentOperations();
 
   function request({
@@ -25,7 +19,6 @@ export function createAgentController(
     expectedPullRequestHead,
     expectedHead,
     prompt,
-    fix,
   }: AgentTurnRequest) {
     if (
       ![operationId, workflowId, branch, expectedPullRequestHead, expectedHead, prompt].every(
@@ -41,15 +34,12 @@ export function createAgentController(
       )
     )
       throw new Error("Agent turns require full Git commit SHAs.");
-    if (fix && !refreshLaunch)
-      throw new Error("Fix turns require controller-owned GitHub preflight.");
     return operations.request({
       operationId,
       workflowId,
       branch,
       expectedPullRequestHead,
       expectedHead,
-      ...(fix ? { fix } : {}),
       configurationId: worker.configurationId,
       promptDigest: createHash("sha256").update(prompt).digest("hex"),
     });
@@ -65,13 +55,8 @@ export function createAgentController(
       if (!claim) return operations.get(operationId)!;
 
       let evidence: AgentTurnEvidence;
-      let deferredPreflight: Error | undefined;
       try {
         const { previous } = claim;
-        if (typeof previous?.checkpoint?.session === "string")
-          throw new Error(
-            "The saved checkpoint predates verified rollout selection and requires inspection.",
-          );
         const runtime = worker.runtime();
         if (
           previous &&
@@ -82,8 +67,6 @@ export function createAgentController(
             !isDeepStrictEqual(previous.runtime, runtime))
         )
           throw new Error("Recorded agent runtime or session is incompatible with continuation.");
-        if (operation.evidence?.runtime && !isDeepStrictEqual(operation.evidence.runtime, runtime))
-          throw new Error("Recorded prelaunch runtime changed.");
         if (!operations.start(operationId, runtime))
           throw new Error("Workflow authorization changed before the worker started.");
         evidence = await worker.execute({
@@ -96,49 +79,12 @@ export function createAgentController(
             if (!operations.authorizeLaunch(operationId))
               throw new Error("Workflow authorization changed before the agent launched.");
           },
-          ...(refreshLaunch
-            ? {
-                async refreshLaunch() {
-                  try {
-                    await refreshLaunch();
-                  } catch (error) {
-                    if (
-                      error instanceof GitHubTransientError ||
-                      error instanceof GitHubRateLimitError ||
-                      error instanceof PullRequestHeadChangedError ||
-                      error instanceof GitHubDrainError
-                    )
-                      deferredPreflight = error;
-                    throw error;
-                  }
-                },
-              }
-            : {}),
-          ...(operation.evidence?.worktree && operation.evidence.prelaunchCheckpoint
-            ? {
-                preflight: {
-                  worktree: operation.evidence.worktree,
-                  checkpoint: operation.evidence.prelaunchCheckpoint,
-                },
-              }
-            : {}),
-          ...(input.fix ? { fixFindingIds: input.fix.findingIds } : {}),
           recordExpectedWorktree: (expectedWorktree) =>
             operations.progress(operationId, { expectedWorktree }),
-          recordWorkspace: (worktree, checkpoint) =>
-            operations.progress(operationId, {
-              worktree,
-              ...(checkpoint ? { prelaunchCheckpoint: checkpoint } : {}),
-            }),
+          recordWorkspace: (worktree) => operations.progress(operationId, { worktree }),
           recordSession: (reference) => operations.progress(operationId, { reference }),
         });
       } catch (error) {
-        if (
-          error === deferredPreflight &&
-          deferredPreflight &&
-          operations.deferPrelaunch(operationId)
-        )
-          throw deferredPreflight;
         evidence = { error: describeError(error) };
       }
       // If this write fails, keep the existing intent so restart recovery holds the workflow.

@@ -13,12 +13,12 @@ import {
 } from "./review.ts";
 import type { Workflow, WorkflowCommand } from "./workflow.ts";
 
-export const reviewMigration = `
+export const reviewSchema = `
   CREATE TABLE review_runs (
     id TEXT PRIMARY KEY NOT NULL, workflow_id TEXT NOT NULL REFERENCES workflows(id),
     head_sha TEXT NOT NULL, source TEXT NOT NULL, purpose TEXT NOT NULL, reviewer TEXT NOT NULL,
     status TEXT NOT NULL, eligible INTEGER NOT NULL DEFAULT 1,
-    started_at TEXT NOT NULL, completed_at TEXT, start_evidence TEXT, evidence TEXT, error TEXT, result_digest TEXT
+    started_at TEXT NOT NULL, completed_at TEXT, start_evidence TEXT, evidence TEXT, error TEXT, result_digest TEXT, latest_summary TEXT
   );
   CREATE INDEX review_runs_by_workflow ON review_runs(workflow_id, head_sha);
   CREATE UNIQUE INDEX one_active_review ON review_runs(workflow_id)
@@ -149,7 +149,6 @@ const codexReviewer = JSON.stringify({
 
 type StoreContext = {
   transaction<T>(run: () => T): T;
-  assertDispositionAllowed(workflowId: string, runId: string): void;
   getWorkflow(id: string): Workflow | null;
   transition(id: string, command: WorkflowCommand): Workflow;
 };
@@ -216,8 +215,7 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
     });
   }
 
-  function summarize(finding: FindingRow) {
-    const history = actions(finding.id);
+  function findingStatus(history: Action[]) {
     const disposition = history.findLast(
       ({ action }) => action === "accepted" || action === "deferred" || action === "rejected",
     );
@@ -228,6 +226,12 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
       resolution?.action === "fixed" || resolution?.action === "superseded"
         ? resolution.action
         : "open";
+    return { disposition, state };
+  }
+
+  function summarize(finding: FindingRow) {
+    const history = actions(finding.id);
+    const { disposition, state } = findingStatus(history);
     return {
       ...finding,
       thread_observation: finding.thread_observation
@@ -253,15 +257,20 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
   }
 
   return {
-    latestIndeterminate(workflowId: string, head: string): boolean {
-      const latest = db
+    hasBlockingFindings(workflowId: string): boolean {
+      // Only a review projected onto the workflow can establish blocking findings.
+      const findings = db
         .prepare(
-          `
-        SELECT status FROM review_runs WHERE workflow_id=? AND head_sha=? ORDER BY rowid DESC LIMIT 1
-      `,
+          `SELECT f.id FROM review_findings f WHERE f.run_id IN (
+             SELECT run_id FROM review_snapshots WHERE workflow_id=? AND outcome='completed_with_findings'
+           )`,
         )
-        .get(workflowId, head);
-      return ["indeterminate", "unknown", "failed", "interrupted"].includes(String(latest?.status));
+        .iterate(workflowId) as Iterable<{ id: string }>;
+      for (const { id } of findings) {
+        const { disposition, state } = findingStatus(actions(id));
+        if (state === "open" && (!disposition || disposition.action === "accepted")) return true;
+      }
+      return false;
     },
 
     start(input: unknown) {
@@ -296,13 +305,8 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
           return previous;
         }
         const current = workflow(workflowId);
-        if (
-          current.headSha !== sha ||
-          ["stopped", "escalated", "validating"].includes(current.state)
-        )
-          throw new Error(
-            "Review start requires the current head of an active workflow outside validation.",
-          );
+        if (current.headSha !== sha || ["stopped", "escalated"].includes(current.state))
+          throw new Error("Review start requires the current head of an active workflow.");
         const active = activeRun(workflowId);
         if (active?.status === "running" && active.source === "operator")
           throw new Error("A review run already awaits an outcome for this workflow.");
@@ -581,7 +585,6 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
           FindingRow | undefined;
         if (!finding) throw new Error("Review finding does not exist.");
         const current = workflow(run(finding.run_id)!.workflow_id);
-        context.assertDispositionAllowed(current.id, finding.run_id);
         if (current.headSha !== sha)
           throw new Error("Finding action must use the current workflow head.");
         const status = summarize(finding);
@@ -589,7 +592,7 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
           throw new Error("Finding history changed. Supply the latest action ID.");
         if (status.actionable && (action === "deferred" || action === "rejected"))
           throw new Error(
-            "An accepted open finding requires a verified fix or explicit supersession.",
+            "An accepted open finding requires a resolution or explicit supersession.",
           );
         if (
           action === "reopened"
@@ -603,6 +606,12 @@ export function createReviewStore(db: DatabaseSync, context: StoreContext) {
           `INSERT INTO finding_actions (id,finding_id,action,rationale,actor,head_sha,previous_action_id,created_at)
           VALUES (?,?,?,?,?,?,?,?)`,
         ).run(id, findingId, action, rationale, actor, sha, previousActionId, timestamp());
+        if (
+          current.review?.outcome === "completed_clean" &&
+          current.state !== "stopped" &&
+          current.state !== "escalated"
+        )
+          transition(current.id, { type: "findings_changed" });
         return db.prepare("SELECT * FROM finding_actions WHERE id=?").get(id) as Action;
       });
     },

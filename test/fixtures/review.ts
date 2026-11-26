@@ -44,9 +44,6 @@ export function createWorkflow(store: WorkflowStore) {
     requiredChecks: null,
     review: null,
     checks: [],
-    fixCycles: 0,
-    cycleAwaitingReview: false,
-    validationHeadSha: null,
     escalationReason: null,
   });
 }

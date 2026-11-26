@@ -19,9 +19,9 @@ This plan supersedes the remaining work in [Plan 001](001-pr-review-loop.md) and
 
 Keep at most one active assignment per PR initially. Review and CI observations can arrive independently. When a head changes, reconcile it as an ordinary event and stop applying stale results to the new head. Before starting replacement work, establish the disposition of any in-flight assignment through its result, GitHub evidence or supported native inspection. A head change alone neither attributes a push nor proves that an active session stopped. Reconcile an established outcome, retry known non-execution within limits, and pause when the outcome remains uncertain. Keep operator stops durable across reconciliation.
 
-### Proposed counting rule for operator review
+### Accepted execution counting rule
 
-Use two durable counters on the PR workflow, initially allowing **three Reviewer rounds and three Implementer revisions**. The shared revision allowance covers review fixes, CI fixes and combined assignments, so alternating triggers cannot extend it.
+Use two durable counters on the PR workflow. The defaults are **three Reviewer rounds and three Implementer revisions**. The shared revision allowance covers review fixes, CI fixes and combined assignments, so alternating triggers cannot extend it.
 
 - A review round is one Reviewer assignment that starts. It counts even if it returns incomplete or the head moves. Its Adjudicator assignment does not consume another round. Allow adjudication of the third review before deciding whether findings still block.
 - A revision is one Implementer assignment that starts. A CI-driven revision includes a failed required check in its assignment, with or without review fixes. A combined assignment counts once. An attempt that starts counts even if it fails or produces no commit. Observations, reconciliation, CI reruns and commits made outside Switchyard do not spend an allowance.
@@ -29,15 +29,13 @@ Use two durable counters on the PR workflow, initially allowing **three Reviewer
 - Escalate when completing the workflow requires a review or revision with no remaining slots. After the last review, finish adjudication and allow pending CI to settle. If accepted findings or failed required CI still call for a revision that may change the head, pause before dispatching it because a new head would need another review. Escalated findings and uncertain outcomes can require attention earlier. A final allowed revision can still be reviewed if a review slot remains. Reaching a limit does not invalidate evidence that already satisfies handoff.
 - The CLI records operator-authorized additional review or revision slots and the reason. Resume reconciles the current head first and follows the ordinary recovery rules for any outstanding attempt. A grant supplies capacity for future dispatch. The workflow still requires review and CI evidence for handoff.
 
-Confirm the three-slot shared revision allowance and the proposed stop before a revision whose resulting head cannot be reviewed. The three-round review default, hard bounds and explicit continuation are the accepted direction.
-
 ## Implementation sequence
 
 Each change should leave the repository buildable and testable. Temporary loss of legacy functionality is accepted. Keep useful code and coverage for retained behavior. Use semantic branches, focused PRs, repository checks and independent automated review of implementation changes.
 
 ### Phase A — Remove the old fix pipeline and establish native execution
 
-Remove the controller-owned fix pipeline first, including its call sites in the CLI and unattended loop. Keep a small explicit local execution path for testing and keep GitHub observation usable during the transition. The existing remote path depends on the checkout verification and old agent-turn records. Retire it from the active CLI when those dependencies are removed and use its code and tests as reference in Phase C. Introduce a fresh SQLite baseline as the affected stores are replaced. Cut over the deployed database in Phase D.
+Remove the controller-owned fix pipeline first, including its call sites in the CLI and unattended loop. Keep a small explicit local execution path for testing and keep GitHub observation usable during the transition. The existing remote path depends on the checkout verification and old agent-turn records. Retire it from the active CLI when those dependencies are removed and use its code and tests as reference in Phase C. Introduce a fresh SQLite baseline as the affected stores are replaced. Cut over the deployed database in Phase D. The first increment keeps the existing explicit, read-only remote turns while their checkout and agent-turn dependencies remain available.
 
 | Current code                                                                                                      | Implementation direction                                                                                                                                                                                                                                                         |
 | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -54,7 +52,7 @@ Persist assignment identity, native session reference and execution context, pla
 ### Phase B — Replace delivery processing with read-only GitHub reconciliation
 
 - Keep the signature and request-boundary handling in `src/webhook.ts`, GitHub App authentication and useful read/error handling in `src/github-app.ts` and `src/github-api.ts`, and the exact-head recheck in `src/reconcile.ts`. Add enabled-repository discovery and lifecycle/eligibility reads. Consolidate `src/controller.ts`, `src/unattended.ts` and `src/main.ts` around the same reconciliation path. Acknowledge valid notifications promptly and coalesce work in memory as needed.
-- Remove the SQLite delivery inbox and its claim, retry and replay paths in `src/store.ts`. Finish replacing legacy migrations and their upgrade fixtures with fresh-database initialization and coverage. Keep durable workflows, execution attempts and explicit initiation requests. Use transactional workflow decisions and execution claims to prevent duplicate dispatch.
+- Remove the SQLite delivery inbox and its claim, retry and replay paths in `src/store.ts`. Update the fresh-database baseline and coverage for the remaining stores. Keep durable workflows, execution attempts and explicit initiation requests. Use transactional workflow decisions and execution claims to prevent duplicate dispatch.
 - Remove `src/codex-review.ts` and its automatic-review marker tests and fixtures where they only cover that integration. Delete `src/review-publications.ts`, retired `src/review-command.ts` paths and GitHub App content-write methods. Preserve useful review and finding identity concepts in `src/review.ts` and `src/review-store.ts`; replace stored review text and sync state with structured metadata and GitHub references. Reuse check and webhook fixtures that still exercise supported behavior.
 
 **Acceptance.** Invalid signatures are rejected. Startup, webhook, periodic and operator reconciliation converge on the same GitHub state. Tests demonstrate recovery from a missed webhook, deduplication under duplicate or out-of-order signals, eligible discovery regardless of author and correct handling of draft, fork, closed and merged PRs. A stale observation cannot advance the workflow. The App observes PRs, checks and referenced evidence with read-only repository access. Keep repository writes with the agents.
@@ -79,6 +77,6 @@ Before deploying the replacement, stop the old controller and archive its SQLite
 
 ## Remaining implementation choices
 
-- Confirm the proposed counting details above. Establish the exact GitHub identities and reference checks that corroborate native structured results, including how to handle evidence edited, deleted or no longer attributable. Determine the minimal source of truth for required-check names and producer identity.
+- Establish the exact GitHub identities and reference checks that corroborate native structured results, including how to handle evidence edited, deleted or no longer attributable. Determine the minimal source of truth for required-check names and producer identity.
 - Confirm the CLI treatment of a GitHub-reopened PR, preserving its history and limits. An explicit operator stop remains in effect until operator action.
 - Select remote execution from the Phase C spike. Investigate notification integration during deployment without making it a release dependency.

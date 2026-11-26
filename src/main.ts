@@ -5,8 +5,6 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { runAgentCommand } from "./agent-command.ts";
 import { createController, createGitHubRetryOwnerCheck, describeError } from "./controller.ts";
-import { requiredChecksForCycle } from "./fix-store.ts";
-import { runFixCommand } from "./fix-command.ts";
 import { loadConfig, workflowKey } from "./config.ts";
 import { createGitHubReader, type PullRequestTarget } from "./github-api.ts";
 import { createGitHubAppClient, resumeGitHubAfterSecondaryLimit } from "./github-app.ts";
@@ -31,7 +29,7 @@ function makeReader(store: WorkflowStore, targets: PullRequestTarget[]) {
       retryDeadlines: store.reconciliationRetries(),
       isRetryOwnerActive: createGitHubRetryOwnerCheck(store, targets),
       canReadPullRequest: (target, pullRequest) =>
-        canReconcilePullRequest(store, target.repository, pullRequest, true),
+        canReconcilePullRequest(store, target.repository, pullRequest),
     }),
   );
 }
@@ -64,7 +62,6 @@ async function main(): Promise<void> {
   if (await runRemoteCommand(args, dbPath)) return;
   if (await runReviewCommand(args, dbPath, (path) => loadConfig(path).targets)) return;
   if (await runAgentCommand(args, dbPath)) return;
-  if (await runFixCommand(args, dbPath, makeReader)) return;
   if (args[0] === "--worker-status") {
     if (args.length !== 1) throw new Error("Usage: --worker-status");
     const store = new WorkflowStore(dbPath);
@@ -93,7 +90,11 @@ async function main(): Promise<void> {
   const supervised = args[0] === "--worker-process";
   const unattended = supervised || args[0] === "--worker";
   const configPath = args[onceOnly || unattended ? 1 : 0];
-  if (!configPath || args.length !== (onceOnly || unattended ? 2 : 1))
+  if (
+    !configPath ||
+    configPath.startsWith("--") ||
+    args.length !== (onceOnly || unattended ? 2 : 1)
+  )
     throw new Error(
       "Usage: npm start -- [--once | --worker] CONFIG.json or npm start -- --worker-status | --resume-github",
     );
@@ -134,11 +135,10 @@ async function main(): Promise<void> {
     const controller = createController({
       ...config,
       store,
-      reconcile: createReconciler(store, reader, (target) =>
-        requiredChecksForCycle(
-          store.fixes(`${target.repository}#${target.pullRequest}`).read().at(-1),
-          config.fixes.get(workflowKey(target))?.requiredChecks ?? null,
-        ),
+      reconcile: createReconciler(
+        store,
+        reader,
+        (target) => config.requiredChecks.get(workflowKey(target)) ?? null,
       ),
       reportError,
       reportDeferred: onceOnly,

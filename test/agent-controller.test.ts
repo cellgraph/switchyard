@@ -13,7 +13,6 @@ import { createLocalAgentExecution } from "../src/local-agent-execution.ts";
 import { WorkflowStore } from "../src/store.ts";
 import { createWorktreeManager } from "../src/worktree.ts";
 import { agentRepository, git } from "./fixtures/agent-repository.ts";
-import { removeDurableAgentMigration } from "./fixtures/legacy-schema.ts";
 
 const runtime = {
   provider: "fixture",
@@ -92,30 +91,7 @@ describe("durable agent controller", () => {
     return first.evidence!.reference!.worktree.path;
   }
 
-  it("upgrades the Phase 2 schema while retaining existing rows and legacy operation recovery", () => {
-    store.createOperation("legacy", fixture.workflow.id, "agent_turn", { value: "preserve" });
-    store.close();
-    const db = new DatabaseSync(fixture.db);
-    removeDurableAgentMigration(db);
-    db.prepare(
-      "INSERT INTO agent_sessions (workflow_id, session_id) VALUES (?, 'legacy-thread')",
-    ).run(fixture.workflow.id);
-    db.close();
-    store = new WorkflowStore(fixture.db);
-    expect(store.getWorkflow(fixture.workflow.id)).toEqual(fixture.workflow);
-    expect(store.agentOperations().session(fixture.workflow.id)).toBeNull();
-    expect(store.recover().ambiguousOperations).toBe(1);
-    const reader = new DatabaseSync(fixture.db);
-    expect(reader.prepare("SELECT session_id FROM agent_sessions").get()?.session_id).toBe(
-      "legacy-thread",
-    );
-    expect(
-      reader.prepare("SELECT input FROM operations WHERE operation_id='legacy'").get()?.input,
-    ).toBe('{"value":"preserve"}');
-    reader.close();
-  });
-
-  it("reports pre-ownership claims for inspection and preserves their unresolved state", () => {
+  it("reports claims missing ownership evidence for inspection and preserves their unresolved state", () => {
     const controller = createAgentController(store, requests);
     const { operationId } = controller.request(fixture.request).intent;
     store.agentOperations().claim(operationId);
@@ -137,24 +113,6 @@ describe("durable agent controller", () => {
       "unresolved agent operation",
     );
     expect(startSession).not.toHaveBeenCalled();
-  });
-
-  it("holds a preview session with a checkpoint that predates verified rollout selection", async () => {
-    await start();
-    const db = new DatabaseSync(fixture.db);
-    try {
-      db.prepare(
-        "UPDATE agent_sessions SET execution=json_set(execution, '$.checkpoint.session', 'legacy-digest') WHERE workflow_id=?",
-      ).run(fixture.workflow.id);
-    } finally {
-      db.close();
-    }
-    reopen();
-    expect(await createAgentController(store, requests).runTurn(followUp())).toMatchObject({
-      status: "manual_reconciliation",
-      error: "The saved checkpoint predates verified rollout selection and requires inspection.",
-    });
-    expect(resumeSession).not.toHaveBeenCalled();
   });
 
   it("leaves an undispatched request retryable across restart and fails closed on a conflicting request", async () => {
@@ -306,22 +264,35 @@ describe("durable agent controller", () => {
     });
   });
 
-  it("records the validated same-session continuation and moves an exact-head fix to validating", async () => {
-    const path = await start();
-    reopen();
-    expect(store.recover().ambiguousOperations).toBe(0);
+  it("blocks new turns and revokes an earlier request when findings are observed", async () => {
+    const controller = createAgentController(store, requests);
+    controller.request(fixture.request);
     store.transition(fixture.workflow.id, {
       type: "review_received",
       evidence: { sha: fixture.workflow.headSha, outcome: "completed_with_findings" },
     });
+    await expect(controller.runTurn(followUp())).rejects.toThrow(/not eligible/);
+    store.transition(fixture.workflow.id, {
+      type: "review_invalidated",
+      reason: "Evidence withdrawn.",
+    });
+    reopen();
+    expect(await createAgentController(store, requests).runTurn(fixture.request)).toMatchObject({
+      status: "completed",
+      error: "Workflow authorization changed before dispatch.",
+    });
+    expect(startSession).not.toHaveBeenCalled();
+  });
+
+  it("continues an explicitly requested local session across restart", async () => {
+    const path = await start();
+    reopen();
+    expect(store.recover().ambiguousOperations).toBe(0);
     const second = await createAgentController(store, requests).runTurn(followUp());
     expect(second).toMatchObject({ status: "completed", error: null });
     expect(second.evidence?.reference?.worktree.path).toBe(path);
     expect(resumeSession).toHaveBeenCalledWith({ workingDirectory: path }, reference);
-    expect(store.getWorkflow(fixture.workflow.id)).toMatchObject({
-      state: "validating",
-      validationHeadSha: fixture.workflow.headSha,
-    });
+    expect(store.getWorkflow(fixture.workflow.id)?.state).toBe("awaiting_review");
     expect(store.agentOperations().session(fixture.workflow.id)?.lastOperationId).toBe("follow-up");
   });
 
@@ -535,12 +506,8 @@ describe("durable agent controller", () => {
     },
   );
 
-  it("does not advance a fix to validation when the PR changes during execution", async () => {
+  it("holds the local session when the PR head changes during execution", async () => {
     await start();
-    store.transition(fixture.workflow.id, {
-      type: "review_received",
-      evidence: { sha: fixture.workflow.headSha, outcome: "completed_with_findings" },
-    });
     runTurn.mockImplementationOnce(async () => {
       store.transition(fixture.workflow.id, { type: "head_changed", sha: "a".repeat(40) });
       return { outcome: "completed", response: "done" };
@@ -550,7 +517,6 @@ describe("durable agent controller", () => {
     expect(second.error).toContain("authorization changed");
     expect(store.getWorkflow(fixture.workflow.id)).toMatchObject({
       state: "escalated",
-      validationHeadSha: null,
       headSha: "a".repeat(40),
     });
   });

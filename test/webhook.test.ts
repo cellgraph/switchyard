@@ -13,7 +13,6 @@ import { WorkflowStore } from "../src/store.ts";
 import { createWebhookServer } from "../src/webhook.ts";
 import type { CheckEvidence } from "../src/workflow.ts";
 import codexReview from "./fixtures/codex-pr51.json" with { type: "json" };
-import { removeDurableAgentMigration } from "./fixtures/legacy-schema.ts";
 
 type Fixture = { id: string; event: string; payload: Record<string, unknown> };
 const fixtures = JSON.parse(
@@ -446,51 +445,41 @@ describe("GitHub webhook intake and reconciliation", () => {
     expect(workflow()).toMatchObject({ state: "awaiting_review", headSha: headA, checks: [] });
   });
 
-  it("upgrades and reconciles pending and interrupted Phase 1 deliveries", async () => {
+  it("reconciles pending and interrupted linked and unlinked deliveries after restart", async () => {
     await controller().runPass();
     const workflowId = workflow()!.id;
     store.close();
     const db = new DatabaseSync(dbPath);
-    removeDurableAgentMigration(db);
-    db.exec(`
-      DROP TABLE reconciliation_retries;
-      DROP TABLE github_rate_limits;
-      DROP INDEX deliveries_retry;
-      ALTER TABLE deliveries DROP COLUMN retry_at;
-      ALTER TABLE deliveries DROP COLUMN attempts;
-      ALTER TABLE workflows DROP COLUMN closed_by_github;
-      DELETE FROM schema_migrations WHERE version >= 4;
-    `);
     const insert = db.prepare(
       "INSERT INTO deliveries (delivery_id, workflow_id, payload, status, received_at) VALUES (?, ?, ?, ?, ?)",
     );
     insert.run(
-      "legacy-review",
+      "linked-review",
       workflowId,
       '{"action":"review"}',
       "processing",
       new Date(now).toISOString(),
     );
     insert.run(
-      "legacy-unlinked",
+      "unlinked-open",
       null,
       '{"action":"opened"}',
       "pending",
       new Date(now).toISOString(),
     );
-    insert.run("legacy-null", null, "null", "pending", new Date(now).toISOString());
+    insert.run("opaque-delivery", null, "null", "pending", new Date(now).toISOString());
     db.close();
     store = new WorkflowStore(dbPath);
     expect(store.recover()).toEqual({ deliveries: 1, ambiguousOperations: 0 });
-    const legacyIds = ["legacy-review", "legacy-unlinked", "legacy-null"];
-    expect(store.dueDeliveryIds(now, 25)).toEqual(legacyIds);
+    const deliveryIds = ["linked-review", "unlinked-open", "opaque-delivery"];
+    expect(store.dueDeliveryIds(now, 25)).toEqual(deliveryIds);
     state.headSha = headB;
     const { runPass } = controller();
     vi.mocked(github.readPullRequest).mockRejectedValueOnce(
       new Error("GitHub unavailable at startup"),
     );
     expect(await runPass()).toBe(false);
-    expect(store.deliveryStatus("legacy-null")).toMatchObject({
+    expect(store.deliveryStatus("opaque-delivery")).toMatchObject({
       status: "failed",
       retryAt: now + 30_000,
     });
@@ -501,7 +490,7 @@ describe("GitHub webhook intake and reconciliation", () => {
       state: "awaiting_review",
       review: null,
     });
-    for (const id of legacyIds)
+    for (const id of deliveryIds)
       expect(store.deliveryStatus(id)).toMatchObject({
         status: "processed",
         attempts: 2,
@@ -509,7 +498,7 @@ describe("GitHub webhook intake and reconciliation", () => {
       });
   });
 
-  it("uses the linked workflow to route a Phase 1 payload after the startup sweep", async () => {
+  it("uses the linked workflow to route a payload after the startup sweep", async () => {
     const reconcile = vi.fn(createReconciler(store, github));
     const { runPass } = createController({
       store,
@@ -521,7 +510,7 @@ describe("GitHub webhook intake and reconciliation", () => {
     });
     await runPass();
     reconcile.mockClear();
-    store.receiveDelivery("legacy-review", { action: "review" }, workflow()!.id);
+    store.receiveDelivery("linked-review", { action: "review" }, workflow()!.id);
     expect(await runPass()).toBe(true);
     expect(reconcile.mock.calls).toEqual([[target]]);
   });
@@ -557,30 +546,4 @@ describe("GitHub webhook intake and reconciliation", () => {
     expect(workflow()).toMatchObject({ state: "stopped", closedByGitHub: true });
     expect(github.completeReconciliation).not.toHaveBeenCalled();
   });
-
-  it.each([
-    ["42:GET:/repos/owner/repo/commits/old/status?page=1", 4, 0],
-    ["42:POST:/app/installations/42/access_tokens", 3, 0],
-    ["42:POST:/app/installations/42/access_tokens", 5, 5],
-    ["42:GET:/repos/owner/repo/pulls/7/reviews?page=1", 4, 4],
-  ] as const)(
-    "upgrades the old retry key %s with %i attempts without shortening its cooldown",
-    (retryRequest, throttledAttempts, expectedAttempts) => {
-      const retryAt = now + 120_000;
-      store.githubRateLimits().set("secondary", { retryAt, throttledAttempts, retryRequest });
-      store.close();
-      const db = new DatabaseSync(dbPath);
-      removeDurableAgentMigration(db);
-      db.exec(
-        "DROP TABLE reconciliation_retries; DELETE FROM schema_migrations WHERE version >= 6;",
-      );
-      db.close();
-      store = new WorkflowStore(dbPath);
-      expect(store.githubRateLimits().get("secondary")).toEqual({
-        retryAt,
-        throttledAttempts: expectedAttempts,
-        retryRequest: expectedAttempts === 0 ? null : retryRequest,
-      });
-    },
-  );
 });
