@@ -22,7 +22,7 @@ npm start -- agent run --session SESSION_ID \
 
 Use the Switchyard ID in `session.id` for `--session`. The adapter resumes the native reference in `session.nativeId` using the stored provider and invocation context. Each continuation submits a new assignment by default. Set `--model` to override the native default and `--config-dir` to select a Codex home or [Claude Code configuration directory](claude-code.md) when starting a session. Omit `--cwd` to use the current directory. When model or configuration directory is omitted, the provider uses its normal defaults and inherited environment.
 
-The command prints JSON with an `execution` and a `session`. When the current invocation completes, it also returns `result.response` and any `result.structuredOutput`. Treat stdout as potentially sensitive. SQLite and `agent status` retain coordination metadata and the reference only. Keep secrets out of prompts, schemas and labels.
+Before dispatch, `agent run` prints its execution ID to stderr, including when the command generates the ID. Use `agent status EXECUTION_ID` with that ID to inspect an interrupted run. The command's stdout carries one JSON result with an `execution` and a `session` when the record is available. When the current invocation completes, it also returns `result.response` and any `result.structuredOutput`. Treat stdout as potentially sensitive. SQLite and `agent status` retain coordination metadata and the reference only. Keep secrets out of prompts, schemas and labels.
 
 Supply `--execution ID` to reserve an ID you can inspect after a crash. The execution ID also serves as the assignment ID unless you pass `--assignment ID`. Reusing a recorded execution ID with the same assignment and context returns its metadata, with no dispatch or stored response. Use a new execution ID with the same assignment ID for an explicit retry after `not_started`.
 
@@ -37,6 +37,8 @@ Supply `--execution ID` to reserve an ID you can inspect after a crash. The exec
 | `unknown`     | The outcome could not be established. The assignment and any associated session are held for inspection.     |
 
 `agent run` exits nonzero when the stored execution status is anything other than `completed`. Native errors appear as fixed diagnostics. Ctrl-C requests cancellation through the native interface. If cancellation leaves no authoritative result, the status is `unknown`.
+
+A confirmed turn that omits required output or returns unusable output fails the assignment. A later assignment can still use the recorded session. If SQLite is briefly busy or locked, the current owner retries saving the observed ID and outcome. The CLI returns a native result only after the write is confirmed. A persistent write failure leaves the claim held for recovery.
 
 Run `npm start -- agent recover` to mark claims whose local owner exited before recording an outcome. A live or reused PID leaves the claim intact. A crash can leave native processes or external effects in progress. Inspect the execution record, native session and any external effects using the runtime and environment. The development CLI keeps uncertain assignments and sessions held. Use the database on the same persistent local host as the execution processes.
 

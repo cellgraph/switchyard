@@ -26,11 +26,13 @@ const fixture = `
       emit({ type: "assistant", session_id: id });
     } else if (prompt === "incomplete") {
       emit({ ...end, result: undefined });
-    } else if (prompt === "failure") {
-      emit({ ...end, subtype: "error_during_execution", is_error: true, errors: ["secret diagnostics"] });
+    } else if (prompt === "failure" || prompt === "auth result") {
+      emit({ ...end, subtype: "error_during_execution", is_error: true, errors: [prompt === "failure" ? "secret diagnostics" : "Not logged in: secret diagnostics"] });
       process.exitCode = 1;
     } else if (prompt === "different session") {
       emit({ ...end, session_id: "wrong-id" });
+    } else if (prompt === "interrupt CLI") {
+      process.kill(process.ppid, "SIGKILL");
     } else {
       emit({
         ...end,
@@ -56,6 +58,16 @@ afterEach(() => {
 
 function adapter() {
   return createClaudeAgent({ provider: "claude-code", workingDirectory: directory });
+}
+
+function cli(...args: string[]) {
+  const env = { ...process.env, SWITCHYARD_DB_PATH: join(directory, "local.sqlite") };
+  const main = fileURLToPath(new URL("../src/main.ts", import.meta.url));
+  return spawnSync(process.execPath, [main, "agent", ...args], {
+    env,
+    encoding: "utf8",
+    timeout: 5000,
+  });
 }
 
 it("starts through the native CLI with inherited configuration and schema passthrough", async () => {
@@ -114,9 +126,13 @@ it("reports launch, native execution and authentication failures without raw dia
     outcome: "failed",
     reason: "Claude Code reported a turn failure.",
   });
-  expect(await local.start({ prompt: "auth stderr", onSession })).toEqual({
+  expect(await local.start({ prompt: "auth result", onSession })).toEqual({
     outcome: "failed",
     reason: "Claude Code could not authenticate.",
+  });
+  expect(await local.start({ prompt: "auth stderr", onSession })).toEqual({
+    outcome: "unknown",
+    reason: "Claude Code reported an authentication error without a confirmed terminal result.",
   });
   vi.stubEnv("PATH", directory + "/missing");
   expect(await local.start({ prompt: "run", onSession })).toEqual({
@@ -125,11 +141,14 @@ it("reports launch, native execution and authentication failures without raw dia
   });
 });
 
-it("holds a zero exit with missing terminal evidence or missing requested output", async () => {
+it("distinguishes a zero exit with no terminal result from a terminal result with no response", async () => {
   const local = adapter();
   const onSession = vi.fn();
-  for (const prompt of ["partial", "incomplete", "no schema result"])
-    expect((await local.start({ prompt, outputSchema: {}, onSession })).outcome).toBe("unknown");
+  expect((await local.start({ prompt: "partial", onSession })).outcome).toBe("unknown");
+  expect(await local.start({ prompt: "incomplete", onSession })).toEqual({
+    outcome: "failed",
+    reason: "Claude Code omitted the required response.",
+  });
 });
 
 it("requests native cancellation and keeps a missing outcome uncertain", async () => {
@@ -144,14 +163,6 @@ it("requests native cancellation and keeps a missing outcome uncertain", async (
 });
 
 it("runs, inspects, and continues local assignments across CLI processes without a PR", () => {
-  const env = { ...process.env, SWITCHYARD_DB_PATH: join(directory, "local.sqlite") };
-  const main = fileURLToPath(new URL("../src/main.ts", import.meta.url));
-  const cli = (...args: string[]) =>
-    spawnSync(process.execPath, [main, "agent", ...args], {
-      env,
-      encoding: "utf8",
-      timeout: 5000,
-    });
   const prompt = join(directory, "prompt");
   writeFileSync(prompt, "start");
   const first = cli(
@@ -166,6 +177,7 @@ it("runs, inspects, and continues local assignments across CLI processes without
     "first",
   );
   expect(first.status, first.stderr).toBe(0);
+  expect(first.stderr).toBe('Execution ID: "first"\n');
   const started = JSON.parse(first.stdout);
   expect(started).toMatchObject({
     execution: { id: "first", assignmentId: "first", status: "completed" },
@@ -183,7 +195,9 @@ it("runs, inspects, and continues local assignments across CLI processes without
   writeFileSync(prompt, "continue");
   const second = cli("run", "--session", started.session.id, "--prompt", prompt);
   expect(second.status, second.stderr).toBe(0);
-  expect(JSON.parse(second.stdout)).toMatchObject({
+  const continued = JSON.parse(second.stdout);
+  expect(second.stderr).toBe(`Execution ID: ${JSON.stringify(continued.execution.id)}\n`);
+  expect(continued).toMatchObject({
     execution: { sessionId: started.session.id, status: "completed" },
     session: started.session,
   });
@@ -193,5 +207,65 @@ it("runs, inspects, and continues local assignments across CLI processes without
   expect(JSON.parse(uncertain.stdout)).toMatchObject({
     execution: { sessionId: started.session.id, status: "unknown" },
     session: started.session,
+  });
+});
+
+it("fails a confirmed turn with no structured output, blocks replay and permits continuation", () => {
+  const prompt = join(directory, "prompt");
+  const schema = join(directory, "schema.json");
+  writeFileSync(prompt, "no schema result");
+  writeFileSync(schema, '{"type":"object"}');
+  const start = [
+    "run",
+    "--provider",
+    "claude-code",
+    "--cwd",
+    directory,
+    "--prompt",
+    prompt,
+    "--schema",
+    schema,
+  ];
+  const result = cli(...start, "--execution", "first");
+  expect(result.status).toBe(1);
+  const recorded = JSON.parse(result.stdout);
+  expect(recorded).toMatchObject({
+    execution: { status: "failed", reason: "Claude Code omitted the required structured output." },
+    session: { nativeId },
+  });
+  expect(recorded).not.toHaveProperty("result");
+  expect(JSON.parse(cli("status", "first").stdout)).toEqual(recorded);
+  const replay = cli(...start, "--execution", "retry", "--assignment", "first");
+  expect(replay.status).toBe(1);
+  expect(replay.stderr).toContain("Assignment already has a dispatched or unresolved attempt.");
+
+  writeFileSync(prompt, "continue");
+  const continued = cli("run", "--session", recorded.session.id, "--prompt", prompt);
+  expect(continued.status, continued.stderr).toBe(0);
+  expect(JSON.parse(continued.stdout)).toMatchObject({
+    execution: { status: "completed" },
+    session: recorded.session,
+  });
+});
+
+it("reports a generated ID on stderr before dispatch even if the invocation is interrupted", () => {
+  const prompt = join(directory, "prompt");
+  writeFileSync(prompt, "interrupt CLI");
+  const interrupted = cli(
+    "run",
+    "--provider",
+    "claude-code",
+    "--cwd",
+    directory,
+    "--prompt",
+    prompt,
+  );
+  expect(interrupted.signal).toBe("SIGKILL");
+  expect(interrupted.stdout).toBe("");
+  const match = /^Execution ID: "([a-f0-9-]{36})"\n$/.exec(interrupted.stderr);
+  expect(match).not.toBeNull();
+  expect(JSON.parse(cli("recover").stdout)).toEqual({ unknownExecutions: 1 });
+  expect(JSON.parse(cli("status", match![1]!).stdout)).toMatchObject({
+    execution: { id: match![1], status: "unknown" },
   });
 });

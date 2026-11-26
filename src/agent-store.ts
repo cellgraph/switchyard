@@ -123,6 +123,21 @@ export function createAgentStore(
     return get(id)!;
   }
 
+  function recordSession(executionId: string, nativeId: string): void {
+    const changed = db
+      .prepare(
+        `
+        UPDATE agent_sessions SET native_id=?
+        WHERE id=(
+          SELECT session_id FROM agent_executions WHERE id=? AND status='running' AND owner_pid=?
+        ) AND (native_id IS NULL OR native_id=?)
+      `,
+      )
+      .run(nativeId, executionId, process.pid, nativeId);
+    if (changed.changes !== 1)
+      throw new Error("Could not associate the native session with the active execution.");
+  }
+
   return {
     get,
     session,
@@ -192,30 +207,41 @@ export function createAgentStore(
         return { claimed: true, execution: get(input.id)!, session: record };
       });
     },
-    recordSession(executionId: string, nativeId: string): void {
-      const changed = db
-        .prepare(
-          `
-        UPDATE agent_sessions SET native_id=?
-        WHERE id=(
-          SELECT session_id FROM agent_executions WHERE id=? AND status='running' AND owner_pid=?
-        ) AND (native_id IS NULL OR native_id=?)
-      `,
-        )
-        .run(nativeId, executionId, process.pid, nativeId);
-      if (changed.changes !== 1)
-        throw new Error("Could not associate the native session with the active execution.");
-    },
-    finish(id: string, outcome: Outcome): ExecutionRecord {
+    recordSession,
+    finish(id: string, outcome: Outcome, nativeId: string | null) {
       return transaction(() => {
         const execution = get(id);
         const owner = db.prepare("SELECT owner_pid FROM agent_executions WHERE id=?").get(id);
-        if (!execution || owner?.owner_pid !== process.pid)
+        if (execution?.status !== "running" || owner?.owner_pid !== process.pid)
           throw new Error("Execution no longer belongs to this process.");
-        if (outcome.outcome === "completed" && !session(execution.sessionId)?.nativeId)
+        if (outcome.outcome === "completed" && nativeId === null)
           throw new Error("Completion requires a native session reference.");
-        return finish(id, outcome);
+        const saved = session(execution.sessionId)!;
+        if (saved.nativeId !== nativeId) {
+          if (nativeId === null)
+            throw new Error("The recorded native session differs from the execution evidence.");
+          recordSession(id, nativeId);
+        }
+        return { execution: finish(id, outcome), session: session(execution.sessionId)! };
       });
+    },
+    confirmFinish(claim: ExecutionRecord, outcome: Outcome, nativeId: string | null) {
+      // A connection may see its own writes even when their commit failed.
+      if (db.isTransaction) return null;
+      const execution = get(claim.id);
+      if (
+        !execution?.finishedAt ||
+        execution.assignmentId !== claim.assignmentId ||
+        execution.sessionId !== claim.sessionId ||
+        execution.claimedAt !== claim.claimedAt ||
+        execution.status !== outcome.outcome ||
+        execution.reason !== ("reason" in outcome ? outcome.reason : null)
+      )
+        return null;
+      const recordedSession = session(claim.sessionId);
+      return recordedSession?.nativeId === nativeId
+        ? { execution, session: recordedSession }
+        : null;
     },
     recover(): number {
       return transaction(() => {

@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   validNativeId,
   type AgentAdapter,
@@ -11,6 +12,15 @@ import { createClaudeAgent } from "./claude-agent.ts";
 import { createCodexAgent } from "./codex-agent.ts";
 
 type Assignment = ExecutionIntent & Pick<AgentTurn, "prompt" | "outputSchema" | "signal">;
+
+const persistenceRetryDelays = [25, 75];
+
+function sqliteContention(error: unknown): boolean {
+  const { code, errcode } = (error as { code?: string; errcode?: number } | null) ?? {};
+  if (code !== "ERR_SQLITE_ERROR" || typeof errcode !== "number") return false;
+  // Extended result codes keep SQLITE_BUSY and SQLITE_LOCKED in the low byte.
+  return [5, 6].includes(errcode & 0xff);
+}
 
 export function createAgentController(
   executions: ReturnType<typeof createAgentStore>,
@@ -35,17 +45,23 @@ export function createAgentController(
       const claim = executions.claim(assignment);
       if (!claim.claimed) return { execution: claim.execution, session: claim.session };
 
-      let sessionWriteFailed = false;
+      let nativeId = claim.session.nativeId;
+      let conflictingSession = false;
       const turn: AgentTurn = {
         prompt,
         ...(outputSchema === undefined ? {} : { outputSchema }),
         ...(signal === undefined ? {} : { signal }),
-        onSession(nativeId) {
+        onSession(reportedId) {
+          if (!validNativeId(reportedId) || (nativeId !== null && nativeId !== reportedId)) {
+            conflictingSession = true;
+            return;
+          }
+          if (nativeId === reportedId) return;
+          nativeId = reportedId;
           try {
-            if (!validNativeId(nativeId)) throw new Error("Invalid native session ID.");
             executions.recordSession(id, nativeId);
           } catch {
-            sessionWriteFailed = true;
+            // Keep the observed ID for finalization if the early write could not be confirmed.
           }
         },
       };
@@ -61,20 +77,30 @@ export function createAgentController(
           reason: "Native execution ended without a confirmed outcome.",
         };
       }
-      const session = executions.session(claim.session.id)!;
-      if (sessionWriteFailed || (result.outcome === "completed" && !session.nativeId))
+      if (conflictingSession || (result.outcome === "completed" && nativeId === null))
         result = { outcome: "unknown", reason: "Could not confirm and record the native session." };
 
       // Only coordination metadata crosses the SQLite boundary.
-      const execution = executions.finish(
-        id,
-        result.outcome === "completed" ? { outcome: result.outcome } : result,
-      );
-      return {
-        execution,
-        session,
-        ...(result.outcome === "completed" ? { result } : {}),
-      };
+      const outcome = result.outcome === "completed" ? { outcome: result.outcome } : result;
+      for (let attempt = 0; ; attempt++) {
+        let saved;
+        try {
+          saved = executions.finish(id, outcome, nativeId);
+        } catch (error) {
+          try {
+            saved = executions.confirmFinish(claim.execution, outcome, nativeId);
+          } catch (readError) {
+            if (!sqliteContention(readError)) throw readError;
+          }
+          if (!saved) {
+            const retryDelay = persistenceRetryDelays[attempt];
+            if (retryDelay === undefined || !sqliteContention(error)) throw error;
+            await delay(retryDelay);
+            continue;
+          }
+        }
+        return { ...saved, ...(result.outcome === "completed" ? { result } : {}) };
+      }
     },
   };
 }

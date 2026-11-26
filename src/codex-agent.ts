@@ -34,7 +34,7 @@ export function createCodexAgent({
     let invalidEvidence = false;
     let receivedEvent = false;
     let terminal: "completed" | "failed" | undefined;
-    let authFailed = false;
+    let authDiagnostic = false;
     let response: string | undefined;
     let streamIssue: string | undefined;
     try {
@@ -62,10 +62,10 @@ export function createCodexAgent({
             if (terminal) invalidEvidence = true;
             terminal = event.type === "turn.completed" ? "completed" : "failed";
             if (event.type === "turn.failed")
-              authFailed ||= authenticationFailure(event.error?.message);
+              authDiagnostic ||= authenticationFailure(event.error?.message);
             break;
           case "error":
-            authFailed ||= authenticationFailure(event.message);
+            authDiagnostic ||= authenticationFailure(event.message);
             break;
         }
       }
@@ -77,25 +77,29 @@ export function createCodexAgent({
         (code === "ENOENT" || code === "EACCES" || code === "EPERM")
       )
         return { outcome: "not_started", reason: "Could not launch the Codex CLI." };
-      authFailed ||=
+      authDiagnostic ||=
         !receivedEvent && error instanceof Error && authenticationFailure(error.message);
       streamIssue = "The Codex event stream ended with an error.";
     }
 
     if (invalidEvidence)
       return { outcome: "unknown", reason: "Codex reported conflicting execution evidence." };
-    if (terminal === "failed" || (terminal === undefined && authFailed))
+    if (terminal === "failed")
       return {
         outcome: "failed",
-        reason: authFailed ? "Codex could not authenticate." : "Codex reported a turn failure.",
+        reason: authDiagnostic ? "Codex could not authenticate." : "Codex reported a turn failure.",
       };
-    if (terminal !== "completed" || !sessionConfirmed || typeof response !== "string")
+    if (terminal !== "completed" || !sessionConfirmed)
       return {
         outcome: "unknown",
         reason: turn.signal?.aborted
           ? "Cancellation was requested without a complete Codex result."
-          : (streamIssue ?? "Codex did not report a complete terminal result."),
+          : authDiagnostic
+            ? "Codex reported an authentication error without a confirmed terminal result."
+            : (streamIssue ?? "Codex did not report a complete terminal result."),
       };
+    if (typeof response !== "string")
+      return { outcome: "failed", reason: "Codex omitted the required response." };
     if (turn.outputSchema === undefined) return { outcome: "completed", response };
     try {
       return { outcome: "completed", response, structuredOutput: JSON.parse(response) };

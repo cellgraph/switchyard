@@ -14,6 +14,8 @@ const success = {
   response: "private response",
   structuredOutput: { ok: true },
 } as const;
+const sqliteError = (errcode: number) =>
+  Object.assign(new Error("fixture SQLite failure"), { code: "ERR_SQLITE_ERROR", errcode });
 let dir: string;
 let path: string;
 let store: WorkflowStore;
@@ -209,26 +211,99 @@ it("holds unconfirmed completion and sanitizes adapter exceptions after the clai
   });
 });
 
-it("withholds a native result and retains the dispatch claim if terminal persistence fails", async () => {
-  using db = new DatabaseSync(path);
-  db.exec(`
-    CREATE TRIGGER fail_outcome BEFORE UPDATE OF status ON agent_executions
-    BEGIN SELECT RAISE(ABORT, 'fixture write failure'); END;
-  `);
+it("retries transient session and outcome writes after one native invocation", async () => {
+  const executions = store.agentExecutions();
+  const recordSession = vi.spyOn(executions, "recordSession").mockImplementationOnce(() => {
+    throw sqliteError(5);
+  });
+  const finish = vi.spyOn(executions, "finish").mockImplementationOnce(() => {
+    throw sqliteError(261); // SQLITE_BUSY_RECOVERY
+  });
   const start = vi.fn(async (turn: AgentTurn) => {
     turn.onSession("native-id");
     return success;
   });
-  const execute = createAgentController(store.agentExecutions(), () => ({
-    start,
-    resume: vi.fn(),
-  })).execute;
-  await expect(execute(assignment)).rejects.toThrow("fixture write failure");
+  const { execute } = createAgentController(executions, () => ({ start, resume: vi.fn() }));
   const recorded = await execute(assignment);
   expect(recorded).toMatchObject({
-    execution: { status: "running", finishedAt: null },
+    execution: { status: "completed" },
     session: { nativeId: "native-id" },
+    result: success,
   });
-  expect(recorded).not.toHaveProperty("result");
+  expect(executions.get(assignment.id)).toEqual(recorded.execution);
+  expect(executions.session(recorded.session.id)).toEqual(recorded.session);
+  expect(recordSession).toHaveBeenCalledTimes(1);
+  expect(finish).toHaveBeenCalledTimes(2);
   expect(start).toHaveBeenCalledTimes(1);
 });
+
+it.each(["matching", "conflicting"])(
+  "reads back a %s terminal record after an ambiguous commit",
+  async (evidence) => {
+    const executions = store.agentExecutions();
+    const commit = executions.finish;
+    const finish = vi
+      .spyOn(executions, "finish")
+      .mockImplementationOnce((id, outcome, nativeId) => {
+        commit(
+          id,
+          evidence === "matching" ? outcome : { outcome: "unknown", reason: "Other evidence." },
+          nativeId,
+        );
+        throw sqliteError(10); // SQLITE_IOERR
+      });
+    const start = vi.fn(async (turn: AgentTurn) => {
+      turn.onSession("native-id");
+      return success;
+    });
+    const { execute } = createAgentController(executions, () => ({ start, resume: vi.fn() }));
+    const run = execute(assignment);
+    if (evidence === "matching") {
+      const recorded = await run;
+      expect(recorded).toMatchObject({ execution: { status: "completed" }, result: success });
+      expect(recorded.execution).toEqual(executions.get(assignment.id));
+    } else {
+      await expect(run).rejects.toThrow("fixture SQLite failure");
+      expect(executions.get(assignment.id)?.status).toBe("unknown");
+    }
+    expect(finish).toHaveBeenCalledTimes(1);
+    expect(start).toHaveBeenCalledTimes(1);
+  },
+);
+
+it.each(["session", "outcome"])(
+  "retains the dispatch claim after persistent %s write failure",
+  async (write) => {
+    const executions = store.agentExecutions();
+    using db = new DatabaseSync(path);
+    const finish = vi.spyOn(executions, "finish");
+    if (write === "session") {
+      db.exec(`
+      CREATE TRIGGER fail_session BEFORE UPDATE OF native_id ON agent_sessions
+      BEGIN SELECT RAISE(ABORT, 'fixture SQLite failure'); END;
+    `);
+    } else {
+      finish.mockImplementation(() => {
+        throw sqliteError(6);
+      });
+    }
+    const start = vi.fn(async (turn: AgentTurn) => {
+      turn.onSession("native-id");
+      return success;
+    });
+    const execute = createAgentController(executions, () => ({
+      start,
+      resume: vi.fn(),
+    })).execute;
+    await expect(execute(assignment)).rejects.toThrow("fixture SQLite failure");
+    const recorded = await execute(assignment);
+    expect(recorded).toMatchObject({
+      execution: { status: "running", finishedAt: null },
+      session: { nativeId: write === "session" ? null : "native-id" },
+    });
+    expect(recorded).not.toHaveProperty("result");
+    await expect(execute({ ...assignment, id: "replay" })).rejects.toThrow("already has");
+    expect(finish).toHaveBeenCalledTimes(write === "session" ? 1 : 3);
+    expect(start).toHaveBeenCalledTimes(1);
+  },
+);

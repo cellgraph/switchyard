@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { createAgentController } from "./agent-controller.ts";
@@ -83,6 +83,7 @@ export async function runAgentCommand(args: string[], dbPath: string): Promise<b
     process.on("SIGINT", stop);
     process.on("SIGTERM", stop);
     try {
+      writeSync(process.stderr.fd, `Execution ID: ${JSON.stringify(id)}\n`);
       const execution = await createAgentController(store.agentExecutions()).execute({
         ...intent,
         prompt: promptText,

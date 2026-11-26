@@ -362,7 +362,7 @@ export class WorkflowStore {
       this.#db.exec("COMMIT");
       return result;
     } catch (error) {
-      this.#db.exec("ROLLBACK");
+      if (this.#db.isTransaction) this.#db.exec("ROLLBACK");
       throw error;
     }
   }

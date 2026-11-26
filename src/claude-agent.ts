@@ -35,7 +35,7 @@ export function createClaudeAgent({
     } catch {
       return { outcome: "not_started", reason: "Could not launch the Claude Code CLI." };
     }
-    const exit = new Promise<number | null>((resolve) => child.once("close", resolve));
+    const exit = new Promise<void>((resolve) => child.once("close", () => resolve()));
     let launched = false;
     let processError = false;
     let stderr = "";
@@ -82,7 +82,7 @@ export function createClaudeAgent({
       // Keep draining stdout while waiting for the process to close.
       child.stdout.resume();
     }
-    const code = await exit;
+    await exit;
     if (processError && !launched)
       return { outcome: "not_started", reason: "Could not launch the Claude Code CLI." };
     const authFailed =
@@ -92,29 +92,26 @@ export function createClaudeAgent({
 
     if (invalidEvidence)
       return { outcome: "unknown", reason: "Claude Code reported invalid execution evidence." };
-    if (
-      terminal?.is_error === true ||
-      (terminal === undefined && !sessionConfirmed && code !== null && code !== 0 && authFailed)
-    )
+    if (terminal?.is_error === true)
       return {
         outcome: "failed",
         reason: authFailed
           ? "Claude Code could not authenticate."
           : "Claude Code reported a turn failure.",
       };
-    if (
-      !sessionConfirmed ||
-      terminal?.subtype !== "success" ||
-      terminal.is_error !== false ||
-      typeof terminal.result !== "string" ||
-      (turn.outputSchema !== undefined && !Object.hasOwn(terminal, "structured_output"))
-    )
+    if (!sessionConfirmed || terminal?.subtype !== "success" || terminal.is_error !== false)
       return {
         outcome: "unknown",
         reason: turn.signal?.aborted
           ? "Cancellation was requested without a complete Claude Code result."
-          : "Claude Code did not report a complete terminal result.",
+          : authFailed
+            ? "Claude Code reported an authentication error without a confirmed terminal result."
+            : "Claude Code did not report a complete terminal result.",
       };
+    if (typeof terminal.result !== "string")
+      return { outcome: "failed", reason: "Claude Code omitted the required response." };
+    if (turn.outputSchema !== undefined && !Object.hasOwn(terminal, "structured_output"))
+      return { outcome: "failed", reason: "Claude Code omitted the required structured output." };
     return {
       outcome: "completed",
       response: terminal.result,

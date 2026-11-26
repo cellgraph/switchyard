@@ -1,6 +1,8 @@
 import type { ThreadEvent } from "@openai/codex-sdk";
 import { beforeEach, expect, it, vi } from "vitest";
+import { createAgentController } from "../src/agent-controller.ts";
 import { createCodexAgent } from "../src/codex-agent.ts";
+import { WorkflowStore } from "../src/store.ts";
 
 const sdk = vi.hoisted(() => ({
   create: vi.fn(),
@@ -113,20 +115,25 @@ it("distinguishes launch failure, native failure and authentication with fixed r
     outcome: "failed",
     reason: "Codex reported a turn failure.",
   });
-  stream([{ type: "error", message: "401 Unauthorized: private details" }], new Error("exit"));
+  stream([{ type: "turn.failed", error: { message: "401 Unauthorized: private details" } }]);
   expect(await adapter.start(turn)).toEqual({
     outcome: "failed",
     reason: "Codex could not authenticate.",
   });
+  stream([], new Error("401 Unauthorized: private details"));
+  expect(await adapter.start(turn)).toEqual({
+    outcome: "unknown",
+    reason: "Codex reported an authentication error without a confirmed terminal result.",
+  });
 });
 
-it("holds missing or incomplete completion and reports invalid structured JSON", async () => {
+it("holds missing or conflicting terminal evidence and reports invalid structured JSON", async () => {
   const adapter = createCodexAgent(context);
   const turn = { prompt: "test", onSession: vi.fn() };
   for (const events of [
     [thread, message("partial")],
-    [thread, completed],
     [message("response"), completed],
+    [thread, message("response"), completed, completed],
   ]) {
     stream(events);
     expect((await adapter.start(turn)).outcome).toBe("unknown");
@@ -143,6 +150,68 @@ it("holds missing or incomplete completion and reports invalid structured JSON",
 
   stream([thread, message("confirmed"), completed], new Error("stream disconnected after result"));
   expect(await adapter.start(turn)).toEqual({ outcome: "completed", response: "confirmed" });
+});
+
+it("holds continuation when an auth diagnostic is followed by a disconnected stream", async () => {
+  const store = new WorkflowStore();
+  try {
+    const executions = store.agentExecutions();
+    const { execute } = createAgentController(executions);
+    stream(
+      [
+        thread,
+        { type: "turn.started" },
+        { type: "error", message: "401 Unauthorized: private details" },
+      ],
+      new Error("disconnected"),
+    );
+    const run = await execute({ id: "first", assignmentId: "first", context, prompt: "test" });
+    expect(executions.get("first")).toMatchObject({
+      status: "unknown",
+      reason: "Codex reported an authentication error without a confirmed terminal result.",
+    });
+    expect(run.session.nativeId).toBe(thread.thread_id);
+    await expect(
+      execute({
+        id: "later",
+        assignmentId: "later",
+        sessionId: run.session.id,
+        prompt: "continue",
+      }),
+    ).rejects.toThrow("unresolved execution");
+    expect(sdk.runStreamed).toHaveBeenCalledTimes(1);
+  } finally {
+    store.close();
+  }
+});
+
+it("fails a confirmed turn without a response, blocks replay and allows a new assignment to resume", async () => {
+  const store = new WorkflowStore();
+  try {
+    const executions = store.agentExecutions();
+    const { execute } = createAgentController(executions);
+    const request = { id: "first", assignmentId: "first", context, prompt: "test" };
+    stream([thread, completed]);
+    const run = await execute(request);
+    expect(executions.get("first")).toMatchObject({
+      status: "failed",
+      reason: "Codex omitted the required response.",
+    });
+    expect(run).not.toHaveProperty("result");
+    await expect(execute({ ...request, id: "retry" })).rejects.toThrow("already has");
+    stream([thread, message("confirmed"), completed]);
+    const next = await execute({
+      id: "later",
+      assignmentId: "later",
+      sessionId: run.session.id,
+      prompt: "continue",
+    });
+    expect(next.execution.status).toBe("completed");
+    expect(next.session).toEqual(run.session);
+    expect(sdk.runStreamed).toHaveBeenCalledTimes(2);
+  } finally {
+    store.close();
+  }
 });
 
 it("forwards cancellation and holds a dispatched turn without a terminal result", async () => {

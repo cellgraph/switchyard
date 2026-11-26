@@ -37,11 +37,13 @@ Each change should leave the repository buildable and testable. Temporary loss o
 
 - **A1, complete in PR #25.** Removed the controller-owned fix pipeline, including its CLI, unattended dispatch, edit scopes, candidate sealing, validation, commits, pushes and approval gates. Retained explicit local and read-only remote turns during that increment.
 - **A2, implemented.** Simplified the Codex SDK and Claude Code CLI adapters and replaced their execution persistence in the same increment. The prior records encoded PR authorization, worktrees, runtime bindings and remote leases, so retaining them would have introduced transitional complexity. Retired the [HTTP remote worker](../distributed-workers.md) and removed the legacy generic operation writers and their pending/ambiguous paths. [Deferred finding from PR #25](https://github.com/cellgraph/switchyard/pull/25#discussion_r4708594181)
-- **Remaining Phase A.** Verify the two native runtimes in the operator's configured local environments and address issues discovered in that verification.
+- **A3, verification.** Verify the two native runtimes in the operator's configured local environments and address issues discovered in that verification.
 
 The A2 baseline records sessions separately from execution attempts. It records intent at claim time, preserves native IDs and terminal outcomes, and allows explicit local start and continuation without a PR. The repository retains GitHub observation and review evidence during the transition. Cut over the deployed database in Phase D.
 
 **Acceptance.** Offline tests exercise native interface calls, structured results, failure and cancellation where supported, duplicate claims and ambiguous recovery. Record successful start and continuation with both Codex and Claude Code in the operator's configured environments, including continuation after a controller restart. Record live observations separately from fixtures. Use existing native accounts and settings. Any separately metered API request requires operator direction.
+
+**A3 gate for in-process Codex execution.** Verify the pinned Codex SDK's early CLI exit while writing to stdin. The reported uncaught `EPIPE` can terminate the invoking process before it records an outcome. Check for a supported upstream fix first and exercise the real SDK with an offline child that exits before consuming its prompt. If needed, choose the simplest containment that protects the long-lived controller. Complete this verification and any required fix before invoking the adapter inside a long-lived controller. Hold the execution as uncertain unless there is evidence of non-execution. [Deferred finding from PR #26](https://github.com/cellgraph/switchyard/pull/26#discussion_r4711789830)
 
 ### Phase B — Replace delivery processing with read-only GitHub reconciliation
 
