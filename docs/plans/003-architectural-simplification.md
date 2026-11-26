@@ -47,6 +47,8 @@ Remove the controller-owned fix pipeline first, including its call sites in the 
 
 Persist assignment identity, native session reference and execution context, placement, status, timestamps and coordination outcomes. Persist intent before dispatch and confirm the terminal result before using it for workflow advancement. Store only the metadata and references needed for decisions and recovery. Native runtimes retain prompts, substantive responses, streams and transcripts. Keep distinct sessions for roles as needed; the execution layer accepts assignments without a PR. Use persistent, operator-preconfigured execution environments. Installation, clones, dependencies, credentials, worktrees and native configuration belong to the operator, agents and their tools.
 
+In the execution persistence replacement increment (A3), remove the generic legacy operation writers and the recovery branches for their `pending` and `ambiguous` records. Preserve meaningful coverage of PR closure, reopen, restart and uncertain execution using actual execution records. [Deferred finding from PR #25](https://github.com/cellgraph/switchyard/pull/25#discussion_r4708594181)
+
 **Acceptance.** Offline tests exercise native interface calls, structured results, failure and cancellation where supported, duplicate claims and ambiguous recovery. Record successful start and continuation with both Codex and Claude Code in the operator's configured environments, including continuation after a controller restart. Record live observations separately from fixtures. Use existing native accounts and settings. Any separately metered API request requires operator direction.
 
 ### Phase B — Replace delivery processing with read-only GitHub reconciliation

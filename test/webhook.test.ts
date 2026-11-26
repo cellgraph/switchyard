@@ -348,6 +348,51 @@ describe("GitHub webhook intake and reconciliation", () => {
     expect(store.deliveryStatus(fixtures.review!.id)?.error).toContain("head changed");
   });
 
+  it("keeps newer failing CI when a passing observation of the same head finishes late", async () => {
+    const sha = codexReview.clean;
+    state.headSha = sha;
+    vi.mocked(github.readReviewInputs).mockResolvedValue(codexReview);
+    const requiredChecks = () => ["CI"];
+    const reconcile = createReconciler(store, github, requiredChecks);
+    await reconcile(target);
+    expect(workflow()?.state).toBe("ready_for_human");
+
+    const other = new WorkflowStore(dbPath);
+    const reachedFinalRead = Promise.withResolvers<void>();
+    const finalRead = Promise.withResolvers<PullRequestState>();
+    try {
+      const delayedReader = {
+        ...github,
+        readPullRequest: vi
+          .fn(github.readPullRequest)
+          .mockImplementationOnce(github.readPullRequest)
+          .mockImplementationOnce(() => {
+            reachedFinalRead.resolve();
+            return finalRead.promise;
+          }),
+      };
+      const delayed = createReconciler(other, delayedReader, requiredChecks)(target);
+      const superseded = expect(delayed).rejects.toThrow(/superseded this observation/);
+      await reachedFinalRead.promise;
+      try {
+        checkOutcome = "failed";
+        await reconcile(target);
+        expect(workflow()?.state).toBe("awaiting_review");
+      } finally {
+        finalRead.resolve({ ...state });
+        await superseded;
+      }
+      expect(workflow()).toMatchObject({
+        headSha: sha,
+        review: { sha, outcome: "completed_clean" },
+        checks: [{ name: "CI", sha, outcome: "failed" }],
+        state: "awaiting_review",
+      });
+    } finally {
+      other.close();
+    }
+  });
+
   it("honors an operator stop issued while GitHub has closed the PR", async () => {
     const { runPass } = controller();
     await runPass();

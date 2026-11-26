@@ -14,20 +14,29 @@ import { localProcessAlive, type WorkflowStore } from "./store.ts";
 function prStatus(store: WorkflowStore, target: PullRequestTarget) {
   const workflow = store.findWorkflow(target.repository, target.pullRequest);
   if (!workflow) return { state: "unobserved" as const };
+  const blockedByPriorFindings =
+    workflow.state === "awaiting_review" &&
+    workflow.review?.outcome === "completed_clean" &&
+    workflow.review.sha === workflow.headSha &&
+    store.reviews().hasBlockingFindings(workflow.id);
   const attention =
     workflow.state === "escalated" ||
     workflow.state === "ready_for_human" ||
     workflow.state === "review_findings" ||
     (workflow.state === "stopped" && !workflow.closedByGitHub)
       ? workflow.state
-      : null;
+      : blockedByPriorFindings
+        ? "review_findings"
+        : null;
   return {
     workflowId: workflow.id,
     state: workflow.state,
     headSha: workflow.headSha,
     reviewOutcome: workflow.review?.outcome ?? null,
     attention,
-    reason: workflow.escalationReason,
+    reason: blockedByPriorFindings
+      ? "Resolve blocking findings from prior reviews. Use --review-status to inspect them."
+      : workflow.escalationReason,
   };
 }
 

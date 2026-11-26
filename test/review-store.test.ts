@@ -1,10 +1,11 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WorkflowStore } from "../src/store.ts";
+import { workerStatus } from "../src/unattended.ts";
 import type { WorkflowCommand } from "../src/workflow.ts";
 import {
   clean,
@@ -13,6 +14,7 @@ import {
   head,
   nextHead,
   reviewStart,
+  target,
   workflowId,
 } from "./fixtures/review.ts";
 
@@ -46,6 +48,65 @@ describe("durable review runs", () => {
     expect(raw.prepare("PRAGMA journal_mode").get()?.journal_mode).toBe("delete");
     expect(raw.prepare("SELECT id FROM fix_cycles").get()?.id).toBe("saved");
     expect(raw.prepare("SELECT version FROM schema_migrations").get()?.version).toBe(15);
+  });
+
+  it("sets both identity and version for a fresh database", () => {
+    using raw = new DatabaseSync(path, { readOnly: true });
+    expect(raw.prepare("PRAGMA application_id").get()?.application_id).toBe(0x53575944);
+    expect(raw.prepare("PRAGMA user_version").get()?.user_version).toBe(16);
+  });
+
+  it.each([
+    [
+      "same version without an application ID",
+      "PRAGMA user_version = 16; CREATE TABLE data (value TEXT);",
+    ],
+    [
+      "same version with a foreign application ID",
+      "PRAGMA application_id = 42; PRAGMA user_version = 16; CREATE TABLE data (value TEXT);",
+    ],
+    ["foreign application ID on an empty schema", "PRAGMA application_id = 42;"],
+    [
+      "Switchyard identity with an unsupported version",
+      "PRAGMA application_id = 0x53575944; PRAGMA user_version = 15;",
+    ],
+  ])("rejects %s without modifying the database", (_scenario, setup) => {
+    const foreignPath = join(directory, "foreign.sqlite");
+    {
+      using raw = new DatabaseSync(foreignPath);
+      raw.exec(setup);
+    }
+    const before = readFileSync(foreignPath);
+    const files = readdirSync(directory);
+    expect(() => new WorkflowStore(foreignPath)).toThrow(/Use a fresh SWITCHYARD_DB_PATH/);
+    expect(readFileSync(foreignPath).equals(before)).toBe(true);
+    expect(readdirSync(directory)).toEqual(files);
+  });
+
+  it("rejects a foreign database with an uncheckpointed WAL without modifying either file", () => {
+    const foreignPath = join(directory, "foreign-wal.sqlite");
+    const writer = spawnSync(process.execPath, [
+      "--input-type=module",
+      "-e",
+      `
+        import { DatabaseSync } from "node:sqlite";
+        const db = new DatabaseSync(process.argv[1]);
+        db.exec("PRAGMA user_version = 16; PRAGMA application_id = 42; CREATE TABLE data (value TEXT)");
+        db.exec("PRAGMA journal_mode = WAL; INSERT INTO data VALUES ('saved')");
+        process.kill(process.pid, "SIGKILL");
+      `,
+      foreignPath,
+    ]);
+    expect(writer.signal).toBe("SIGKILL");
+    const walPath = foreignPath + "-wal";
+    const before = readFileSync(foreignPath);
+    const wal = readFileSync(walPath);
+    expect(wal.length).toBeGreaterThan(0);
+    const files = readdirSync(directory);
+    expect(() => new WorkflowStore(foreignPath)).toThrow(/Use a fresh SWITCHYARD_DB_PATH/);
+    expect(readFileSync(foreignPath).equals(before)).toBe(true);
+    expect(readFileSync(walPath).equals(wal)).toBe(true);
+    expect(readdirSync(directory)).toEqual(files);
   });
 
   it("distinguishes a running review from an explicitly clean review after restart", () => {
@@ -220,6 +281,8 @@ describe("durable review runs", () => {
   });
 
   it("blocks readiness on unresolved projected findings across a new head and restart", () => {
+    store.claimWorker([target], 60_000, new Date().toISOString());
+    const status = () => workerStatus(store).pullRequests[0];
     const reviews = store.reviews();
     reviews.start(reviewStart);
     reviews.finish(reviewStart.id, { ...clean, findings: [finding] });
@@ -243,6 +306,13 @@ describe("durable review runs", () => {
       state: "awaiting_review",
       review: { sha: nextHead, outcome: "completed_clean" },
     });
+    expect(status()).toMatchObject({
+      state: "awaiting_review",
+      headSha: nextHead,
+      reviewOutcome: "completed_clean",
+      attention: "review_findings",
+      reason: expect.stringContaining("--review-status"),
+    });
 
     const action = {
       findingId,
@@ -254,8 +324,14 @@ describe("durable review runs", () => {
     expect(store.getWorkflow(workflowId)?.state).toBe("awaiting_review");
     store.reviews().act({ ...action, id: "fixed", action: "fixed", previousActionId: "accept" });
     expect(store.getWorkflow(workflowId)?.state).toBe("ready_for_human");
+    expect(status()).toMatchObject({ attention: "ready_for_human", reason: null });
     store.reviews().act({ ...action, id: "reopen", action: "reopened", previousActionId: "fixed" });
     expect(store.getWorkflow(workflowId)?.state).toBe("awaiting_review");
+    store.transition(workflowId, { type: "stop", reason: "Operator stopped tracking this PR." });
+    expect(status()).toMatchObject({
+      attention: "stopped",
+      reason: "Operator stopped tracking this PR.",
+    });
   });
 
   it("retains a result after escalation and leaves the workflow escalated", () => {

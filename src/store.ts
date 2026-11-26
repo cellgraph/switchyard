@@ -1,6 +1,8 @@
 import { createRemoteStore, remoteSchema } from "./remote-store.ts";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { createAgentOperationStore, recoverAgentOperations } from "./agent-store.ts";
 import type { GitHubRateLimits, GitHubRateLimitState } from "./github-app.ts";
 import type { PullRequestTarget } from "./github-api.ts";
@@ -49,7 +51,19 @@ export function localProcessAlive(pid: number | null): boolean {
   }
 }
 
+const applicationId = 0x53575944; // SWYD
 const schemaVersion = 16;
+const unsupportedDatabase =
+  "Unsupported Switchyard database identity or schema version. Use a fresh SWITCHYARD_DB_PATH for this implementation.";
+
+function databaseIdentity(db: DatabaseSync) {
+  return db
+    .prepare(
+      "SELECT application_id AS id, user_version AS version FROM pragma_application_id(), pragma_user_version()",
+    )
+    .get() as { id: number; version: number };
+}
+
 const schema = `
   CREATE TABLE workflows (
     id TEXT PRIMARY KEY, repository TEXT NOT NULL, pull_request INTEGER NOT NULL,
@@ -104,6 +118,7 @@ const schema = `
   CREATE TABLE unattended_worker (slot INTEGER PRIMARY KEY CHECK(slot=1), record TEXT NOT NULL);
   ${reviewSchema}
   ${remoteSchema}
+  PRAGMA application_id = ${applicationId};
   PRAGMA user_version = ${schemaVersion};
 `;
 
@@ -638,15 +653,26 @@ export class WorkflowStore {
   }
 
   #initialize(): void {
+    const filename = this.#db.location();
+    if (filename && statSync(filename).size > 0) {
+      // The baseline sets both fields before WAL. An immutable probe reads those
+      // fields without recovery or checkpointing a foreign database.
+      const url = pathToFileURL(filename);
+      url.searchParams.set("immutable", "1");
+      using probe = new DatabaseSync(url.href, { readOnly: true });
+      const { id, version } = databaseIdentity(probe);
+      if (id !== applicationId || version !== schemaVersion) throw new Error(unsupportedDatabase);
+    }
+
     this.#transaction(() => {
-      const { user_version: version } = this.#db.prepare("PRAGMA user_version").get() as {
-        user_version: number;
-      };
-      if (version === schemaVersion) return;
-      if (version !== 0 || this.#db.prepare("SELECT 1 FROM sqlite_schema LIMIT 1").get())
-        throw new Error(
-          "Unsupported Switchyard database schema. Use a fresh SWITCHYARD_DB_PATH for this implementation.",
-        );
+      const { id, version } = databaseIdentity(this.#db);
+      if (id === applicationId && version === schemaVersion) return;
+      if (
+        id !== 0 ||
+        version !== 0 ||
+        this.#db.prepare("SELECT 1 FROM sqlite_schema LIMIT 1").get()
+      )
+        throw new Error(unsupportedDatabase);
       this.#db.exec(schema);
     });
   }
