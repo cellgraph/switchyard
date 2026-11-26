@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -194,26 +194,60 @@ it("recovers a dead owner once and holds its assignment and native session witho
   expect(adapter).not.toHaveBeenCalled();
 });
 
-it("contains the pinned Codex SDK's offline early-exit crash in a separate process", () => {
+it("keeps an offline Codex SDK early exit held without replay", () => {
   const executable = join(dir, "early-exit-codex");
-  writeFileSync(executable, "#!/bin/sh\nexit 2\n", { mode: 0o700 });
+  writeFileSync(executable, '#!/bin/sh\n: > "$0.started"\nexit 2\n', { mode: 0o700 });
 
   const worker = runSdkWithEarlyExit(path, executable);
-  // Revisit this expectation when a supported SDK release handles stdin errors.
-  expect(worker.status, worker.stderr).toBe(1);
-  expect(worker.stderr).toContain("Error: write EPIPE");
-  expect(worker.stdout).toBe("");
+  expect(worker.error).toBeUndefined();
+  expect(worker.signal).toBeNull();
+  expect(existsSync(executable + ".started"), worker.stderr).toBe(true);
+
   const executions = store.agentExecutions();
-  expect(executions.get("early-exit")).toMatchObject({ status: "running", finishedAt: null });
-  expect(executions.recover()).toBe(1);
-  expect(executions.get("early-exit")).toMatchObject({
+  const intent = { id: "early-exit", assignmentId: "sdk-assignment", context };
+  const initial = executions.get(intent.id);
+  expect(initial).toMatchObject({
+    id: intent.id,
+    assignmentId: intent.assignmentId,
+    sessionId: expect.any(String),
+    claimedAt: expect.any(String),
+  });
+  const session = executions.session(initial!.sessionId);
+  expect(session).toMatchObject({ context, nativeId: null });
+
+  if (worker.status === 0) {
+    expect(initial).toMatchObject({
+      status: "unknown",
+      reason: "Native execution ended without a confirmed outcome.",
+      finishedAt: expect.any(String),
+    });
+    expect(JSON.parse(worker.stdout)).toEqual({ execution: initial, session });
+    expect(executions.recover()).toBe(0);
+    expect(executions.get(intent.id)).toEqual(initial);
+  } else {
+    expect(worker.status, worker.stderr).toBe(1);
+    expect(worker.stderr).toContain("Unhandled 'error' event");
+    expect(worker.stderr).toMatch(/^Error: write EPIPE$/m);
+    expect(worker.stdout).toBe("");
+    expect(initial).toMatchObject({ status: "running", reason: null, finishedAt: null });
+    expect(executions.recover()).toBe(1);
+  }
+
+  const held = executions.get(intent.id);
+  expect(held).toMatchObject({
+    ...initial,
     status: "unknown",
+    reason:
+      worker.status === 0
+        ? "Native execution ended without a confirmed outcome."
+        : "Execution owner exited before recording an outcome.",
     finishedAt: expect.any(String),
   });
   expect(executions.recover()).toBe(0);
-  expect(() => executions.claim({ id: "retry", assignmentId: "sdk-assignment", context })).toThrow(
-    "already has",
-  );
+  expect(executions.get(intent.id)).toEqual(held);
+  expect(executions.claim(intent)).toEqual({ claimed: false, execution: held, session });
+  expect(() => executions.claim({ ...intent, id: "retry" })).toThrow("already has");
+  expect(executions.get("retry")).toBeNull();
 });
 
 it("holds unconfirmed completion and sanitizes adapter exceptions after the claim", async () => {

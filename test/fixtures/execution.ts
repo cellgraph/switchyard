@@ -11,24 +11,38 @@ export function runSdkWithEarlyExit(dbPath: string, executable: string) {
       "--input-type=module",
       "-e",
       `
+        import assert from "node:assert/strict";
         import { Codex } from "@openai/codex-sdk";
         import { createAgentController } from ${JSON.stringify(controller)};
         import { WorkflowStore } from ${JSON.stringify(store)};
         const store = new WorkflowStore(process.argv[1]);
+        let sdkError;
         const controller = createAgentController(store.agentExecutions(), () => ({
           async start(turn) {
             const sdk = new Codex({ codexPathOverride: process.argv[2], env: {} });
-            const { events } = await sdk.startThread().runStreamed(turn.prompt);
-            for await (const event of events) {
-              if (event.type === "thread.started") turn.onSession(event.thread_id);
+            try {
+              const { events } = await sdk.startThread().runStreamed(turn.prompt);
+              for await (const event of events) {
+                throw new Error("Unexpected SDK event: " + event.type);
+              }
+            } catch (error) {
+              sdkError = error;
+              throw error;
             }
-            return { outcome: "unknown", reason: "No terminal result." };
+            throw new Error("SDK stream ended without reporting the fixture failure.");
           },
         }));
         const run = await controller.execute({
           id: "early-exit", assignmentId: "sdk-assignment", prompt: "x".repeat(4 * 1024 * 1024),
           context: ${JSON.stringify(executionContext)},
         });
+        // The controller translates any adapter exception to unknown. Verify the actual SDK error.
+        assert.ok(sdkError instanceof Error, "Expected the SDK to reject");
+        assert.ok(
+          sdkError.message.trimEnd() === "Codex Exec exited with code 2:" ||
+            (sdkError.code === "EPIPE" && sdkError.syscall === "write"),
+          "Unexpected SDK rejection: " + sdkError.message,
+        );
         console.log(JSON.stringify(run));
         store.close();
       `,
