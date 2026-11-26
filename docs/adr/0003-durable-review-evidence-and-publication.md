@@ -1,6 +1,7 @@
 # ADR-0003: Own review evidence and decisions in SQLite
 
 - Status: Accepted for Phase 4
+- Supersession: [ADR-0006](0006-orchestrate-through-native-tools.md) supersedes parts of this record. See its prior decisions table for details.
 - Date: 2026-11-20
 
 ## Context

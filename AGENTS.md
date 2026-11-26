@@ -4,7 +4,8 @@ These shared instructions apply to Codex, Claude Code, and other coding agents. 
 
 ## Working agreements
 
-- Treat `CONTEXT.md` and accepted ADRs as durable decisions. Plans describe work, not new product policy. Surface evidence that makes a decision invalid before changing it.
+- Treat `CONTEXT.md` and accepted ADRs as durable decisions. Plans describe implementation work. Follow [ADR-0006](docs/adr/0006-orchestrate-through-native-tools.md) where earlier ADRs or plans conflict, and surface evidence that warrants revisiting a decision.
+- Let agents implement, validate, commit, push, and publish review content under workflow policy. Use role instructions and task scope to communicate expectations. Delegate credentials and native permissions to the operator.
 - Keep state transitions deterministic and durable. Check that review and CI evidence matches the exact PR head SHA.
 - Never interpret missing review comments as a clean review. Never add an automatic PR merge path.
 - Report errors explicitly; do not silently swallow failed side effects. Comments explain why, not what the code already says.

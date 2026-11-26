@@ -1,6 +1,7 @@
 # ADR-0002: Bind local agent sessions to workflow worktrees
 
 - Status: Accepted for Phases 3A and 3B
+- Supersession: [ADR-0006](0006-orchestrate-through-native-tools.md) supersedes parts of this record. See its prior decisions table for details.
 - Date: 2026-11-20
 
 ## Context

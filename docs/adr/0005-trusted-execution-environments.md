@@ -1,6 +1,7 @@
 # ADR-0005: Trust operator-controlled execution environments
 
 - Status: Accepted architectural direction. Implementation pending operator approval of [Plan 002](../plans/002-claude-code-authentication.md).
+- Supersession: [ADR-0006](0006-orchestrate-through-native-tools.md) supersedes parts of this record. See its prior decisions table for details.
 - Date: 2026-11-24
 
 ## Context
