@@ -1,10 +1,12 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WorkflowStore } from "../src/store.ts";
+import { workerStatus } from "../src/unattended.ts";
+import type { WorkflowCommand } from "../src/workflow.ts";
 import {
   clean,
   createWorkflow,
@@ -12,6 +14,7 @@ import {
   head,
   nextHead,
   reviewStart,
+  target,
   workflowId,
 } from "./fixtures/review.ts";
 
@@ -30,23 +33,80 @@ afterEach(() => {
 });
 
 describe("durable review runs", () => {
-  it("upgrades the Phase 3B schema without backfilling unsupported review completion", () => {
-    store.transition(workflowId, { type: "review_started" });
-    store.close();
-    using raw = new DatabaseSync(path);
-    raw.exec(`
-      DROP TABLE remote_attempts; DROP TABLE remote_turns; DROP TABLE remote_workers;
-      DROP TABLE unattended_worker; DROP TABLE github_observation_generations; DROP TABLE fix_cycles; DROP TABLE review_publications; DROP TABLE finding_actions;
-      DROP TABLE review_findings; DROP TABLE review_runs;
-      DELETE FROM schema_migrations WHERE version>=10;
-    `);
-    store = new WorkflowStore(path);
-    expect(store.getWorkflow(workflowId)?.state).toBe("review_running");
-    expect(store.reviews().inspect(workflowId).runs).toEqual([]);
-    expect(store.reviews().start(reviewStart).status).toBe("running");
-    expect(raw.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({
-      version: 15,
-    });
+  it("refuses an earlier schema without modifying it", () => {
+    const legacyPath = join(directory, "legacy.sqlite");
+    const legacySchema = `
+      CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+      INSERT INTO schema_migrations VALUES (15);
+      CREATE TABLE fix_cycles (id TEXT PRIMARY KEY);
+      INSERT INTO fix_cycles VALUES ('saved');
+    `;
+    using raw = new DatabaseSync(legacyPath);
+    raw.exec(legacySchema);
+    expect(() => new WorkflowStore(legacyPath)).toThrow(/Use a fresh SWITCHYARD_DB_PATH/);
+    expect(raw.prepare("PRAGMA user_version").get()?.user_version).toBe(0);
+    expect(raw.prepare("PRAGMA journal_mode").get()?.journal_mode).toBe("delete");
+    expect(raw.prepare("SELECT id FROM fix_cycles").get()?.id).toBe("saved");
+    expect(raw.prepare("SELECT version FROM schema_migrations").get()?.version).toBe(15);
+  });
+
+  it("sets both identity and version for a fresh database", () => {
+    using raw = new DatabaseSync(path, { readOnly: true });
+    expect(raw.prepare("PRAGMA application_id").get()?.application_id).toBe(0x53575944);
+    expect(raw.prepare("PRAGMA user_version").get()?.user_version).toBe(16);
+  });
+
+  it.each([
+    [
+      "same version without an application ID",
+      "PRAGMA user_version = 16; CREATE TABLE data (value TEXT);",
+    ],
+    [
+      "same version with a foreign application ID",
+      "PRAGMA application_id = 42; PRAGMA user_version = 16; CREATE TABLE data (value TEXT);",
+    ],
+    ["foreign application ID on an empty schema", "PRAGMA application_id = 42;"],
+    [
+      "Switchyard identity with an unsupported version",
+      "PRAGMA application_id = 0x53575944; PRAGMA user_version = 15;",
+    ],
+  ])("rejects %s without modifying the database", (_scenario, setup) => {
+    const foreignPath = join(directory, "foreign.sqlite");
+    {
+      using raw = new DatabaseSync(foreignPath);
+      raw.exec(setup);
+    }
+    const before = readFileSync(foreignPath);
+    const files = readdirSync(directory);
+    expect(() => new WorkflowStore(foreignPath)).toThrow(/Use a fresh SWITCHYARD_DB_PATH/);
+    expect(readFileSync(foreignPath).equals(before)).toBe(true);
+    expect(readdirSync(directory)).toEqual(files);
+  });
+
+  it("rejects a foreign database with an uncheckpointed WAL without modifying either file", () => {
+    const foreignPath = join(directory, "foreign-wal.sqlite");
+    const writer = spawnSync(process.execPath, [
+      "--input-type=module",
+      "-e",
+      `
+        import { DatabaseSync } from "node:sqlite";
+        const db = new DatabaseSync(process.argv[1]);
+        db.exec("PRAGMA user_version = 16; PRAGMA application_id = 42; CREATE TABLE data (value TEXT)");
+        db.exec("PRAGMA journal_mode = WAL; INSERT INTO data VALUES ('saved')");
+        process.kill(process.pid, "SIGKILL");
+      `,
+      foreignPath,
+    ]);
+    expect(writer.signal).toBe("SIGKILL");
+    const walPath = foreignPath + "-wal";
+    const before = readFileSync(foreignPath);
+    const wal = readFileSync(walPath);
+    expect(wal.length).toBeGreaterThan(0);
+    const files = readdirSync(directory);
+    expect(() => new WorkflowStore(foreignPath)).toThrow(/Use a fresh SWITCHYARD_DB_PATH/);
+    expect(readFileSync(foreignPath).equals(before)).toBe(true);
+    expect(readFileSync(walPath).equals(wal)).toBe(true);
+    expect(readdirSync(directory)).toEqual(files);
   });
 
   it("distinguishes a running review from an explicitly clean review after restart", () => {
@@ -195,7 +255,7 @@ describe("durable review runs", () => {
     expect(store.getWorkflow(workflowId)?.review?.outcome).toBe("in_progress");
   });
 
-  it("retains stale completion and findings without authorizing a fix after an ABA head change", () => {
+  it("retains stale completion and findings without projecting them after an ABA head change", () => {
     store.reviews().start(reviewStart);
     store.transition(workflowId, { type: "head_changed", sha: nextHead });
     expect(() => store.reviews().start({ ...reviewStart, id: "incorrect-head" })).toThrow(
@@ -206,11 +266,72 @@ describe("durable review runs", () => {
     store.transition(workflowId, { type: "head_changed", sha: head });
     store.reviews().finish(reviewStart.id, { ...clean, findings: [finding] });
     expect(store.getWorkflow(workflowId)).toMatchObject({ review: null, state: "awaiting_review" });
-    expect(() => store.transition(workflowId, { type: "fix_started" })).toThrow(/awaiting_review/);
     expect(store.reviews().inspect(workflowId).runs).toMatchObject([
       { head_sha: head, status: "completed", eligible: 0, findings: [{ content: finding }] },
       { head_sha: nextHead, status: "completed", eligible: 0, findings: [] },
     ]);
+    store.reviews().start({ ...reviewStart, id: "current-review" });
+    store.reviews().finish("current-review", clean);
+    store.transition(workflowId, {
+      type: "checks_received",
+      configuredNames: ["CI"],
+      evidence: [{ name: "CI", sha: head, outcome: "passed" }],
+    });
+    expect(store.getWorkflow(workflowId)?.state).toBe("ready_for_human");
+  });
+
+  it("blocks readiness on unresolved projected findings across a new head and restart", () => {
+    store.claimWorker([target], 60_000, new Date().toISOString());
+    const status = () => workerStatus(store).pullRequests[0];
+    const reviews = store.reviews();
+    reviews.start(reviewStart);
+    reviews.finish(reviewStart.id, { ...clean, findings: [finding] });
+    const findingId = reviews.inspect(workflowId).runs[0]!.findings[0]!.id;
+    expect(store.getWorkflow(workflowId)?.state).toBe("review_findings");
+
+    store.transition(workflowId, { type: "head_changed", sha: nextHead });
+    reviews.start({ ...reviewStart, id: "new-head", headSha: nextHead });
+    const passingChecks = {
+      type: "checks_received",
+      configuredNames: ["CI"],
+      evidence: [{ name: "CI", sha: nextHead, outcome: "passed" }],
+    } satisfies WorkflowCommand;
+    store.transition(workflowId, passingChecks);
+    reviews.finish("new-head", { ...clean, headSha: nextHead });
+    expect(store.getWorkflow(workflowId)?.state).toBe("awaiting_review");
+    store.close();
+    store = new WorkflowStore(path);
+    store.transition(workflowId, passingChecks);
+    expect(store.getWorkflow(workflowId)).toMatchObject({
+      state: "awaiting_review",
+      review: { sha: nextHead, outcome: "completed_clean" },
+    });
+    expect(status()).toMatchObject({
+      state: "awaiting_review",
+      headSha: nextHead,
+      reviewOutcome: "completed_clean",
+      attention: "review_findings",
+      reason: expect.stringContaining("--review-status"),
+    });
+
+    const action = {
+      findingId,
+      headSha: nextHead,
+      actor: "operator",
+      rationale: "Inspected change",
+    };
+    store.reviews().act({ ...action, id: "accept", action: "accepted" });
+    expect(store.getWorkflow(workflowId)?.state).toBe("awaiting_review");
+    store.reviews().act({ ...action, id: "fixed", action: "fixed", previousActionId: "accept" });
+    expect(store.getWorkflow(workflowId)?.state).toBe("ready_for_human");
+    expect(status()).toMatchObject({ attention: "ready_for_human", reason: null });
+    store.reviews().act({ ...action, id: "reopen", action: "reopened", previousActionId: "fixed" });
+    expect(store.getWorkflow(workflowId)?.state).toBe("awaiting_review");
+    store.transition(workflowId, { type: "stop", reason: "Operator stopped tracking this PR." });
+    expect(status()).toMatchObject({
+      attention: "stopped",
+      reason: "Operator stopped tracking this PR.",
+    });
   });
 
   it("retains a result after escalation and leaves the workflow escalated", () => {
@@ -251,7 +372,7 @@ describe("durable review runs", () => {
     );
     expect(() =>
       reviews.act({ ...accept, id: "conflict", action: "deferred", previousActionId: accept.id }),
-    ).toThrow(/requires a verified fix/);
+    ).toThrow(/requires a resolution/);
     expect(() =>
       reviews.act({ ...accept, id: "invalid", action: "reopened", previousActionId: accept.id }),
     ).toThrow(/current state/);

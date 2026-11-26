@@ -23,9 +23,6 @@ function fixture(): Workflow {
     requiredChecks: null,
     review: null,
     checks: [],
-    fixCycles: 0,
-    cycleAwaitingReview: false,
-    validationHeadSha: null,
     escalationReason: null,
   };
 }
@@ -146,75 +143,6 @@ describe("workflow state and durable store", () => {
       }),
     ).toBe(true);
     expect(calls).toBe(1);
-  });
-
-  it("ignores repeated finding evidence during and after its fix cycle", () => {
-    const db = memoryStore();
-    const finding = { sha: "abc", outcome: "completed_with_findings" as const };
-    db.transition("wf-1", { type: "review_received", evidence: finding });
-    db.transition("wf-1", { type: "validation_started" });
-    const historyLength = db.transitions("wf-1").length;
-    db.transition("wf-1", { type: "review_received", evidence: finding });
-    expect(db.getWorkflow("wf-1")?.state).toBe("validating");
-    expect(db.transitions("wf-1")).toHaveLength(historyLength);
-    db.transition("wf-1", { type: "cycle_finished", outcome: "successful" });
-    const historyAfterCycle = db.transitions("wf-1").length;
-    db.transition("wf-1", { type: "review_received", evidence: finding });
-    expect(db.getWorkflow("wf-1")).toMatchObject({ state: "awaiting_review", fixCycles: 0 });
-    expect(db.transitions("wf-1")).toHaveLength(historyAfterCycle);
-  });
-
-  it("escalates after three unsuccessful fix cycles", () => {
-    const db = memoryStore();
-    for (let i = 0; i < 3; i += 1) {
-      db.transition("wf-1", {
-        type: "review_received",
-        evidence: { sha: "abc", outcome: "completed_with_findings" },
-      });
-      expect(db.getWorkflow("wf-1")?.state).toBe("fixing");
-      db.transition("wf-1", { type: "validation_started" });
-      db.transition("wf-1", { type: "cycle_finished", outcome: "unsuccessful" });
-      if (i < 2) expect(db.getWorkflow("wf-1")?.state).toBe("fixing");
-    }
-    expect(db.getWorkflow("wf-1")).toMatchObject({ state: "escalated", fixCycles: 3 });
-    expect(() => db.transition("wf-1", { type: "fix_started" })).toThrow(InvalidTransitionError);
-  });
-
-  it("counts fix cycles rejected by a later review", () => {
-    const db = memoryStore();
-    db.transition("wf-1", {
-      type: "review_received",
-      evidence: { sha: "abc", outcome: "completed_with_findings" },
-    });
-
-    for (let cycle = 1; cycle <= 3; cycle += 1) {
-      expect(db.getWorkflow("wf-1")?.state).toBe("fixing");
-      db.transition("wf-1", { type: "validation_started" });
-      db.transition("wf-1", { type: "head_changed", sha: `head-${cycle}` });
-      if (cycle === 2) {
-        db.transition("wf-1", {
-          type: "review_received",
-          evidence: { sha: `head-${cycle}`, outcome: "completed_with_findings" },
-        });
-        expect(db.getWorkflow("wf-1")?.state).toBe("validating");
-        db.transition("wf-1", { type: "cycle_finished", outcome: "successful" });
-        expect(db.getWorkflow("wf-1")?.state).toBe("fixing");
-      } else {
-        expect(db.getWorkflow("wf-1")?.state).toBe("validating");
-        db.transition("wf-1", { type: "cycle_finished", outcome: "successful" });
-        expect(db.getWorkflow("wf-1")?.cycleAwaitingReview).toBe(true);
-        db.transition("wf-1", {
-          type: "review_received",
-          evidence: { sha: `head-${cycle}`, outcome: "completed_with_findings" },
-        });
-      }
-    }
-
-    expect(db.getWorkflow("wf-1")).toMatchObject({
-      state: "escalated",
-      fixCycles: 3,
-      cycleAwaitingReview: false,
-    });
   });
 
   it("recovers processing deliveries and marks uncertain operations ambiguous without replay", () => {

@@ -18,7 +18,6 @@ export type AgentTurnRequest = {
   expectedPullRequestHead: string;
   expectedHead: string;
   prompt: string;
-  fix?: { cycleId: string; findingIds: string[] };
 };
 
 export type AgentTurnIntent = Omit<AgentTurnRequest, "prompt"> & {
@@ -26,7 +25,6 @@ export type AgentTurnIntent = Omit<AgentTurnRequest, "prompt"> & {
   promptDigest: string;
   configurationId: string;
   workflowRevision: number;
-  mode: "awaiting_review" | "fixing";
 };
 
 export type AgentOperationStatus =
@@ -43,7 +41,6 @@ export type AgentSessionCheckpoint = { identity: string; digest: string };
 export type AgentTurnEvidence = AgentTurnTelemetry & {
   expectedWorktree?: WorktreeLocation;
   launchAuthorizedAt?: string;
-  prelaunchCheckpoint?: string;
   runtime?: AgentRuntime;
   worktree?: Worktree;
   reference?: WorkerSessionReference;
@@ -51,8 +48,6 @@ export type AgentTurnEvidence = AgentTurnTelemetry & {
   workspace?: WorkerTurnResult["workspace"];
   checkpoint?: { workspace: string; session: AgentSessionCheckpoint };
   error?: string;
-  addressedFindings?: string[];
-  ignoredCheckpoint?: string;
 };
 
 export type AgentOperation = {
@@ -89,11 +84,8 @@ export interface AgentOperationWorker {
     signal?: AbortSignal;
     authorizeLaunch(): void | Promise<void>;
     checkLaunch?: () => void;
-    refreshLaunch?: () => Promise<void>;
-    fixFindingIds?: string[];
     recordExpectedWorktree(worktree: WorktreeLocation): void;
-    recordWorkspace(worktree: Worktree, checkpoint?: string): void;
-    preflight?: { worktree: Worktree; checkpoint: string };
+    recordWorkspace(worktree: Worktree): void;
     recordSession(reference: WorkerSessionReference): void;
   }): Promise<AgentTurnEvidence>;
 }

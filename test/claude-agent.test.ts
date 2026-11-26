@@ -16,14 +16,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { localAgentWorker, localCodexWorker } from "../src/agent-command.ts";
 import { parseAgentConfig } from "../src/agent-config.ts";
 import { createAgentController } from "../src/agent-controller.ts";
-import { claudeEditRules, createClaudeAgent } from "../src/claude-agent.ts";
+import { createClaudeAgent } from "../src/claude-agent.ts";
 import {
   claudeExecutableIdentity,
   claudeSessionCheckpoint,
   claudeTranscript,
   claudeVersion,
 } from "../src/claude-runtime.ts";
-import { parseFixConfig } from "../src/config.ts";
 import { WorkflowStore } from "../src/store.ts";
 import { agentRepository, git } from "./fixtures/agent-repository.ts";
 
@@ -154,7 +153,6 @@ describe("Claude Code local provider", () => {
         timeoutMs,
         maxBudgetUsd: 0.25,
         readOnly,
-        allowedPaths: ["tracked.txt", "src/"],
       },
       secret,
     ).startSession({ workingDirectory });
@@ -194,15 +192,6 @@ describe("Claude Code local provider", () => {
     expect(() =>
       parseAgentConfig({ ...config, claude: { executable, home, maxBudgetUsd: Infinity } }),
     ).toThrow("maxBudgetUsd");
-    const fix = {
-      ...config,
-      ...repo,
-      localBranch: "fix/test",
-      requiredChecks: ["CI"],
-      validation: [{ id: "test", argv: ["true"] }],
-    };
-    expect(parseFixConfig({ ...fix, allowedPaths: ["src/"] }).provider).toBe("claude-code");
-    expect(() => parseFixConfig({ ...fix, allowedPaths: ["*.txt"] })).toThrow("literal");
   });
 
   it("offers only read tools for remote profiles", async () => {
@@ -212,20 +201,6 @@ describe("Claude Code local provider", () => {
     const { args } = launches()[0];
     expect(args[args.indexOf("--tools") + 1]).toBe("Read,Glob,Grep");
     expect(JSON.parse(args[args.indexOf("--settings") + 1]).permissions.deny).toContain("Edit");
-  });
-
-  it("preserves recursive permission when an exact scope overlaps it", () => {
-    const rules = claudeEditRules(["src", "src/", "src/component.ts", "outside.txt"]);
-    expect(rules.allow).toEqual([
-      "Edit(/src)",
-      "Edit(/src/**)",
-      "Edit(/src/component.ts)",
-      "Edit(/outside.txt)",
-    ]);
-    expect(rules.deny).toContain("Edit(/outside.txt/**)");
-    expect(rules.deny).not.toContain("Edit(/src/**)");
-    expect(rules.deny).not.toContain("Edit(/src/component.ts/**)");
-    expect(() => claudeEditRules(["src", "src/file.ts"])).toThrow("ancestor");
   });
 
   it("launches headlessly with an allowlisted environment and returns sanitized structured evidence", async () => {
@@ -271,7 +246,7 @@ describe("Claude Code local provider", () => {
         "--permission-prompts",
         "none",
         "Read,Glob,Grep,Edit,Write",
-        "Edit(/tracked.txt),Edit(/src/**)",
+        "Edit(./**)",
         "configured-model",
         "0.25",
         JSON.stringify(schema),
@@ -286,7 +261,7 @@ describe("Claude Code local provider", () => {
       apiKeyHelper: "/usr/bin/printenv SWITCHYARD_CLAUDE_API_KEY",
       disableAllHooks: true,
       disableClaudeAiConnectors: true,
-      permissions: { deny: ["Edit(.git)", "Read(.git)", "Edit(.claude)", "Edit(/tracked.txt/**)"] },
+      permissions: { deny: ["Edit(.git)", "Read(.git)", "Edit(.claude)"] },
     });
     expect(keys).not.toContain("GITHUB_TOKEN");
     expect(JSON.stringify(args)).not.toContain(secret);

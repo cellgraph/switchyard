@@ -40,9 +40,6 @@ export function agentRepository() {
     requiredChecks: null,
     review: null,
     checks: [],
-    fixCycles: 0,
-    cycleAwaitingReview: false,
-    validationHeadSha: null,
     escalationReason: null,
   };
   const request = {

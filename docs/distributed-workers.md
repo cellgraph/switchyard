@@ -4,13 +4,9 @@
 
 The controller host can run an execution listener alongside its normal GitHub poller. Both processes use the same local SQLite database. Workers connect outbound, poll for eligible turns, and execute in isolated worktrees using their own clones and provider profiles. See [ADR-0004](adr/0004-remote-agent-turns.md) for lease, delivery and transport decisions.
 
-Phase 5.6B supports explicitly authorized, read-only turns on PRs awaiting review. Codex uses its read-only sandbox with approval and agent network access disabled. Claude Code uses the existing restricted profile with only read tools. The worker checks the checkout and transcript locally and the controller checks the bound checkout identity, exact commit, runtime, workflow revision, and empty changed paths before confirming success. Provider transcripts remain on the worker. Run local implementation, validation and publication through the existing fix loop on workflows without a remote session binding. For a workflow with a remote session, address findings manually or use a new workflow with a local session. The controller checks placement before proposing or approving a local fix.
+Phase 5.6B supports explicitly authorized, read-only turns on PRs awaiting review. Codex uses its read-only sandbox with approval and agent network access disabled. Claude Code uses the existing restricted profile with only read tools. The worker checks the checkout and transcript locally and the controller checks the bound checkout identity, exact commit, runtime, workflow revision, and empty changed paths before confirming success. Provider transcripts remain on the worker.
 
-### Trust and proposed review behavior
-
-Run workers on trusted hosts that you control. The [execution responsibility ADR](adr/0005-trusted-execution-environments.md) requires review instructions to leave the checkout unchanged and rejection of results when the checkout changes. Runtime permissions remain the operator's responsibility. A clean checkout is evidence about the observed checkout only. Provider-side or external actions can survive rejection or cancellation, and controller publication approval covers only controller actions.
-
-The registration and test instructions below describe Phase 5.6B as shipped. The [Claude authentication follow-up](plans/002-claude-code-authentication.md) proposes relying on native Claude permissions while keeping the worktree, session, routing, and lease checks. Until that work ships, the native flags described above still apply.
+Run workers on trusted hosts that you control. An unchanged checkout is evidence about observed workspace contents. Provider-side or external actions can survive rejection or cancellation. This is the existing remote transport while its checkout verification and agent-turn records are available. See [Plan 003](plans/003-architectural-simplification.md#phase-c--investigate-rex-then-implement-explicit-remote-placement) for the remote placement decision.
 
 ## Controller setup
 
@@ -68,7 +64,7 @@ Supply `SWITCHYARD_WORKER_TOKEN` through the worker's private process environmen
 
 ## Two-process smoke test
 
-1. Use a disposable reconciled PR in `awaiting_review` with no existing implementation session or active fix cycle. For local development, start the listener and worker in separate terminals with loopback HTTP. For the Mac mini test, run the listener on exe.dev and the worker on the Mac through the SSH forward above. On the controller host run `npm start -- --remote-status` and verify the expected worker ID, architecture, provider, model and online status.
+1. Use a disposable reconciled PR in `awaiting_review` with no existing local agent session. For local development, start the listener and worker in separate terminals with loopback HTTP. For the Mac mini test, run the listener on exe.dev and the worker on the Mac through the SSH forward above. On the controller host run `npm start -- --remote-status` and verify the expected worker ID, architecture, provider, model and online status.
 2. Save the request below on the controller host. Replace both SHAs with the reconciled PR head and use a fresh semantic branch on the worker clone. Run `npm start -- --remote-turn request.json`. This command records explicit operator authorization. It can return while the request is waiting for capacity.
 
    ```json

@@ -101,7 +101,7 @@ GitHub is the collaboration interface. Switchyard is the workflow authority. Per
 3. Stage the authorized paths, record the exact candidate and validation results, and require separate publication approval. The controller creates a single-parent commit and publishes it through an explicitly claimed, fast-forward Git operation.
 4. Reconcile the Git ref and GitHub PR head before completing publication. Wait for a new exact-head completed review and the locally configured required check names.
 5. Bound authorized cycles, time out agent execution, limit validation retries, and retain durable reasons for triage and unsafe or uncertain outcomes.
-6. Hand the PR to a human only when the current head has a clean review and passing required checks. See the [operating guide](../fix-loop.md).
+6. Hand the PR to a human only when the current head has a clean review and passing required checks. See the [historical fix loop](../fix-loop.md).
 
 ### Acceptance criteria
 

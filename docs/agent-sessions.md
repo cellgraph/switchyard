@@ -4,7 +4,7 @@
 
 Start by reconciling the PR through the existing GitHub App configuration so the workflow and its current head appear in the Switchyard database. Use a trusted clone of that repository, a dedicated worktree root outside Git checkouts, and a persistent Codex home that this controller owns. Sign in to Codex in that home or make `OPENAI_API_KEY` available to the controller. Configured credentials must have access to the requested model.
 
-Submit an explicit turn to the database used for GitHub reconciliation. Use absolute paths, the current full PR head SHA, and a semantic workflow branch. For an initial turn, use the recorded PR head for both SHAs. For a follow-up, use the latest recorded PR head and the local head returned by the previous turn. Follow-ups use a new operation ID and the same checkout, Codex home, and model. Keep request files private and omit secrets from prompts.
+Submit an explicit turn for a workflow in `awaiting_review` to the database used for GitHub reconciliation. Use absolute paths, the current full PR head SHA, and a semantic workflow branch. For an initial turn, use the recorded PR head for both SHAs. For a follow-up, use the latest recorded PR head and the local head returned by the previous turn. Follow-ups use a new operation ID and the same checkout, Codex home, and model. Keep request files private and omit secrets from prompts.
 
 ```json
 {
@@ -29,25 +29,21 @@ npm start -- --agent-status pr-42-first-turn
 
 Reusing an operation ID with the same content returns the durable record or dispatches a still-authorized `requested` turn. The command exits with an error if the result requires attention. For a successful continuation, the database retains local and PR heads, the checkout and provider identifiers, a checkpoint of the checkout and Codex session file, and the observed changed paths. SQLite records the turn outcome and sanitized error reason. Codex retains the transcript in its own home.
 
-The GitHub controller automatically checks recovery when it starts. For a CLI-only run, use `npm start -- --recover`. This also recovers the webhook inbox. An agent claim with a live owner stays in flight so the owner can commit its outcome. A reused PID can leave a claim unresolved. Recovery reports pre-ownership claims by operation ID under `unverifiedAgentOperations` and retains them for inspection. If an operation becomes unknown, inspect the operation record, Codex processes and rollout, and checkout before making any manual decision. The record includes the expected checkout location if Git could have created it. Treat a held session as unavailable. Phase 3B provides no reset or force-resume command. Leave the worktree and Codex files intact while investigating.
+The GitHub controller automatically checks recovery when it starts. For a CLI-only run, use `npm start -- --recover`. This also recovers the webhook inbox. An agent claim with a live owner stays in flight so the owner can commit its outcome. A reused PID can leave a claim unresolved. Recovery reports claims missing owner evidence by operation ID under `unverifiedAgentOperations` and retains them for inspection. If an operation becomes unknown, inspect the operation record, Codex processes and rollout, and checkout before making any manual decision. The record includes the expected checkout location if Git could have created it. Treat a held session as unavailable. Leave the worktree and Codex files intact while investigating.
 
 Use the workflow checkout and Codex thread exclusively through Switchyard. The checkout checkpoint supports up to 10,000 entries and 64 MiB of content, including ignored files. The rollout checkpoint supports files up to 64 MiB. Codex must have an active rollout indexed in the state database in the configured Codex home. A managed override for the SQLite location requires inspection. Exceeding either limit or changing the checkout, thread, runtime configuration, or SDK/CLI version requires inspection. The evidence check is local and assumes the checkout and Codex home are on a trusted filesystem.
 
 ## Claude Code
 
-An explicit turn or a fix configuration can select Claude Code with its own model, profile and execution limits. See [Claude Code setup, recovery, and smoke test](claude-code.md).
+An explicit turn can select Claude Code with its own model, profile and execution limits. See [Claude Code setup, recovery, and smoke test](claude-code.md).
 
-## Bounded PR fixes
+## SQLite baseline
 
-Use the [bounded fix controller](fix-loop.md) to start a turn from durable, accepted review findings. Direct agent turn requests do not authorize fixes for durable review runs. The fix controller requires a clean exact-head checkout, uses a compatible recorded session when available, and updates the session checkpoint after Git and GitHub confirm publication.
-
-## Upgrading Phase 3B preview databases
-
-If you used the preview before rollout selection was verified, finish any planned turns while still on that version and stop its agent processes before upgrading. The current release requires new checkout and rollout checkpoints. It holds preview sessions if a continuation is requested because their records cannot identify the provider-selected rollout. Keep the old database and worktrees for inspection.
+Use a fresh SQLite database for this implementation. The existing operation and session records apply to turns submitted in that database. See the [state model](state-model.md#sqlite-baseline).
 
 ## Verification
 
-The ordinary test suite exercises schema upgrades, duplicate operation claims across SQLite connections, head and checkout changes, missing or incompatible runtime and session bindings, startup recovery during a live turn, and child-process termination at dispatch, checkout creation, execution, and just before outcome persistence.
+The ordinary test suite exercises duplicate operation claims across SQLite connections, head and checkout changes, missing or incompatible runtime and session bindings, startup recovery during a live turn, and child-process termination at dispatch, checkout creation, execution, and just before outcome persistence.
 
 The live acceptance test uses a temporary repository, SQLite database, and Codex home. It starts two separate Node.js controller invocations with recovery between them. The first turn edits the checkout and remembers a token. The second turn writes the token using the original thread and dirty checkout. It verifies the original thread ID and checkout identity, and the clean primary checkout. The test passed on macOS with Codex SDK and CLI `0.171.0` using `gpt-6.2-sol`. Routine CI skips it.
 
@@ -57,4 +53,4 @@ SWITCHYARD_CODEX_SMOKE=1 \
   npm test -- test/codex-resume.smoke.test.ts
 ```
 
-Set `OPENAI_API_KEY` in the environment or provide `SWITCHYARD_SMOKE_AUTH_FILE` pointing to an existing Codex `auth.json`. The smoke test copies that file into the private temporary home and removes the home afterward. The test does not exercise live Codex interruption, credential expiry mid-turn, or a live GitHub-driven fix.
+Set `OPENAI_API_KEY` in the environment or provide `SWITCHYARD_SMOKE_AUTH_FILE` pointing to an existing Codex `auth.json`. The smoke test copies that file into the private temporary home and removes the home afterward. The test covers successful start and continuation.

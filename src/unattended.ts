@@ -1,9 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { workflowKey, type loadConfig } from "./config.ts";
 import { createController } from "./controller.ts";
-import { advanceReconciledFix } from "./fix-command.ts";
-import { fixStatus } from "./fix-controller.ts";
-import { requiredChecksForCycle } from "./fix-store.ts";
 import type { GitHubReader, PullRequestTarget } from "./github-api.ts";
 import {
   GitHubAuthenticationError,
@@ -13,34 +10,33 @@ import {
 } from "./github-app.ts";
 import { createReconciler, PullRequestHeadChangedError } from "./reconcile.ts";
 import { localProcessAlive, type WorkflowStore } from "./store.ts";
-import { WorktreeSetupError } from "./worktree.ts";
 
 function prStatus(store: WorkflowStore, target: PullRequestTarget) {
   const workflow = store.findWorkflow(target.repository, target.pullRequest);
   if (!workflow) return { state: "unobserved" as const };
-  const status = fixStatus(store, workflow.id);
-  const cycle = status.cycles.at(-1);
+  const blockedByPriorFindings =
+    workflow.state === "awaiting_review" &&
+    workflow.review?.outcome === "completed_clean" &&
+    workflow.review.sha === workflow.headSha &&
+    store.reviews().hasBlockingFindings(workflow.id);
   const attention =
     workflow.state === "escalated" ||
     workflow.state === "ready_for_human" ||
+    workflow.state === "review_findings" ||
     (workflow.state === "stopped" && !workflow.closedByGitHub)
       ? workflow.state
-      : cycle?.head === workflow.headSha && cycle.phase === "proposed"
-        ? "fix_authorization"
-        : cycle?.head === workflow.headSha && cycle.phase === "validated"
-          ? "publication_authorization"
-          : status.pendingFindingIds.length
-            ? "finding_disposition"
-            : null;
+      : blockedByPriorFindings
+        ? "review_findings"
+        : null;
   return {
     workflowId: workflow.id,
     state: workflow.state,
     headSha: workflow.headSha,
-    cycleId: cycle?.id ?? null,
-    phase: cycle?.phase ?? null,
-    operationId: cycle?.operationId ?? null,
+    reviewOutcome: workflow.review?.outcome ?? null,
     attention,
-    nextAction: status.nextAction,
+    reason: blockedByPriorFindings
+      ? "Resolve blocking findings from prior reviews. Use --review-status to inspect them."
+      : workflow.escalationReason,
   };
 }
 
@@ -62,7 +58,6 @@ export function workerStatus(store: WorkflowStore) {
 function failureKind(error: unknown) {
   if (error instanceof GitHubAuthenticationError) return "github_authentication";
   if (error instanceof GitHubDrainError) return "interrupted";
-  if (error instanceof WorktreeSetupError) return error.code;
   if (error instanceof PullRequestHeadChangedError) return "observation_changed";
   if (error instanceof GitHubRateLimitError) return "github_rate_limited";
   if (error instanceof GitHubTransientError) return "github_transient";
@@ -75,7 +70,6 @@ export async function runUnattended({
   reader,
   signal,
   log,
-  advance = advanceReconciledFix,
   now = Date.now,
   wait = async (ms, signal) => {
     await delay(ms, undefined, { signal });
@@ -86,12 +80,11 @@ export async function runUnattended({
   reader: GitHubReader;
   signal: AbortSignal;
   log: (entry: Record<string, unknown>) => void;
-  advance?: typeof advanceReconciledFix;
   now?: () => number;
   wait?: (ms: number, signal: AbortSignal) => Promise<void>;
 }) {
   const at = () => new Date(now()).toISOString();
-  const { targets, fixes, reconcileIntervalMs } = config;
+  const { targets, requiredChecks, reconcileIntervalMs } = config;
   if (reconcileIntervalMs <= 0)
     throw new Error("The unattended worker requires a positive polling interval.");
   const claim = store.claimWorker(targets, reconcileIntervalMs, at());
@@ -107,13 +100,11 @@ export async function runUnattended({
       pollIntervalMs: reconcileIntervalMs,
       interruptedRun: claim.interruptedRun,
     });
-    const reconcile = createReconciler(store, reader, (target) => {
-      const workflow = store.findWorkflow(target.repository, target.pullRequest);
-      return requiredChecksForCycle(
-        workflow ? store.fixes(workflow.id).read().at(-1) : undefined,
-        fixes.get(workflowKey(target))?.requiredChecks ?? null,
-      );
-    });
+    const reconcile = createReconciler(
+      store,
+      reader,
+      (target) => requiredChecks.get(workflowKey(target)) ?? null,
+    );
     const controller = createController({
       store,
       targets,
@@ -124,35 +115,11 @@ export async function runUnattended({
       reportError: () => report("controller_attention"),
       async reconcile(target) {
         const context = { repository: target.repository, pullRequest: target.pullRequest };
-        let stage = "reconciliation";
-        async function refresh() {
-          try {
-            await reconcile(target, signal);
-            report("reconciliation", { ...context, outcome: "completed" });
-          } catch (error) {
-            report("reconciliation", { ...context, outcome: failureKind(error) });
-            throw error;
-          }
-        }
         try {
-          await refresh();
-          if (signal.aborted) return;
-          const configured = fixes.get(workflowKey(target));
-          const workflow = store.findWorkflow(target.repository, target.pullRequest);
-          if (
-            configured &&
-            workflow &&
-            workflow.state !== "escalated" &&
-            workflow.state !== "stopped"
-          ) {
-            stage = "fix_advance";
-            await advance(store, workflow.id, target, configured, reader, refresh, {
-              drainSignal: signal,
-              now,
-              report: (operation) => report("fix_operation", { ...context, ...operation }),
-            });
-          }
+          await reconcile(target, signal);
+          report("reconciliation", { ...context, outcome: "completed" });
         } catch (error) {
+          report("reconciliation", { ...context, outcome: failureKind(error) });
           if (error instanceof GitHubDrainError && signal.aborted) throw error;
           report("target_failed", {
             ...context,
@@ -161,9 +128,8 @@ export async function runUnattended({
             ...(error instanceof GitHubAuthenticationError
               ? { httpStatus: error.status, retryAt: error.retryAt }
               : {}),
-            stage,
+            stage: "reconciliation",
             outcome: failureKind(error),
-            ...(error instanceof WorktreeSetupError ? { detail: error.message } : {}),
           });
           throw error;
         }

@@ -1,6 +1,6 @@
 # ADR-0006: Orchestrate through native tools
 
-- Status: Accepted architectural direction, updated after the operator review of Plan 003. Implementation pending.
+- Status: Accepted architectural direction, including the execution counting rule approved in Plan 003.
 - Date: 2026-11-25
 - Original baseline: `e0b10d6`, the merge of PR #21
 
@@ -38,7 +38,7 @@ The Reviewer publishes to GitHub and returns structured exact-head completion me
 
 Handoff requires completed review of the current head, no unresolved blocking findings, and passing required CI for that head. A clean review is sufficient, and a completed review whose findings were all rejected or deferred qualifies without another review of unchanged code. Unresolved accepted findings and escalated findings block handoff. Missing, incomplete, stale or unverified review evidence cannot establish readiness. Head changes invalidate prior readiness evidence. Switchyard never merges a PR automatically.
 
-Unresolved accepted findings and failed required CI can trigger the same Implementer role. Combine them when practical. Use hard, durable limits on autonomous review and revision to prevent alternating CI and review fixes from extending the loop. Start with three review rounds. An operator can explicitly grant additional execution after inspection. Changes to the PR head do not reset the allowance. [Plan 003](../plans/003-architectural-simplification.md#proposed-counting-rule-for-operator-review) records the proposed counting details.
+Unresolved accepted findings and failed required CI can trigger the same Implementer role. Combine them when practical. The default allowance is three Reviewer rounds and three Implementer revisions. Review-driven and CI-driven revisions share the revision allowance. Assignments consume their slot when they start. Known non-execution retries reuse the reserved slot, and adjudication uses no additional review slot. New heads, restarts and ordinary resumes preserve both allowances. Escalate before dispatch when additional capacity is required, including when a revision would require a subsequent review and no review slot remains. The operator can explicitly grant additional execution. [Plan 003](../plans/003-architectural-simplification.md#accepted-execution-counting-rule) records the accepted counting and recovery details.
 
 ### Recovery, remote execution and operator control
 
@@ -65,4 +65,4 @@ Earlier records preserve the reasons for the original implementation. This ADR a
 
 Temporary loss of obsolete functionality is accepted during implementation while the repository remains buildable and testable. Remove the controller-owned fix pipeline early. Before deploying the replacement, archive the old SQLite database and preserve native sessions, clones and worktrees independently. Start from a fresh database. Legacy migrations, compatibility layers and parallel legacy execution paths are unnecessary.
 
-[Plan 003](../plans/003-architectural-simplification.md) replaces the remaining PR-loop work in [Plan 001](../plans/001-pr-review-loop.md) and the authentication subsystem proposed in [Plan 002](../plans/002-claude-code-authentication.md). The [architecture overview](../architecture.md#current-implementation-after-pr-21) records existing behavior and its operating guides until the replacement ships.
+[Plan 003](../plans/003-architectural-simplification.md) replaces the remaining PR-loop work in [Plan 001](../plans/001-pr-review-loop.md) and the authentication subsystem proposed in [Plan 002](../plans/002-claude-code-authentication.md). The [architecture overview](../architecture.md#current-implementation) records existing behavior and its operating guides until the replacement ships.

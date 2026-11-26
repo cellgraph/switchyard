@@ -26,9 +26,8 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
     previous?: WorkerSessionReference,
     requireNew = false,
     beforeLaunch?: () => void | Promise<void>,
-    checkout?: Worktree,
   ) {
-    const expected = previous?.worktree ?? checkout;
+    const expected = previous?.worktree;
     const worktree = worktrees.open(target, expected ? false : requireNew ? "new" : true);
     assertAvailable(worktree.path);
     if (
@@ -117,8 +116,7 @@ export function createLocalWorker(worktrees: WorktreeManager, agent: AgentAdapte
       target: WorktreeTarget,
       requireNew = false,
       beforeLaunch?: () => void | Promise<void>,
-      checkout?: Worktree,
-    ) => openSession(target, undefined, requireNew, beforeLaunch, checkout),
+    ) => openSession(target, undefined, requireNew, beforeLaunch),
     resumeSession: (
       target: WorktreeTarget,
       reference: WorkerSessionReference,

@@ -20,7 +20,7 @@ import type { WorkerSessionReference } from "./local-worker.ts";
 import type { Worktree, WorktreeLocation } from "./worktree.ts";
 import type { Workflow } from "./workflow.ts";
 
-export const remoteMigration = `
+export const remoteSchema = `
   CREATE TABLE remote_workers (
     id TEXT PRIMARY KEY NOT NULL,
     capabilities TEXT NOT NULL,

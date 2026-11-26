@@ -284,9 +284,6 @@ describe("isolated worktrees and the local worker", () => {
         requiredChecks: null,
         review: null,
         checks: [],
-        fixCycles: 0,
-        cycleAwaitingReview: false,
-        validationHeadSha: null,
         escalationReason: null,
       });
       const workflow = store.getWorkflow(target.workflowId);

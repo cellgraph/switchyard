@@ -2,7 +2,7 @@
 
 **Implementation status.** This guide describes the existing implementation. [ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture, and [Plan 003](plans/003-architectural-simplification.md) describes the pending replacement.
 
-Switchyard tracks PR numbers explicitly selected in a local configuration. The controller uses GitHub's current PR state after receiving a webhook and on every configured polling interval. It records lifecycle changes and exact-head check evidence in SQLite. Review submissions, inline comments, and PR conversation comments feed the [durable Codex review adapter](reviews.md). Required-check discovery belongs to Phase 5, so GitHub reconciliation cannot promote a workflow to `ready_for_human` on its own.
+Switchyard tracks PR numbers explicitly selected in a local configuration. The controller uses GitHub's current PR state after receiving a webhook and on every configured polling interval. It records lifecycle changes and exact-head check evidence in SQLite. Review submissions, inline comments, and PR conversation comments feed the [durable Codex review adapter](reviews.md). Use the optional per-PR `requiredChecks` configuration to evaluate readiness alongside exact-head review evidence.
 
 ## Register and install the App
 
@@ -34,11 +34,14 @@ Save a local JSON configuration with the repository, App installation ID, and PR
       "installationId": 123456,
       "pullRequests": [7, 12]
     }
-  ]
+  ],
+  "requiredChecks": { "owner/repo#7": ["Quality checks"] }
 }
 ```
 
-Supply credentials through the environment. Set `GITHUB_WEBHOOK_SECRET` from your secret store to enable the loopback receiver. The optional `SWITCHYARD_WEBHOOK_PORT` defaults to `3000`. The optional `SWITCHYARD_DB_PATH` defaults to `switchyard.sqlite` in the working directory.
+Each `requiredChecks` key names a configured `owner/repo#PR` in lowercase. A PR without configured required checks still records CI observations and stays ineligible for handoff.
+
+Supply credentials through the environment. Set `GITHUB_WEBHOOK_SECRET` from your secret store to enable the loopback receiver. The optional `SWITCHYARD_WEBHOOK_PORT` defaults to `3000`. The optional `SWITCHYARD_DB_PATH` defaults to `switchyard.sqlite` in the working directory. Use a fresh path for this implementation. See the [SQLite baseline](state-model.md#sqlite-baseline).
 
 ```sh
 export GITHUB_APP_CLIENT_ID=your-app-client-id
@@ -57,9 +60,9 @@ sqlite3 -readonly switchyard.sqlite \
   'SELECT delivery_id, status, attempts, error, datetime(retry_at / 1000, "unixepoch") AS retry_utc FROM deliveries ORDER BY received_at DESC LIMIT 20;'
 ```
 
-Consecutive secondary throttling doubles the wait from one minute and honors longer GitHub retry windows. A successful reconciliation clears its PR retry count, including when the PR closes, the head changes, or a comment page disappears. It can also clear a token-exchange retry for the same repository. An unfinished or failed reconciliation preserves the count. The controller retires counts below the retry limit for untracked PRs and terminal workflows before each pass and when a secondary throttle arrives. A late throttle from a workflow that stopped in flight still sets a cooldown. Only an active retry owner can advance the attempt count. A pause that already requires operator action stays in effect. Upgrading older retry keys without those scopes preserves active deadlines and explicit pauses. After five throttled attempts, API requests stay paused across restarts. Deliveries that need GitHub keep their inbox status and attempt counts until the operator resumes and the cooldown expires. Deliveries that require no GitHub work can still finish. Stop the controller and run `npm start -- --resume-github` using the same `SWITCHYARD_DB_PATH` to resume. The command clears the retry limit and preserves the last backoff deadline. It uses the local SQLite file without making GitHub requests. [GitHub REST API rate-limit guidance](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api#exceeding-the-rate-limit)
+Consecutive secondary throttling doubles the wait from one minute and honors longer GitHub retry windows. A successful reconciliation clears its PR retry count, including when the PR closes, the head changes, or a comment page disappears. It can also clear a token-exchange retry for the same repository. An unfinished or failed reconciliation preserves the count. The controller retires counts below the retry limit for untracked PRs and terminal workflows before each pass and when a secondary throttle arrives. A late throttle from a workflow that stopped in flight still sets a cooldown. Only an active retry owner can advance the attempt count. A pause that already requires operator action stays in effect. After five throttled attempts, API requests stay paused across restarts. Deliveries that need GitHub keep their inbox status and attempt counts until the operator resumes and the cooldown expires. Deliveries that require no GitHub work can still finish. Stop the controller and run `npm start -- --resume-github` using the same `SWITCHYARD_DB_PATH` to resume. The command clears the retry limit and preserves the last backoff deadline. It uses the local SQLite file without making GitHub requests. [GitHub REST API rate-limit guidance](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api#exceeding-the-rate-limit)
 
-Check run, check suite, and commit status events refresh the configured PRs in their repository. A check event may have an empty PR list, including for fork cases. Switchyard fetches the check run and status lists for the authoritative PR head in the configured base repository, and missing records remain missing. A shared check name across producers, a skipped or neutral run, or unrecognized evidence is recorded as unknown if returned. Repository ruleset discovery and required-check policy belong to Phase 5.
+Check run, check suite, and commit status events refresh the configured PRs in their repository. A check event may have an empty PR list, including for fork cases. Switchyard fetches the check run and status lists for the authoritative PR head in the configured base repository, and missing records remain missing. A shared check name across producers, a skipped or neutral run, or unrecognized evidence is recorded as unknown if returned. Repository ruleset discovery and required-check producer identity remain open in [Plan 003](plans/003-architectural-simplification.md#remaining-implementation-choices).
 
 ## Optional review publication
 
@@ -71,7 +74,7 @@ After installing the pinned dependencies, run `npm test` without App credentials
 
 All six repository read endpoints were exercised on Switchyard PR #6 with existing `gh` credentials. App token issuance, the App's actual repository grants, and GitHub-to-receiver delivery still require live verification with an installed App. To verify an installation, run a manual refresh for a known open PR and inspect the workflow and check evidence in SQLite. For webhook verification, redeliver a GitHub event, confirm the delivery shows `202` in GitHub, and confirm the same delivery ID has one processed inbox row.
 
-The Phase 3A smoke test used the local fixtures to verify RS256 App JWT signing, repository-scoped token requests, token replacement and refresh, signed webhook receipts, deduplication, and reconciliation. It also ran the documented `--once` entry point and confirmed missing App credentials fail before SQLite is opened. No App client ID, private-key path, or installation configuration was available for the run.
+A historical Phase 3A smoke test used the local fixtures to verify RS256 App JWT signing, repository-scoped token requests, token replacement and refresh, signed webhook receipts, deduplication, and reconciliation. It also checked that the `--once` command reports missing App credentials. No App client ID, private-key path, or installation configuration was available for the run.
 
 To finish the live polling check, use an App installed on the intended repository with the read grants above. Use a config containing that installation's numeric ID and a known open PR with check activity. Supply the App client ID and PEM path and run the following with an unused SQLite path in a private directory.
 
