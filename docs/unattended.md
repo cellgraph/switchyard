@@ -1,5 +1,7 @@
 # Unattended controller
 
+**Implementation status.** This guide describes the existing implementation. [ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture, and [Plan 003](plans/003-architectural-simplification.md) describes the pending replacement.
+
 Run the worker on one host from a stable Switchyard checkout. Give it a persistent SQLite database, trusted clones of the monitored repositories, a dedicated root for fix worktrees, and a persistent agent profile. Keep these paths separate from Switchyard's own development worktrees. Use the [GitHub App reader](github-app.md) and the [Phase 5 agent and publication setup](fix-loop.md).
 
 ## Configuration

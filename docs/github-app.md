@@ -1,5 +1,7 @@
 # GitHub App and local reconciliation
 
+**Implementation status.** This guide describes the existing implementation. [ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture, and [Plan 003](plans/003-architectural-simplification.md) describes the pending replacement.
+
 Switchyard tracks PR numbers explicitly selected in a local configuration. The controller uses GitHub's current PR state after receiving a webhook and on every configured polling interval. It records lifecycle changes and exact-head check evidence in SQLite. Review submissions, inline comments, and PR conversation comments feed the [durable Codex review adapter](reviews.md). Required-check discovery belongs to Phase 5, so GitHub reconciliation cannot promote a workflow to `ready_for_human` on its own.
 
 ## Register and install the App

@@ -1,7 +1,7 @@
 # ADR-0004: Run Claude Code through the local agent boundary
 
-- Status: Accepted for Phase 5.6A. [ADR-0005](0005-trusted-execution-environments.md) supersedes the execution-policy portions of decision 2. The original launcher described here is still implemented.
-- Supersession: [ADR-0006](0006-orchestrate-through-native-tools.md) supersedes parts of this record. See its prior decisions table for details.
+- Original status: Accepted for Phase 5.6A
+- Current status: The original launcher, runtime and transcript checks, and controller validation were superseded by [ADR-0006](0006-orchestrate-through-native-tools.md#prior-decisions-superseded).
 - Date: 2026-11-22
 
 ## Context

@@ -1,5 +1,7 @@
 # Plan 001: Codex GitHub PR review/fix loop
 
+**Historical plan.** [Plan 003](003-architectural-simplification.md) replaces the remaining PR-loop work after Phase 5.6B. The phases and proposals below preserve the original roadmap. [ADR-0006](../adr/0006-orchestrate-through-native-tools.md#prior-decisions-superseded) identifies the architectural requirements that were superseded.
+
 ## Goal
 
 Implement the first Switchyard workflow from a Codex implementation session with a pushed GitHub PR to a human-ready handoff. Record all state durably, resume the same Codex thread, associate every review and check with the exact PR head SHA, and never merge. After three unsuccessful fix/review cycles or an explicit judgment call, stop and escalate.

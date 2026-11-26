@@ -1,5 +1,7 @@
 # Durable reviews and finding decisions
 
+**Implementation status.** This guide describes the existing implementation. [ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture, and [Plan 003](plans/003-architectural-simplification.md) describes the pending replacement.
+
 GitHub is the collaboration interface. SQLite is the authority for review runs, finding identities, and operator decisions. Webhook and polling reconciliation use the same reader and check the PR head again after fetching evidence.
 
 ## Review sources and completion

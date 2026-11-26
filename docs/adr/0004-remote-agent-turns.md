@@ -1,7 +1,7 @@
 # ADR-0004: Poll for leased agent turns
 
-- Status: Accepted for Phase 5.6B. [ADR-0005](0005-trusted-execution-environments.md) supersedes the adapter-enforced review policy. The lease, placement and evidence decisions still apply.
-- Supersession: [ADR-0006](0006-orchestrate-through-native-tools.md) supersedes parts of this record. See its prior decisions table for details.
+- Original status: Accepted for Phase 5.6B
+- Current status: The original proof requirements, capability matching and mandated lease protocol were superseded by [ADR-0006](0006-orchestrate-through-native-tools.md#prior-decisions-superseded). [Plan 003](../plans/003-architectural-simplification.md#phase-c--investigate-rex-then-implement-explicit-remote-placement) calls for an experiment before transport selection.
 
 ## Decision
 
