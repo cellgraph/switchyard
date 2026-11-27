@@ -48,8 +48,6 @@ export class GitHubRateLimitError extends Error {
   }
 }
 
-export class GitHubWriteRejected extends Error {}
-
 export class GitHubTransientError extends Error {
   readonly retryAt: number | undefined;
 
@@ -107,12 +105,17 @@ export function resumeGitHubAfterSecondaryLimit(rateLimits: GitHubRateLimits): b
 type Token = { value: string; expiresAt: number };
 type ApiRequest = {
   path: string;
-  method?: "POST";
-  body?: string;
   reconcilePullRequest?: number | undefined;
   commitRetryKey?: string | undefined;
   drainSignal?: AbortSignal | undefined;
-};
+} & (
+  | { method?: undefined; body?: undefined }
+  | {
+      path: `/app/installations/${number}/access_tokens` | "/graphql";
+      method: "POST";
+      body: string;
+    }
+);
 
 export function pullRequestRetryKey(target: GitHubRepository, pullRequest: number): string {
   return `${target.installationId}:${target.repository}:${pullRequest}`;
@@ -127,18 +130,7 @@ export function belongsToReconciliation(
   target: GitHubRepository,
   pullRequest: number,
 ): boolean {
-  // Existing databases may contain check-scoped or individual review-page retry keys.
-  const legacyChecksKey = `checks:${target.installationId}:${target.repository}:${pullRequest}`;
-  const legacyPull = `${target.installationId}:GET:/repos/${target.repository}/pulls/${pullRequest}`;
-  const legacyIssue = `${target.installationId}:GET:/repos/${target.repository}/issues/${pullRequest}/comments?`;
-  return (
-    key === `pr:${pullRequestRetryKey(target, pullRequest)}` ||
-    key === tokenRetryKey(target) ||
-    key === legacyChecksKey ||
-    key === legacyPull ||
-    key.startsWith(`${legacyPull}/`) ||
-    key.startsWith(legacyIssue)
-  );
+  return key === `pr:${pullRequestRetryKey(target, pullRequest)}` || key === tokenRetryKey(target);
 }
 
 export function retireInactiveGitHubRetry(
@@ -172,7 +164,6 @@ export function createGitHubAppClient({
   retryDeadlines = memoryRetryDeadlines(),
   isRetryOwnerActive = () => true,
   canReadPullRequest = () => true,
-  reviewWrites = false,
 }: {
   clientId: string;
   privateKey: string;
@@ -182,7 +173,6 @@ export function createGitHubAppClient({
   retryDeadlines?: GitHubRetryDeadlines;
   isRetryOwnerActive?: (key: string) => boolean;
   canReadPullRequest?: (target: GitHubRepository, pullRequest: number) => boolean;
-  reviewWrites?: boolean;
 }) {
   const key = createPrivateKey(privateKey);
   if (key.asymmetricKeyType !== "rsa") throw new Error("GitHub App requires an RSA private key.");
@@ -403,7 +393,7 @@ export function createGitHubAppClient({
         drainSignal,
         body: JSON.stringify({
           repositories: [target.repository.split("/")[1]],
-          permissions: reviewWrites ? { ...permissions, pull_requests: "write" } : permissions,
+          permissions,
         }),
       },
       appJwt(),
@@ -423,16 +413,6 @@ export function createGitHubAppClient({
   return {
     completeReconciliation(target: GitHubRepository, pullRequest: number): void {
       clearSecondaryAttempts(now(), (key) => belongsToReconciliation(key, target, pullRequest));
-    },
-
-    async readAppBot(target: GitHubRepository): Promise<string> {
-      const response = await request(target, { path: "/app" }, appJwt());
-      if (response.status !== 200)
-        throw new Error(`GitHub App identity lookup failed (HTTP ${response.status}).`);
-      const slug = object(await readJson(response))?.slug;
-      if (typeof slug !== "string" || !/^[a-z0-9-]+$/i.test(slug))
-        throw new Error("GitHub returned an invalid App slug.");
-      return `${slug.toLowerCase()}[bot]`;
     },
 
     readReviewThread(
@@ -503,57 +483,6 @@ export function createGitHubAppClient({
           after = pageInfo.endCursor;
         }
         throw new Error("GitHub review thread pagination limit exceeded.");
-      });
-    },
-
-    postReviewComment(
-      target: GitHubRepository & { pullRequest: number },
-      parentId: number | null,
-      body: Record<string, unknown>,
-    ): Promise<unknown> {
-      if (!reviewWrites)
-        throw new Error("Review publication requires a write-enabled GitHub client.");
-      const comments = `/repos/${target.repository}/pulls/${target.pullRequest}/comments`;
-      const path = parentId === null ? comments : `${comments}/${parentId}/replies`;
-      return queueRead(target.installationId, async () => {
-        const cacheKey = `${target.installationId}:${target.repository}`;
-        let token: Token;
-        try {
-          checkRetryDeadline(pullRequestRetryKey(target, target.pullRequest));
-          token = await tokenFor(target, cacheKey, target.pullRequest);
-        } catch (cause) {
-          // No comment request was sent while checking the deadline or fetching its token.
-          throw new GitHubWriteRejected(
-            cause instanceof Error ? cause.message : "GitHub review publication preflight failed.",
-            { cause },
-          );
-        }
-        let response: Response;
-        try {
-          response = await request(
-            target,
-            {
-              path,
-              method: "POST",
-              body: JSON.stringify(body),
-              reconcilePullRequest: target.pullRequest,
-            },
-            token.value,
-          );
-        } catch (cause) {
-          // These errors prove either a local refusal or a remote rate-limit rejection.
-          if (cause instanceof GitHubRateLimitError || cause instanceof GitHubAuthenticationError)
-            throw new GitHubWriteRejected(cause.message, { cause });
-          throw cause;
-        }
-        if (response.status === 401) tokens.delete(cacheKey);
-        if ([400, 401, 403, 404, 422].includes(response.status))
-          throw new GitHubWriteRejected(
-            `GitHub rejected the review comment (HTTP ${response.status}).`,
-          );
-        if (response.status !== 201)
-          throw new Error(`GitHub review comment outcome is unknown (HTTP ${response.status}).`);
-        return readJson(response);
       });
     },
 

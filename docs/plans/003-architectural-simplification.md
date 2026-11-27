@@ -47,13 +47,24 @@ The A2 baseline records sessions separately from execution attempts. It records 
 
 **Gate before long-lived Codex dispatch.** The real SDK and an offline child reproduce the uncaught stdin `EPIPE` on the pinned and latest stable versions tested. Keep standalone invocation for A3. Before running the adapter within a long-lived controller, verify a supported SDK release handles the early-exit fixture in process and retains conservative outcomes. A separate option is to keep SDK execution in a supervised process and verify in the selected execution mechanism that it confines the crash, correlates durable intent and results, and holds unresolved claims without replay after process loss. Evaluate that option when selecting the Phase C mechanism. The current standalone process establishes local containment. Long-lived integration remains gated. [Deferred finding from PR #26](https://github.com/cellgraph/switchyard/pull/26#discussion_r4711789830)
 
-### Phase B — Replace delivery processing with read-only GitHub reconciliation
+### Phase B — Establish read-only GitHub reconciliation
 
-- Keep the signature and request-boundary handling in `src/webhook.ts`, GitHub App authentication and useful read/error handling in `src/github-app.ts` and `src/github-api.ts`, and the exact-head recheck in `src/reconcile.ts`. Add enabled-repository discovery and lifecycle/eligibility reads. Consolidate `src/controller.ts`, `src/unattended.ts` and `src/main.ts` around the same reconciliation path. Acknowledge valid notifications promptly and coalesce work in memory as needed.
-- Remove the SQLite delivery inbox and its claim, retry and replay paths in `src/store.ts`. Update the fresh-database baseline and coverage for the remaining stores. Keep durable workflows, execution attempts and explicit initiation requests. Use transactional workflow decisions and execution claims to prevent duplicate dispatch.
-- Remove `src/codex-review.ts` and its automatic-review marker tests and fixtures where they only cover that integration. Delete `src/review-publications.ts`, retired `src/review-command.ts` paths and GitHub App content-write methods. Preserve useful review and finding identity concepts in `src/review.ts` and `src/review-store.ts`; replace stored review text and sync state with structured metadata and GitHub references. Reuse check and webhook fixtures that still exercise supported behavior.
+#### B1 — Read-only GitHub boundary and legacy review removal
 
-**Acceptance.** Invalid signatures are rejected. Startup, webhook, periodic and operator reconciliation converge on the same GitHub state. Tests demonstrate recovery from a missed webhook, deduplication under duplicate or out-of-order signals, eligible discovery regardless of author and correct handling of draft, fork, closed and merged PRs. A stale observation cannot advance the workflow. The App observes PRs, checks and referenced evidence with read-only repository access. Keep repository writes with the agents.
+Remove automatic Codex marker ingestion and controller-owned review and disposition publication before redesigning reconciliation. This removes the obsolete review source before expanding observation to repository-level discovery.
+
+- Remove the Codex parser and import paths, publication and retry state, and the review start, finish, action and sync commands. Keep local inspection of structured review references.
+- Scope installation tokens to one repository with Pull requests, Checks and Commit statuses read. Keep authentication, review/comment/thread reads, PR lifecycle and exact-head checks. Publication belongs to native agents using their own external identities.
+- Use a fresh SQLite baseline containing review identity, reviewed SHA, completion metadata, finding references and dispositions with their published reasoning and deferred issue references. Keep substantive content on GitHub. Corroboration and handoff policy remain future work.
+- Keep explicitly configured PR targets and the existing startup, webhook, polling and manual entry points. Keep observation generations, final SHA checks, workflow history, operator stops and closure/reopen behavior. Passing checks and stored references alone leave the workflow awaiting review.
+
+**Acceptance.** Offline tests exercise read-only token requests, lifecycle and exact-head CI observation without automatic ingestion, structured evidence persistence, fail-closed readiness, superseded observations and incompatible database rejection. The existing App and deployment are outside this increment. See the [App permission requirements](../github-app.md#register-and-install-the-app).
+
+#### B2 — Discovery and transient reconciliation signals
+
+Keep signature validation and request handling in `src/webhook.ts`. Acknowledge authenticated signals promptly and coalesce work in memory as needed. Consolidate startup, webhook, periodic and operator reconciliation through one path. Discover open, non-draft, same-repository PRs in explicitly enabled repositories regardless of author. Read current GitHub lifecycle and eligibility, including closures, merges and reopens. Replace the SQLite delivery inbox and its claim, retry and replay paths. Preserve workflow history, execution attempts, exact-head checks, retry deadlines and durable operator stops.
+
+**Acceptance.** Invalid signatures are rejected. Startup, webhook, periodic and operator reconciliation converge on authoritative GitHub state after missed, duplicate or out-of-order signals. Tests cover author-independent discovery, draft and fork exclusion, and lifecycle changes. Superseded observations cannot advance the workflow.
 
 ### Phase C — Investigate Rex, then implement explicit remote placement
 
@@ -68,6 +79,8 @@ Introduce named agent configurations as concrete placement and role needs emerge
 ### Phase D — Complete the PR workflow, CLI and cutover
 
 Implement the workflow above with the native adapters and read-only reconciler. Use role-specific prompts and response schemas. Treat GitHub content as untrusted input. Keep evidence validation and PR policy in the workflow, away from runtime adapters. Keep attention requests in workflow state with the reason and the input needed.
+
+**Gate before production GraphQL thread reads.** Reassess whether the thread lookup is needed once Phase D establishes concrete corroboration requirements. Before using it for production corroboration, refresh rejected installation credentials once and recognize throttling in GraphQL error envelopes and response headers, including HTTP 200 responses. Track GraphQL's primary budget separately from REST and share the secondary cooldown where applicable. Verify credential recovery and both throttling cases with offline fixtures. [Deferred finding from PR #28](https://github.com/cellgraph/switchyard/pull/28#discussion_r4714855070)
 
 Provide a CLI for humans and agents to list and inspect workflows, filter for attention, explicitly initiate, record direction, authorize additional execution, resume and stop. Supply machine-readable output where useful and document commands and their effects. Defer MCP until a concrete access need arises. Investigate proactive notification at deployment; it is independent of foundational work. Any future shared attention service belongs outside Switchyard. OpenClaw, Clawfeil and messaging bridges are outside the application's dependencies.
 

@@ -13,7 +13,6 @@ import { WorkflowStore } from "../src/store.ts";
 import { createWebhookServer } from "../src/webhook.ts";
 import type { CheckEvidence } from "../src/workflow.ts";
 import { crashAfterSession } from "./fixtures/execution.ts";
-import codexReview from "./fixtures/codex-pr51.json" with { type: "json" };
 
 type Fixture = { id: string; event: string; payload: Record<string, unknown> };
 const fixtures = JSON.parse(
@@ -61,11 +60,6 @@ beforeEach(async () => {
     completeReconciliation: vi.fn(),
     readPullRequest: vi.fn(async () => ({ ...state })),
     readChecks: vi.fn(async (_target, sha) => [{ name: "CI", sha, outcome: checkOutcome }]),
-    readReviewInputs: vi.fn(async () => ({
-      reviews: [{ state: "APPROVED", commit_id: state.headSha }],
-      reviewComments: [],
-      issueComments: [{ body: "all clean", updated_at: "2026-01-01T00:00:00Z" }],
-    })),
   };
   await startReceiver();
 });
@@ -169,10 +163,6 @@ describe("GitHub webhook intake and reconciliation", () => {
     await send("opened");
     await runPass();
     const id = workflow()!.id;
-    store.transition(id, {
-      type: "review_received",
-      evidence: { sha: headA, outcome: "completed_clean" },
-    });
     state = { state: "closed", headSha: headB };
     await send("closed");
     await runPass();
@@ -180,14 +170,13 @@ describe("GitHub webhook intake and reconciliation", () => {
       state: "stopped",
       closedByGitHub: true,
       headSha: headB,
-      review: null,
       checks: [],
     });
 
     state = { state: "open", headSha: headB };
     await send("reopened");
     await runPass();
-    expect(workflow()).toMatchObject({ state: "awaiting_review", headSha: headB, review: null });
+    expect(workflow()).toMatchObject({ state: "awaiting_review", headSha: headB });
     expect(workflow()?.closedByGitHub).toBeUndefined();
 
     const transitions = store.transitions(id);
@@ -201,7 +190,7 @@ describe("GitHub webhook intake and reconciliation", () => {
   });
 
   it.each(["review", "reviewComment", "issueComment", "check", "suite", "status"])(
-    "reads current reviews and exact-head checks for %s without deriving a verdict",
+    "uses %s as a signal to read the PR and its exact-head checks",
     async (event) => {
       const { runPass } = controller();
       await runPass();
@@ -210,33 +199,50 @@ describe("GitHub webhook intake and reconciliation", () => {
       vi.clearAllMocks();
       expect((await send(event)).status).toBe(202);
       await runPass();
-      expect(github.readReviewInputs).toHaveBeenCalledWith(target, undefined);
       expect(github.readChecks).toHaveBeenCalledWith(target, headB, undefined);
       expect(workflow()).toMatchObject({
         headSha: headB,
         state: "awaiting_review",
-        review: null,
         requiredChecks: null,
         checks: [{ name: "CI", sha: headB, outcome: "failed" }],
       });
     },
   );
 
-  it("converges on durable review evidence after a summary edit and a poll", async () => {
-    const { runPass } = controller(1000);
-    await runPass();
-    vi.mocked(github.readReviewInputs).mockResolvedValue(codexReview);
-    const payload = { ...fixtures.issueComment!.payload, action: "edited" };
-    expect((await send("issueComment", { body: JSON.stringify(payload) })).status).toBe(202);
-    await runPass();
-    const captured = store.reviews().inspect(workflow()!.id);
-    expect(captured).toMatchObject({
-      projectedReview: { sha: headA, outcome: "completed_clean", runId: expect.any(String) },
-      runs: [{ status: "completed", findings: [] }],
+  it("ignores a legacy Codex completion marker in a signed webhook, including on a later poll", async () => {
+    const reconcile = createReconciler(store, github, () => ["CI"]);
+    const { runPass } = createController({
+      store,
+      targets: [target],
+      reconcile,
+      reportError,
+      reconcileIntervalMs: 1000,
+      now: () => now,
     });
+    const payload = {
+      ...fixtures.issueComment!.payload,
+      action: "edited",
+      comment: {
+        user: { login: "chatgpt-codex-connector[bot]" },
+        body: `<!-- codex-review-state:v1
+${JSON.stringify({ code_review: { commit_sha: headA, status: "completed", has_any_findings: false, has_unresolved_findings: false } })}
+-->`,
+      },
+    };
+    expect((await send("issueComment", { body: JSON.stringify(payload) })).status).toBe(202);
+    expect(store.pendingDeliveries()[0]?.payload).toEqual({
+      githubWebhookVersion: 1,
+      hint: target,
+    });
+    await runPass();
     now += 1000;
     await runPass();
-    expect(store.reviews().inspect(workflow()!.id)).toEqual(captured);
+    expect(store.reviews().list(workflow()!.id)).toEqual([]);
+    expect(workflow()).toMatchObject({
+      state: "awaiting_review",
+      requiredChecks: ["CI"],
+      checks: [{ name: "CI", sha: headA, outcome: "passed" }],
+    });
   });
 
   it("ignores ordinary issues, untracked PRs, and unexpected installations", async () => {
@@ -339,24 +345,22 @@ describe("GitHub webhook intake and reconciliation", () => {
   it("discards a snapshot when the PR changes during the API reads", async () => {
     const { runPass } = controller();
     await runPass();
-    vi.mocked(github.readReviewInputs).mockImplementationOnce(async () => {
+    vi.mocked(github.readChecks).mockImplementationOnce(async () => {
       state.headSha = headB;
-      return { reviews: [], reviewComments: [], issueComments: [] };
+      return [{ name: "CI", sha: headA, outcome: "passed" }];
     });
     await send("review");
     expect(await runPass()).toBe(false);
-    expect(workflow()).toMatchObject({ headSha: headB, checks: [], review: null });
+    expect(workflow()).toMatchObject({ headSha: headB, checks: [] });
     expect(store.deliveryStatus(fixtures.review!.id)?.error).toContain("head changed");
   });
 
   it("keeps newer failing CI when a passing observation of the same head finishes late", async () => {
-    const sha = codexReview.clean;
-    state.headSha = sha;
-    vi.mocked(github.readReviewInputs).mockResolvedValue(codexReview);
+    const sha = headA;
     const requiredChecks = () => ["CI"];
     const reconcile = createReconciler(store, github, requiredChecks);
     await reconcile(target);
-    expect(workflow()?.state).toBe("ready_for_human");
+    expect(workflow()?.checks).toEqual([{ name: "CI", sha: headA, outcome: "passed" }]);
 
     const other = new WorkflowStore(dbPath);
     const reachedFinalRead = Promise.withResolvers<void>();
@@ -385,7 +389,6 @@ describe("GitHub webhook intake and reconciliation", () => {
       }
       expect(workflow()).toMatchObject({
         headSha: sha,
-        review: { sha, outcome: "completed_clean" },
         checks: [{ name: "CI", sha, outcome: "failed" }],
         state: "awaiting_review",
       });
@@ -449,27 +452,23 @@ describe("GitHub webhook intake and reconciliation", () => {
     });
   });
 
-  it("fails closed when a review input read fails for a previously ready head", async () => {
-    const { runPass } = controller();
-    await runPass();
-    const id = workflow()!.id;
-    store.transition(id, {
-      type: "review_received",
-      evidence: { sha: headA, outcome: "completed_clean" },
-    });
-    store.transition(id, {
-      type: "checks_received",
-      configuredNames: ["CI"],
-      evidence: [{ name: "CI", sha: headA, outcome: "passed" }],
-    });
-    expect(workflow()?.state).toBe("ready_for_human");
-    vi.mocked(github.readReviewInputs).mockRejectedValueOnce(
-      new Error("Review inputs unavailable"),
-    );
-    await send("issueComment");
-    expect(await runPass()).toBe(false);
-    expect(workflow()).toMatchObject({ state: "awaiting_review", headSha: headA, checks: [] });
-  });
+  it.each(["CI", "final head"] as const)(
+    "clears current CI evidence when the %s read fails",
+    async (read) => {
+      const { runPass } = controller();
+      await runPass();
+      expect(workflow()?.checks).toEqual([{ name: "CI", sha: headA, outcome: "passed" }]);
+      if (read === "CI")
+        vi.mocked(github.readChecks).mockRejectedValueOnce(new Error("CI unavailable"));
+      else
+        vi.mocked(github.readPullRequest)
+          .mockResolvedValueOnce({ ...state })
+          .mockRejectedValueOnce(new Error("Final head unavailable"));
+      await send("check");
+      expect(await runPass()).toBe(false);
+      expect(workflow()).toMatchObject({ state: "awaiting_review", headSha: headA, checks: [] });
+    },
+  );
 
   it("reconciles pending and interrupted linked and unlinked deliveries after restart", async () => {
     await controller().runPass();
@@ -514,7 +513,6 @@ describe("GitHub webhook intake and reconciliation", () => {
     expect(workflow()).toMatchObject({
       headSha: headB,
       state: "awaiting_review",
-      review: null,
     });
     for (const id of deliveryIds)
       expect(store.deliveryStatus(id)).toMatchObject({

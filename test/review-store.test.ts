@@ -1,22 +1,25 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WorkflowStore } from "../src/store.ts";
-import { workerStatus } from "../src/unattended.ts";
-import type { WorkflowCommand } from "../src/workflow.ts";
-import {
-  clean,
-  createWorkflow,
-  finding,
-  head,
-  nextHead,
-  reviewStart,
-  target,
+import type { FindingDisposition, ReviewMetadata } from "../src/review.ts";
+
+const workflowId = "owner/repo#7";
+const head = "a".repeat(40);
+const nextHead = "b".repeat(40);
+const completedAt = "2026-01-01T00:00:00.000Z";
+const review = {
+  id: "review-1",
   workflowId,
-} from "./fixtures/review.ts";
+  headSha: head,
+  githubReviewId: 101,
+  outcome: "findings",
+  completedAt,
+  findingCommentIds: [201, 202, 203, 204, 205, 206],
+} satisfies ReviewMetadata;
 
 let directory: string;
 let path: string;
@@ -25,14 +28,22 @@ beforeEach(() => {
   directory = mkdtempSync(join(tmpdir(), "switchyard-review-"));
   path = join(directory, "switchyard.sqlite");
   store = new WorkflowStore(path);
-  createWorkflow(store);
+  store.createWorkflow({
+    id: workflowId,
+    identity: { repository: "owner/repo", pullRequest: 7 },
+    state: "awaiting_review",
+    headSha: head,
+    requiredChecks: null,
+    checks: [],
+    escalationReason: null,
+  });
 });
 afterEach(() => {
   store.close();
   rmSync(directory, { recursive: true, force: true });
 });
 
-describe("durable review runs", () => {
+describe("fresh database and durable review references", () => {
   it("refuses an earlier schema without modifying it", () => {
     const legacyPath = join(directory, "legacy.sqlite");
     const legacySchema = `
@@ -53,22 +64,47 @@ describe("durable review runs", () => {
   it("sets both identity and version for a fresh database", () => {
     using raw = new DatabaseSync(path, { readOnly: true });
     expect(raw.prepare("PRAGMA application_id").get()?.application_id).toBe(0x53575944);
-    expect(raw.prepare("PRAGMA user_version").get()?.user_version).toBe(17);
+    expect(raw.prepare("PRAGMA user_version").get()?.user_version).toBe(18);
+    const tables = raw
+      .prepare("SELECT name FROM sqlite_schema WHERE type='table'")
+      .all()
+      .map((row) => row.name);
+    expect(tables).toEqual(
+      expect.arrayContaining([
+        "workflows",
+        "transitions",
+        "deliveries",
+        "agent_sessions",
+        "agent_executions",
+        "check_snapshots",
+        "review_runs",
+        "review_findings",
+        "github_rate_limits",
+      ]),
+    );
+    for (const obsolete of ["review_snapshots", "review_publications", "finding_actions"])
+      expect(tables).not.toContain(obsolete);
+    expect(
+      raw
+        .prepare("PRAGMA table_info(workflows)")
+        .all()
+        .map((row) => row.name),
+    ).not.toContain("review");
   });
 
   it.each([
     [
       "same version without an application ID",
-      "PRAGMA user_version = 17; CREATE TABLE data (value TEXT);",
+      "PRAGMA user_version = 18; CREATE TABLE data (value TEXT);",
     ],
     [
       "same version with a foreign application ID",
-      "PRAGMA application_id = 42; PRAGMA user_version = 17; CREATE TABLE data (value TEXT);",
+      "PRAGMA application_id = 42; PRAGMA user_version = 18; CREATE TABLE data (value TEXT);",
     ],
     ["foreign application ID on an empty schema", "PRAGMA application_id = 42;"],
     [
       "Switchyard identity with an unsupported version",
-      "PRAGMA application_id = 0x53575944; PRAGMA user_version = 16;",
+      "PRAGMA application_id = 0x53575944; PRAGMA user_version = 17;",
     ],
   ])("rejects %s without modifying the database", (_scenario, setup) => {
     const foreignPath = join(directory, "foreign.sqlite");
@@ -91,7 +127,7 @@ describe("durable review runs", () => {
       `
         import { DatabaseSync } from "node:sqlite";
         const db = new DatabaseSync(process.argv[1]);
-        db.exec("PRAGMA user_version = 17; PRAGMA application_id = 42; CREATE TABLE data (value TEXT)");
+        db.exec("PRAGMA user_version = 18; PRAGMA application_id = 42; CREATE TABLE data (value TEXT)");
         db.exec("PRAGMA journal_mode = WAL; INSERT INTO data VALUES ('saved')");
         process.kill(process.pid, "SIGKILL");
       `,
@@ -109,356 +145,209 @@ describe("durable review runs", () => {
     expect(readdirSync(directory)).toEqual(files);
   });
 
-  it("distinguishes a running review from an explicitly clean review after restart", () => {
-    const start = store.reviews().start(reviewStart);
-    expect(store.reviews().start(reviewStart)).toEqual(start);
-    expect(() => store.reviews().start({ ...reviewStart, purpose: "different" })).toThrow(
-      /different request/,
+  it("persists review and finding references and dispositions across connections and restart", () => {
+    const reviews = store.reviews();
+    const reasoning = { kind: "review_comment", id: 701 } as const;
+    const dispositions: FindingDisposition[] = [
+      { decision: "accept", reasoning },
+      { decision: "accept", reasoning, claimedResolvingHeadSha: nextHead },
+      { decision: "reject", reasoning },
+      { decision: "escalate", reasoning: { kind: "issue_comment", id: 702 } },
+      { decision: "defer", reasoning, issue: { repository: "owner/repo", number: 8 } },
+    ];
+    reviews.record(review);
+    for (const [index, disposition] of dispositions.entries()) {
+      const withExtraFields = { ...disposition, body: "Substantive reasoning belongs on GitHub" };
+      reviews.setDisposition(review.id, review.findingCommentIds[index]!, withExtraFields, null);
+    }
+    reviews.record({ ...review, findingCommentIds: [...review.findingCommentIds].reverse() });
+    expect(() => reviews.record({ ...review, headSha: nextHead })).toThrow(/different metadata/);
+    expect(() => reviews.setDisposition(review.id, 999, dispositions[0]!, null)).toThrow(
+      /does not exist/,
     );
-    expect(store.reviews().inspect(workflowId).runs[0]).toMatchObject({
-      status: "running",
-      completed_at: null,
-      findings: [],
-    });
-    expect(store.getWorkflow(workflowId)?.review?.outcome).toBe("in_progress");
 
     store.close();
     store = new WorkflowStore(path);
-    store.recover();
-    expect(store.getWorkflow(workflowId)?.state).toBe("review_running");
-    expect(() => store.reviews().finish(start.id, { ...clean, headSha: nextHead })).toThrow(
-      /original reviewed head/,
+    const { findingCommentIds, ...row } = review;
+    expect(store.reviews().list(workflowId, head)).toEqual([
+      {
+        ...row,
+        findings: findingCommentIds.map((githubCommentId, index) => ({
+          githubCommentId,
+          disposition: dispositions[index] ?? null,
+        })),
+      },
+    ]);
+    using raw = new DatabaseSync(path, { readOnly: true });
+    expect(JSON.stringify(raw.prepare("SELECT * FROM review_findings").all())).not.toContain(
+      "Substantive reasoning",
     );
-    const result = store.reviews().finish(start.id, clean);
-    expect(store.reviews().finish(start.id, clean)).toEqual(result);
-    expect(() => store.reviews().finish(start.id, { ...clean, findings: [finding] })).toThrow(
-      /different outcome/,
-    );
-    expect(store.getWorkflow(workflowId)?.review).toEqual({
-      sha: head,
-      outcome: "completed_clean",
-      runId: reviewStart.id,
-    });
-    expect(store.getWorkflow(workflowId)?.state).toBe("awaiting_review");
-    store.transition(workflowId, {
-      type: "checks_received",
-      evidence: [{ name: "CI", sha: head, outcome: "passed" }],
-      configuredNames: ["CI"],
-    });
-    expect(store.getWorkflow(workflowId)?.state).toBe("ready_for_human");
   });
 
-  it.each(["failed", "interrupted", "unknown"])(
-    "keeps a recorded %s outcome outside the clean gate",
-    (status) => {
+  it("rejects a second owner for a finding within the workflow across heads and rolls back the review", () => {
+    const reviews = store.reviews();
+    reviews.record(review);
+    store.transition(workflowId, { type: "head_changed", sha: nextHead });
+    const nextReview = {
+      ...review,
+      id: "review-2",
+      headSha: nextHead,
+      githubReviewId: 102,
+      findingCommentIds: [200, 201],
+    };
+    expect(() => reviews.record(nextReview)).toThrow(
+      /Finding 201 already belongs to review review-1/,
+    );
+    expect(reviews.list(workflowId, nextHead)).toEqual([]);
+    reviews.record({ ...nextReview, findingCommentIds: [200] });
+    reviews.record(review);
+    expect(
+      reviews.list(workflowId, head)[0]?.findings.map((finding) => finding.githubCommentId),
+    ).toEqual(review.findingCommentIds);
+    expect(reviews.list(workflowId, nextHead)[0]?.findings).toEqual([
+      { githubCommentId: 200, disposition: null },
+    ]);
+
+    const otherId = "owner/repo#8";
+    store.createWorkflow({
+      ...store.getWorkflow(workflowId)!,
+      id: otherId,
+      identity: { repository: "owner/repo", pullRequest: 8 },
+    });
+    reviews.record({ ...review, id: "other-review", workflowId: otherId });
+    expect(reviews.list(otherId)).toHaveLength(1);
+  });
+
+  it("guards replacements across connections and preserves a claimed resolving SHA on replay", () => {
+    const reviews = store.reviews();
+    reviews.record(review);
+    const other = new WorkflowStore(path);
+    try {
+      const concurrentReviews = other.reviews();
+      const reasoning = { kind: "review_comment", id: 701 } as const;
+      const accept = { decision: "accept", reasoning } satisfies FindingDisposition;
+      const resolving = { ...accept, claimedResolvingHeadSha: nextHead };
+      const reject = {
+        decision: "reject",
+        reasoning: { ...reasoning, id: 702 },
+      } satisfies FindingDisposition;
+      const readDisposition = () => reviews.list(workflowId)[0]!.findings[0]!.disposition;
+
+      reviews.setDisposition(review.id, 201, accept, null);
+      concurrentReviews.setDisposition(review.id, 201, resolving, accept);
+      // The original expected value is stale, but the requested metadata is already stored.
+      reviews.setDisposition(
+        review.id,
+        201,
+        { ...resolving, claimedResolvingHeadSha: nextHead.toUpperCase() },
+        accept,
+      );
+      expect(() => reviews.setDisposition(review.id, 201, accept, null)).toThrow(
+        /expected prior value/,
+      );
+      expect(() => reviews.setDisposition(review.id, 201, reject, accept)).toThrow(
+        /expected prior value/,
+      );
+      expect(readDisposition()).toEqual(resolving);
+      reviews.setDisposition(review.id, 201, reject, {
+        ...resolving,
+        claimedResolvingHeadSha: nextHead.toUpperCase(),
+      });
+      concurrentReviews.setDisposition(review.id, 201, reject, resolving);
+      expect(readDisposition()).toEqual(reject);
+    } finally {
+      other.close();
+    }
+  });
+
+  it("keeps evidence by workflow and reviewed head without promoting an unverified result", () => {
+    const reviews = store.reviews();
+    const clean: ReviewMetadata = { ...review, outcome: "clean", findingCommentIds: [] };
+    const passCI = (sha: string) =>
       store.transition(workflowId, {
         type: "checks_received",
-        evidence: [{ name: "CI", sha: head, outcome: "passed" }],
         configuredNames: ["CI"],
+        evidence: [{ name: "CI", sha, outcome: "passed" }],
       });
-      store.reviews().start(reviewStart);
-      store
-        .reviews()
-        .finish(reviewStart.id, { headSha: head, status, error: "No confirmed result." });
-      expect(store.getWorkflow(workflowId)).toMatchObject({
-        state: "awaiting_review",
-        review: null,
-      });
-      expect(store.reviews().inspect(workflowId).runs[0]).toMatchObject({
-        status,
-        error: "No confirmed result.",
-        findings: [],
-      });
-      expect(store.reviews().start({ ...reviewStart, id: "review-2" }).status).toBe("running");
-    },
-  );
 
-  it.each([
-    { title: "" },
-    { explanation: "x".repeat(8001) },
-    { severity: "urgent" },
-    { path: "../worker.ts" },
-    { path: "/worker.ts" },
-    { path: "C:\\worker.ts" },
-    { path: null },
-    { startLine: 10 },
-    { endLine: -1 },
-    { endLine: 2 ** 32 },
-    { confidence: 1.1 },
-  ])("rejects invalid structured findings atomically (%j)", (invalid) => {
-    store.reviews().start(reviewStart);
-    expect(() =>
-      store
-        .reviews()
-        .finish(reviewStart.id, { ...clean, findings: [finding, { ...finding, ...invalid }] }),
-    ).toThrow();
-    expect(store.reviews().inspect(workflowId).runs[0]).toMatchObject({
-      status: "running",
-      findings: [],
+    passCI(head);
+    expect(store.getWorkflow(workflowId)?.state).toBe("awaiting_review");
+    reviews.record(clean);
+    passCI(head);
+    expect(store.getWorkflow(workflowId)?.state).toBe("awaiting_review");
+    store.transition(workflowId, { type: "head_changed", sha: nextHead });
+    passCI(nextHead);
+    expect(reviews.list(workflowId, nextHead)).toEqual([]);
+    expect(store.getWorkflow(workflowId)?.state).toBe("awaiting_review");
+
+    reviews.record({
+      ...review,
+      id: "review-2",
+      githubReviewId: null,
+      outcome: "incomplete",
+      completedAt: null,
+      findingCommentIds: [],
+      headSha: nextHead,
     });
+    store.transition(workflowId, { type: "github_pull_request", sha: nextHead, state: "closed" });
+    store.transition(workflowId, { type: "github_pull_request", sha: head, state: "open" });
+    passCI(head);
+    expect(store.getWorkflow(workflowId)?.state).toBe("awaiting_review");
+    expect(reviews.list(workflowId, head)).toMatchObject([{ id: review.id, outcome: "clean" }]);
+    expect(reviews.list(workflowId, nextHead)).toMatchObject([
+      { id: "review-2", outcome: "incomplete" },
+    ]);
+    expect(reviews.list("owner/repo#99")).toEqual([]);
   });
 
-  it("rejects absent finding arrays, missing evidence, and excessive and duplicate findings", () => {
-    store.reviews().start(reviewStart);
-    for (const input of [
-      { ...clean, findings: undefined },
-      { ...clean, evidence: "" },
-      { ...clean, findings: [finding, finding] },
-      { ...clean, findings: Array(101).fill(finding) },
-    ]) {
-      expect(() => store.reviews().finish(reviewStart.id, input)).toThrow();
-    }
-    expect(store.getWorkflow(workflowId)?.review?.outcome).toBe("in_progress");
-  });
-
-  it("leaves a contradictory terminal result open for a later confirmed outcome", () => {
+  it("rejects inconsistent completion and finding references", () => {
     const reviews = store.reviews();
-    reviews.start(reviewStart);
-    expect(() =>
-      reviews.finish(reviewStart.id, {
-        ...clean,
-        error: "Reviewer process timed out before returning a result.",
-      }),
-    ).toThrow(/completed review cannot attach an execution error/);
-    expect(() =>
-      reviews.finish(reviewStart.id, {
-        status: "unknown",
-        headSha: head,
-        error: "Timed out.",
-        evidence: "Finished.",
-      }),
-    ).toThrow(/completion evidence/);
-    expect(reviews.inspect(workflowId)).toMatchObject({
-      projectedReview: { outcome: "in_progress" },
-      runs: [{ status: "running", completed_at: null, findings: [] }],
-    });
-    expect(reviews.finish(reviewStart.id, clean).status).toBe("completed");
-    expect(store.getWorkflow(workflowId)?.review?.outcome).toBe("completed_clean");
+    for (const input of [
+      { ...review, headSha: "abc" },
+      { ...review, githubReviewId: null },
+      { ...review, completedAt: null },
+      { ...review, findingCommentIds: [] },
+      { ...review, findingCommentIds: [101, 101] },
+      { ...review, workflowId: "missing" },
+    ])
+      expect(() => reviews.record(input)).toThrow();
+    expect(reviews.list(workflowId)).toEqual([]);
   });
 
-  it("rolls back the run, first finding, and verdict if inserting a later finding fails", () => {
-    store.reviews().start(reviewStart);
+  it("rolls back the review and previous findings if any finding insert fails", () => {
     using raw = new DatabaseSync(path);
     raw.exec(`CREATE TRIGGER reject_test_finding BEFORE INSERT ON review_findings
-      WHEN json_extract(new.content,'$.title')='Cannot insert'
+      WHEN new.github_comment_id=202
       BEGIN SELECT RAISE(ABORT, 'Test persistence failure'); END;`);
-    expect(() =>
-      store.reviews().finish(reviewStart.id, {
-        ...clean,
-        findings: [finding, { ...finding, title: "Cannot insert" }],
-      }),
-    ).toThrow(/Test persistence failure/);
-    expect(store.reviews().inspect(workflowId).runs[0]).toMatchObject({
-      status: "running",
-      findings: [],
-    });
-    expect(store.getWorkflow(workflowId)?.review?.outcome).toBe("in_progress");
+    expect(() => store.reviews().record(review)).toThrow(/Test persistence failure/);
+    expect(store.reviews().list(workflowId)).toEqual([]);
+    expect(raw.prepare("SELECT * FROM review_findings").all()).toEqual([]);
   });
 
-  it("retains stale completion and findings without projecting them after an ABA head change", () => {
-    store.reviews().start(reviewStart);
-    store.transition(workflowId, { type: "head_changed", sha: nextHead });
-    expect(() => store.reviews().start({ ...reviewStart, id: "incorrect-head" })).toThrow(
-      /current head/,
-    );
-    store.reviews().start({ ...reviewStart, id: "review-2", headSha: nextHead });
-    store.reviews().finish("review-2", { ...clean, headSha: nextHead });
-    store.transition(workflowId, { type: "head_changed", sha: head });
-    store.reviews().finish(reviewStart.id, { ...clean, findings: [finding] });
-    expect(store.getWorkflow(workflowId)).toMatchObject({ review: null, state: "awaiting_review" });
-    expect(store.reviews().inspect(workflowId).runs).toMatchObject([
-      { head_sha: head, status: "completed", eligible: 0, findings: [{ content: finding }] },
-      { head_sha: nextHead, status: "completed", eligible: 0, findings: [] },
-    ]);
-    store.reviews().start({ ...reviewStart, id: "current-review" });
-    store.reviews().finish("current-review", clean);
-    store.transition(workflowId, {
-      type: "checks_received",
-      configuredNames: ["CI"],
-      evidence: [{ name: "CI", sha: head, outcome: "passed" }],
-    });
-    expect(store.getWorkflow(workflowId)?.state).toBe("ready_for_human");
-  });
-
-  it("blocks readiness on unresolved projected findings across a new head and restart", () => {
-    store.claimWorker([target], 60_000, new Date().toISOString());
-    const status = () => workerStatus(store).pullRequests[0];
+  it("inspects references from a separate CLI process with no GitHub credentials required", () => {
     const reviews = store.reviews();
-    reviews.start(reviewStart);
-    reviews.finish(reviewStart.id, { ...clean, findings: [finding] });
-    const findingId = reviews.inspect(workflowId).runs[0]!.findings[0]!.id;
-    expect(store.getWorkflow(workflowId)?.state).toBe("review_findings");
-
-    store.transition(workflowId, { type: "head_changed", sha: nextHead });
-    reviews.start({ ...reviewStart, id: "new-head", headSha: nextHead });
-    const passingChecks = {
-      type: "checks_received",
-      configuredNames: ["CI"],
-      evidence: [{ name: "CI", sha: nextHead, outcome: "passed" }],
-    } satisfies WorkflowCommand;
-    store.transition(workflowId, passingChecks);
-    reviews.finish("new-head", { ...clean, headSha: nextHead });
-    expect(store.getWorkflow(workflowId)?.state).toBe("awaiting_review");
-    store.close();
-    store = new WorkflowStore(path);
-    store.transition(workflowId, passingChecks);
-    expect(store.getWorkflow(workflowId)).toMatchObject({
-      state: "awaiting_review",
-      review: { sha: nextHead, outcome: "completed_clean" },
+    reviews.record(review);
+    const disposition = {
+      decision: "accept",
+      reasoning: { kind: "review_comment", id: 701 },
+      claimedResolvingHeadSha: nextHead,
+    } satisfies FindingDisposition;
+    reviews.setDisposition(review.id, 201, disposition, null);
+    const result = spawnSync(process.execPath, ["src/main.ts", "--review-status", workflowId], {
+      encoding: "utf8",
+      env: { SWITCHYARD_DB_PATH: path },
     });
-    expect(status()).toMatchObject({
-      state: "awaiting_review",
-      headSha: nextHead,
-      reviewOutcome: "completed_clean",
-      attention: "review_findings",
-      reason: expect.stringContaining("--review-status"),
-    });
-
-    const action = {
-      findingId,
-      headSha: nextHead,
-      actor: "operator",
-      rationale: "Inspected change",
-    };
-    store.reviews().act({ ...action, id: "accept", action: "accepted" });
-    expect(store.getWorkflow(workflowId)?.state).toBe("awaiting_review");
-    store.reviews().act({ ...action, id: "fixed", action: "fixed", previousActionId: "accept" });
-    expect(store.getWorkflow(workflowId)?.state).toBe("ready_for_human");
-    expect(status()).toMatchObject({ attention: "ready_for_human", reason: null });
-    store.reviews().act({ ...action, id: "reopen", action: "reopened", previousActionId: "fixed" });
-    expect(store.getWorkflow(workflowId)?.state).toBe("awaiting_review");
-    store.transition(workflowId, { type: "stop", reason: "Operator stopped tracking this PR." });
-    expect(status()).toMatchObject({
-      attention: "stopped",
-      reason: "Operator stopped tracking this PR.",
-    });
-  });
-
-  it("retains a result after escalation and leaves the workflow escalated", () => {
-    store.reviews().start(reviewStart);
-    store.transition(workflowId, { type: "escalate", reason: "Operator investigation" });
-    store.reviews().finish(reviewStart.id, { ...clean, findings: [finding] });
-    expect(store.reviews().inspect(workflowId)).toMatchObject({
-      state: "escalated",
-      projectedReview: { outcome: "in_progress" },
-      runs: [{ status: "completed", eligible: 0, findings: [{ content: finding }] }],
-    });
-  });
-
-  it("tracks independent dispositions, guarded updates, and resolution history", () => {
-    const reviews = store.reviews();
-    reviews.start(reviewStart);
-    reviews.finish(reviewStart.id, {
-      ...clean,
-      findings: [finding, { ...finding, title: "Preserve input" }],
-    });
-    const initial = reviews.inspect(workflowId);
-    const [first, second] = initial.runs[0]!.findings;
-    expect(initial.pendingDispositions).toEqual([first!.id, second!.id]);
-    expect(first!.id).not.toBe(second!.id);
-    const accept = {
-      id: "accept-first",
-      findingId: first!.id,
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      workflowId,
       headSha: head,
-      action: "accepted",
-      actor: "operator",
-      rationale: "Reproduced in tests.",
-    };
-    const accepted = reviews.act(accept);
-    expect(reviews.act(accept)).toEqual(accepted);
-    expect(() => reviews.act({ ...accept, rationale: "Changed" })).toThrow(/different decision/);
-    expect(() => reviews.act({ ...accept, id: "conflict", action: "deferred" })).toThrow(
-      /latest action ID/,
-    );
-    expect(() =>
-      reviews.act({ ...accept, id: "conflict", action: "deferred", previousActionId: accept.id }),
-    ).toThrow(/requires a resolution/);
-    expect(() =>
-      reviews.act({ ...accept, id: "invalid", action: "reopened", previousActionId: accept.id }),
-    ).toThrow(/current state/);
-    const defer = { ...accept, id: "defer-second", findingId: second!.id, action: "deferred" };
-    reviews.act(defer);
-    reviews.act({
-      ...defer,
-      id: "reject-second",
-      action: "rejected",
-      previousActionId: defer.id,
-      rationale: "The path is unreachable.",
-    });
-
-    store.transition(workflowId, { type: "head_changed", sha: nextHead });
-    expect(() =>
-      reviews.act({ ...accept, id: "fix-first", action: "fixed", previousActionId: accept.id }),
-    ).toThrow(/current workflow head/);
-    reviews.act({
-      ...accept,
-      id: "fix-first",
-      headSha: nextHead,
-      action: "fixed",
-      previousActionId: accept.id,
-      rationale: "Verified with test retry-7.",
-    });
-    expect(reviews.inspect(workflowId).actionableFindings).toEqual([]);
-    reviews.act({
-      ...accept,
-      id: "reopen-first",
-      headSha: nextHead,
-      action: "reopened",
-      previousActionId: "fix-first",
-      rationale: "Reproduced again.",
-    });
-    expect(reviews.inspect(workflowId).actionableFindings).toEqual([first!.id]);
-    reviews.act({
-      ...accept,
-      id: "supersede-first",
-      headSha: nextHead,
-      action: "superseded",
-      previousActionId: "reopen-first",
-      rationale: "Covered by a replacement finding.",
-    });
-    const final = reviews.inspect(workflowId);
-    expect(final.pendingDispositions).toEqual([]);
-    expect(final.actionableFindings).toEqual([]);
-    expect(final.runs[0]!.findings).toMatchObject([
-      {
-        id: first!.id,
-        state: "superseded",
-        disposition: { action: "accepted" },
-        history: [
-          { action: "accepted" },
-          { action: "fixed" },
-          { action: "reopened" },
-          { action: "superseded" },
-        ],
-      },
-      {
-        id: second!.id,
-        state: "open",
-        disposition: { action: "rejected" },
-        history: [{ action: "deferred" }, { action: "rejected" }],
-      },
-    ]);
-  });
-
-  it("records and inspects a run across separate CLI processes", () => {
-    const startPath = join(directory, "start.json");
-    const resultPath = join(directory, "result.json");
-    writeFileSync(startPath, JSON.stringify(reviewStart));
-    writeFileSync(resultPath, JSON.stringify(clean));
-    const cli = (...args: string[]) => {
-      const result = spawnSync(process.execPath, ["src/main.ts", ...args], {
-        encoding: "utf8",
-        env: { ...process.env, SWITCHYARD_DB_PATH: path },
-      });
-      expect(result.status, result.stderr).toBe(0);
-      return JSON.parse(result.stdout) as unknown;
-    };
-    expect(cli("--review-start", startPath)).toMatchObject({ status: "running" });
-    expect(cli("--review-finish", reviewStart.id, resultPath)).toMatchObject({
-      status: "completed",
-    });
-    expect(cli("--review-status", workflowId)).toMatchObject({
-      projectedReview: { outcome: "completed_clean" },
+      reviews: [
+        {
+          headSha: head,
+          githubReviewId: review.githubReviewId,
+          findings: expect.arrayContaining([{ githubCommentId: 201, disposition }]),
+        },
+      ],
     });
   });
 });

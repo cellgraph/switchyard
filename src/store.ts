@@ -5,12 +5,10 @@ import { pathToFileURL } from "node:url";
 import { agentSchema, createAgentStore } from "./agent-store.ts";
 import type { GitHubRateLimits, GitHubRateLimitState } from "./github-app.ts";
 import type { PullRequestTarget } from "./github-api.ts";
-import { createReviewPublications } from "./review-publications.ts";
 import { createReviewStore, reviewSchema } from "./review-store.ts";
 import {
   transitionWorkflow,
   type CheckEvidence,
-  type ReviewEvidence,
   type Workflow,
   type WorkflowCommand,
 } from "./workflow.ts";
@@ -21,7 +19,6 @@ type DeliveryRow = { delivery_id: string; payload: string; workflow_id: string |
 
 export type GitHubObservationWriter = {
   transition(id: string, command: WorkflowCommand): Workflow;
-  observeCodex: ReturnType<WorkflowStore["reviews"]>["observeCodex"];
 };
 
 type WorkerRecord = {
@@ -50,7 +47,7 @@ export function localProcessAlive(pid: number | null): boolean {
 }
 
 const applicationId = 0x53575944; // SWYD
-const schemaVersion = 17;
+const schemaVersion = 18;
 const unsupportedDatabase =
   "Unsupported Switchyard database identity or schema version. Use a fresh SWITCHYARD_DB_PATH for this implementation.";
 
@@ -66,7 +63,7 @@ const schema = `
   CREATE TABLE workflows (
     id TEXT PRIMARY KEY, repository TEXT NOT NULL, pull_request INTEGER NOT NULL,
     state TEXT NOT NULL, head_sha TEXT NOT NULL, required_checks TEXT,
-    review TEXT, checks TEXT NOT NULL DEFAULT '[]', closed_by_github INTEGER NOT NULL DEFAULT 0,
+    checks TEXT NOT NULL DEFAULT '[]', closed_by_github INTEGER NOT NULL DEFAULT 0,
     escalation_reason TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
     UNIQUE(repository, pull_request)
   );
@@ -82,10 +79,6 @@ const schema = `
   );
   CREATE INDEX deliveries_pending ON deliveries(status, received_at);
   CREATE INDEX deliveries_retry ON deliveries(status, retry_at);
-  CREATE TABLE review_snapshots (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id TEXT NOT NULL REFERENCES workflows(id),
-    sha TEXT NOT NULL, outcome TEXT NOT NULL, run_id TEXT REFERENCES review_runs(id), captured_at TEXT NOT NULL
-  );
   CREATE TABLE check_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id TEXT NOT NULL REFERENCES workflows(id),
     name TEXT NOT NULL, sha TEXT NOT NULL, outcome TEXT NOT NULL, captured_at TEXT NOT NULL
@@ -210,8 +203,8 @@ export class WorkflowStore {
     const now = new Date().toISOString();
     this.#db
       .prepare(
-        `INSERT INTO workflows (id, repository, pull_request, state, head_sha, required_checks, review, checks, escalation_reason, closed_by_github, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO workflows (id, repository, pull_request, state, head_sha, required_checks, checks, escalation_reason, closed_by_github, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         workflow.id,
@@ -220,7 +213,6 @@ export class WorkflowStore {
         workflow.state,
         workflow.headSha,
         JSON.stringify(workflow.requiredChecks),
-        JSON.stringify(workflow.review),
         JSON.stringify(workflow.checks),
         workflow.escalationReason,
         workflow.closedByGitHub ? 1 : 0,
@@ -248,20 +240,8 @@ export class WorkflowStore {
     return this.#transaction(() => this.#transition(id, command));
   }
 
-  reviewPublications() {
-    return createReviewPublications(this.#db, (run) => this.#transaction(run));
-  }
-
   reviews() {
-    return this.#reviews((run) => this.#transaction(run));
-  }
-
-  #reviews(transaction: <T>(run: () => T) => T) {
-    return createReviewStore(this.#db, {
-      transaction,
-      getWorkflow: (id) => this.getWorkflow(id),
-      transition: (id, command) => this.#transition(id, command),
-    });
+    return createReviewStore(this.#db, (run) => this.#transaction(run));
   }
 
   beginGitHubObservation(repository: string, pullRequest: number) {
@@ -287,7 +267,6 @@ export class WorkflowStore {
           if (latest?.generation !== generation) return false;
           run({
             transition: (id, command) => this.#transition(id, command),
-            observeCodex: this.#reviews((operation) => operation()).observeCodex,
           });
           return true;
         }),
@@ -301,23 +280,18 @@ export class WorkflowStore {
   #transition(id: string, command: WorkflowCommand): Workflow {
     const current = this.getWorkflow(id);
     if (!current) throw new Error(`Workflow ${id} does not exist.`);
-    const review = command.type === "review_received" ? command.evidence : current.review;
-    const hasBlockingFindings =
-      review?.outcome === "completed_clean" &&
-      this.#reviews((run) => run()).hasBlockingFindings(id);
-    const result = transitionWorkflow(current, command, hasBlockingFindings);
+    const result = transitionWorkflow(current, command);
     const w = result.workflow;
     if (JSON.stringify(w) === JSON.stringify(current)) return w;
     const now = new Date().toISOString();
     this.#db
       .prepare(
-        `UPDATE workflows SET state=?, head_sha=?, required_checks=?, review=?, checks=?, escalation_reason=?, closed_by_github=?, updated_at=? WHERE id=?`,
+        `UPDATE workflows SET state=?, head_sha=?, required_checks=?, checks=?, escalation_reason=?, closed_by_github=?, updated_at=? WHERE id=?`,
       )
       .run(
         w.state,
         w.headSha,
         JSON.stringify(w.requiredChecks),
-        JSON.stringify(w.review),
         JSON.stringify(w.checks),
         w.escalationReason,
         w.closedByGitHub ? 1 : 0,
@@ -329,22 +303,6 @@ export class WorkflowStore {
         "INSERT INTO transitions (workflow_id, from_state, to_state, reason, head_sha, created_at) VALUES (?, ?, ?, ?, ?, ?)",
       )
       .run(id, result.from, result.to, result.reason, result.headSha, now);
-    if (w.headSha !== current.headSha || w.state === "stopped" || w.state === "escalated")
-      this.#db
-        .prepare("UPDATE review_runs SET eligible=0 WHERE workflow_id=? AND eligible=1")
-        .run(id);
-    if (command.type === "review_received")
-      this.#db
-        .prepare(
-          "INSERT INTO review_snapshots (workflow_id, sha, outcome, run_id, captured_at) VALUES (?, ?, ?, ?, ?)",
-        )
-        .run(
-          id,
-          command.evidence.sha,
-          command.evidence.outcome,
-          command.evidence.runId ?? null,
-          now,
-        );
     if (command.type === "checks_received")
       for (const check of command.evidence)
         this.#db
@@ -542,7 +500,6 @@ function decodeWorkflow(row: Record<string, unknown>): Workflow {
     headSha: String(row.head_sha),
     requiredChecks:
       row.required_checks === null ? null : (JSON.parse(String(row.required_checks)) as string[]),
-    review: row.review === null ? null : (JSON.parse(String(row.review)) as ReviewEvidence),
     checks: JSON.parse(String(row.checks)) as CheckEvidence[],
     escalationReason: row.escalation_reason === null ? null : String(row.escalation_reason),
     ...(row.closed_by_github === 1 ? { closedByGitHub: true } : {}),
