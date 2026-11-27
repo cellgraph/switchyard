@@ -19,7 +19,7 @@ export type DispositionReference = {
 type IssueReference = { repository: string; number: number };
 
 export type FindingDisposition = { reasoning: DispositionReference } & (
-  | { decision: "accept"; resolvedHeadSha?: string }
+  | { decision: "accept"; claimedResolvingHeadSha?: string }
   | { decision: "reject" | "escalate" }
   | { decision: "defer"; issue: IssueReference }
 );

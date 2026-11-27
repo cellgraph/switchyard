@@ -37,4 +37,4 @@ A2 replaced the affected persistence alongside the native adapters because the e
 
 ### Review evidence
 
-A review row associates a workflow and exact commit with a native GitHub review ID and completion metadata. Finding rows reference native review comments and can record an accept, reject, defer or escalate disposition, a reference to the published reasoning, an issue reference for deferral and the resolving commit for an accepted finding. Substantive content lives on GitHub. B1 has no path that corroborates a review result or advances a PR to handoff. [Review evidence and inspection](reviews.md)
+A review row associates a workflow and exact commit with a native GitHub review ID and completion metadata. Finding rows reference native review comments and can record an accept, reject, defer or escalate disposition, a reference to the published reasoning, an issue reference for deferral and a claimed resolving SHA for an accepted finding. Substantive content lives on GitHub. B1 has no path that corroborates a review result or advances a PR to handoff. [Review evidence and inspection](reviews.md)

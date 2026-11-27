@@ -96,47 +96,48 @@ export function createReviewStore(db: DatabaseSync, transaction: <T>(run: () => 
         const insert = db.prepare(
           "INSERT INTO review_findings (review_id, github_comment_id) VALUES (?, ?)",
         );
-        for (const commentId of findingCommentIds) insert.run(id, commentId);
+        const owner = db.prepare(
+          `SELECT review_runs.id FROM review_findings
+           JOIN review_runs ON review_runs.id=review_findings.review_id
+           WHERE workflow_id=? AND github_comment_id=? LIMIT 1`,
+        );
+        for (const commentId of findingCommentIds) {
+          const existing = owner.get(workflowId, commentId);
+          if (existing)
+            throw new Error(
+              `Finding ${commentId} already belongs to review ${String(existing.id)} in workflow ${workflowId}.`,
+            );
+          insert.run(id, commentId);
+        }
       });
     },
 
-    setDisposition(reviewId: string, githubCommentId: number, input: FindingDisposition): void {
-      const { decision } = input;
-      const { kind, id } = input.reasoning;
-      if ((kind !== "review_comment" && kind !== "issue_comment") || !positiveInteger(id))
-        throw new Error("Invalid disposition reasoning reference.");
-      const reasoning = { kind, id };
-      let disposition: FindingDisposition;
-      switch (decision) {
-        case "accept": {
-          const resolvedHeadSha = commitSha(input.resolvedHeadSha);
-          if (input.resolvedHeadSha !== undefined && !resolvedHeadSha)
-            throw new Error("Finding resolution requires a full GitHub head SHA.");
-          disposition = { decision, reasoning, ...(resolvedHeadSha ? { resolvedHeadSha } : {}) };
-          break;
-        }
-        case "defer": {
-          const repository = repositoryName(input.issue.repository);
-          const number = input.issue.number;
-          if (!repository || !positiveInteger(number))
-            throw new Error("Deferral requires a GitHub issue reference.");
-          disposition = { decision, reasoning, issue: { repository, number } };
-          break;
-        }
-        case "reject":
-        case "escalate":
-          disposition = { decision, reasoning };
-          break;
-        default:
-          throw new Error("Invalid finding disposition.");
-      }
-      const result = db
-        .prepare(
+    setDisposition(
+      reviewId: string,
+      githubCommentId: number,
+      input: FindingDisposition,
+      expectedPrior: FindingDisposition | null,
+    ): void {
+      const next = JSON.stringify(normalizeDisposition(input));
+      const expected =
+        expectedPrior === null ? null : JSON.stringify(normalizeDisposition(expectedPrior));
+      transaction(() => {
+        const finding = db
+          .prepare(
+            "SELECT disposition FROM review_findings WHERE review_id=? AND github_comment_id=?",
+          )
+          .get(reviewId, githubCommentId);
+        if (!finding)
+          throw new Error(`Finding ${githubCommentId} does not exist in review ${reviewId}.`);
+        if (finding.disposition === next) return;
+        if (finding.disposition !== expected)
+          throw new Error(
+            `Disposition for finding ${githubCommentId} differs from the expected prior value.`,
+          );
+        db.prepare(
           "UPDATE review_findings SET disposition=? WHERE review_id=? AND github_comment_id=?",
-        )
-        .run(JSON.stringify(disposition), reviewId, githubCommentId);
-      if (!result.changes)
-        throw new Error(`Finding ${githubCommentId} does not exist in review ${reviewId}.`);
+        ).run(next, reviewId, githubCommentId);
+      });
     },
 
     list(workflowId: string, headSha?: string): Array<ReviewRow & { findings: ReviewFinding[] }> {
@@ -163,4 +164,36 @@ export function createReviewStore(db: DatabaseSync, transaction: <T>(run: () => 
       }));
     },
   };
+}
+
+function normalizeDisposition(input: FindingDisposition): FindingDisposition {
+  const { decision } = input;
+  const { kind, id } = input.reasoning;
+  if ((kind !== "review_comment" && kind !== "issue_comment") || !positiveInteger(id))
+    throw new Error("Invalid disposition reasoning reference.");
+  const reasoning = { kind, id };
+  switch (decision) {
+    case "accept": {
+      const claimedResolvingHeadSha = commitSha(input.claimedResolvingHeadSha);
+      if (input.claimedResolvingHeadSha !== undefined && !claimedResolvingHeadSha)
+        throw new Error("A claimed resolving head requires a full GitHub SHA.");
+      return {
+        decision,
+        reasoning,
+        ...(claimedResolvingHeadSha ? { claimedResolvingHeadSha } : {}),
+      };
+    }
+    case "defer": {
+      const repository = repositoryName(input.issue.repository);
+      const number = input.issue.number;
+      if (!repository || !positiveInteger(number))
+        throw new Error("Deferral requires a GitHub issue reference.");
+      return { decision, reasoning, issue: { repository, number } };
+    }
+    case "reject":
+    case "escalate":
+      return { decision, reasoning };
+    default:
+      throw new Error("Invalid finding disposition.");
+  }
 }

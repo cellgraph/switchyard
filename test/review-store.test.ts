@@ -150,7 +150,7 @@ describe("fresh database and durable review references", () => {
     const reasoning = { kind: "review_comment", id: 701 } as const;
     const dispositions: FindingDisposition[] = [
       { decision: "accept", reasoning },
-      { decision: "accept", reasoning, resolvedHeadSha: nextHead },
+      { decision: "accept", reasoning, claimedResolvingHeadSha: nextHead },
       { decision: "reject", reasoning },
       { decision: "escalate", reasoning: { kind: "issue_comment", id: 702 } },
       { decision: "defer", reasoning, issue: { repository: "owner/repo", number: 8 } },
@@ -158,11 +158,11 @@ describe("fresh database and durable review references", () => {
     reviews.record(review);
     for (const [index, disposition] of dispositions.entries()) {
       const withExtraFields = { ...disposition, body: "Substantive reasoning belongs on GitHub" };
-      reviews.setDisposition(review.id, review.findingCommentIds[index]!, withExtraFields);
+      reviews.setDisposition(review.id, review.findingCommentIds[index]!, withExtraFields, null);
     }
     reviews.record({ ...review, findingCommentIds: [...review.findingCommentIds].reverse() });
     expect(() => reviews.record({ ...review, headSha: nextHead })).toThrow(/different metadata/);
-    expect(() => reviews.setDisposition(review.id, 999, dispositions[0]!)).toThrow(
+    expect(() => reviews.setDisposition(review.id, 999, dispositions[0]!, null)).toThrow(
       /does not exist/,
     );
 
@@ -182,6 +182,82 @@ describe("fresh database and durable review references", () => {
     expect(JSON.stringify(raw.prepare("SELECT * FROM review_findings").all())).not.toContain(
       "Substantive reasoning",
     );
+  });
+
+  it("rejects a second owner for a finding within the workflow across heads and rolls back the review", () => {
+    const reviews = store.reviews();
+    reviews.record(review);
+    store.transition(workflowId, { type: "head_changed", sha: nextHead });
+    const nextReview = {
+      ...review,
+      id: "review-2",
+      headSha: nextHead,
+      githubReviewId: 102,
+      findingCommentIds: [200, 201],
+    };
+    expect(() => reviews.record(nextReview)).toThrow(
+      /Finding 201 already belongs to review review-1/,
+    );
+    expect(reviews.list(workflowId, nextHead)).toEqual([]);
+    reviews.record({ ...nextReview, findingCommentIds: [200] });
+    reviews.record(review);
+    expect(
+      reviews.list(workflowId, head)[0]?.findings.map((finding) => finding.githubCommentId),
+    ).toEqual(review.findingCommentIds);
+    expect(reviews.list(workflowId, nextHead)[0]?.findings).toEqual([
+      { githubCommentId: 200, disposition: null },
+    ]);
+
+    const otherId = "owner/repo#8";
+    store.createWorkflow({
+      ...store.getWorkflow(workflowId)!,
+      id: otherId,
+      identity: { repository: "owner/repo", pullRequest: 8 },
+    });
+    reviews.record({ ...review, id: "other-review", workflowId: otherId });
+    expect(reviews.list(otherId)).toHaveLength(1);
+  });
+
+  it("guards replacements across connections and preserves a claimed resolving SHA on replay", () => {
+    const reviews = store.reviews();
+    reviews.record(review);
+    const other = new WorkflowStore(path);
+    try {
+      const concurrentReviews = other.reviews();
+      const reasoning = { kind: "review_comment", id: 701 } as const;
+      const accept = { decision: "accept", reasoning } satisfies FindingDisposition;
+      const resolving = { ...accept, claimedResolvingHeadSha: nextHead };
+      const reject = {
+        decision: "reject",
+        reasoning: { ...reasoning, id: 702 },
+      } satisfies FindingDisposition;
+      const readDisposition = () => reviews.list(workflowId)[0]!.findings[0]!.disposition;
+
+      reviews.setDisposition(review.id, 201, accept, null);
+      concurrentReviews.setDisposition(review.id, 201, resolving, accept);
+      // The original expected value is stale, but the requested metadata is already stored.
+      reviews.setDisposition(
+        review.id,
+        201,
+        { ...resolving, claimedResolvingHeadSha: nextHead.toUpperCase() },
+        accept,
+      );
+      expect(() => reviews.setDisposition(review.id, 201, accept, null)).toThrow(
+        /expected prior value/,
+      );
+      expect(() => reviews.setDisposition(review.id, 201, reject, accept)).toThrow(
+        /expected prior value/,
+      );
+      expect(readDisposition()).toEqual(resolving);
+      reviews.setDisposition(review.id, 201, reject, {
+        ...resolving,
+        claimedResolvingHeadSha: nextHead.toUpperCase(),
+      });
+      concurrentReviews.setDisposition(review.id, 201, reject, resolving);
+      expect(readDisposition()).toEqual(reject);
+    } finally {
+      other.close();
+    }
   });
 
   it("keeps evidence by workflow and reviewed head without promoting an unverified result", () => {
@@ -249,7 +325,14 @@ describe("fresh database and durable review references", () => {
   });
 
   it("inspects references from a separate CLI process with no GitHub credentials required", () => {
-    store.reviews().record(review);
+    const reviews = store.reviews();
+    reviews.record(review);
+    const disposition = {
+      decision: "accept",
+      reasoning: { kind: "review_comment", id: 701 },
+      claimedResolvingHeadSha: nextHead,
+    } satisfies FindingDisposition;
+    reviews.setDisposition(review.id, 201, disposition, null);
     const result = spawnSync(process.execPath, ["src/main.ts", "--review-status", workflowId], {
       encoding: "utf8",
       env: { SWITCHYARD_DB_PATH: path },
@@ -262,7 +345,7 @@ describe("fresh database and durable review references", () => {
         {
           headSha: head,
           githubReviewId: review.githubReviewId,
-          findings: expect.arrayContaining([{ githubCommentId: 201, disposition: null }]),
+          findings: expect.arrayContaining([{ githubCommentId: 201, disposition }]),
         },
       ],
     });
