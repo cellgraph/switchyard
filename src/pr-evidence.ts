@@ -8,6 +8,7 @@ import {
   pullUrl,
   type Disposition,
   type PrAssignment,
+  type ReviewClaim,
 } from "./pr-assignments.ts";
 
 export type PublicationReader = {
@@ -59,7 +60,7 @@ function publishedSince(item: unknown, timestamp: string) {
   return Date.parse(item) >= Math.floor(Date.parse(timestamp) / 1000) * 1000;
 }
 
-export async function deferredIssueProof(
+async function deferredIssueProof(
   github: PublicationReader,
   target: PullRequestTarget,
   assignment: PrAssignment,
@@ -89,6 +90,110 @@ export async function deferredIssueProof(
   return issue.body;
 }
 
+function reviewPublication(
+  snapshot: PublicationSnapshot,
+  assignment: PrAssignment,
+  claim: ReviewClaim,
+) {
+  const review = snapshot.reviews.find((item) => item?.id === claim.reviewId);
+  const body = lines(review?.body);
+  if (
+    !review ||
+    !authored(review, assignment) ||
+    commitSha(review.commit_id) !== claim.headSha ||
+    !["COMMENTED", claim.outcome === "clean" ? "APPROVED" : "CHANGES_REQUESTED"].includes(
+      String(review.state),
+    ) ||
+    !publishedSince(review.submitted_at, assignment.createdAt) ||
+    body[0] !== `Review outcome: ${claim.outcome}`
+  )
+    return null;
+  return review;
+}
+
+function findingProof(
+  snapshot: PublicationSnapshot,
+  assignment: PrAssignment,
+  claim: ReviewClaim,
+  id: number,
+) {
+  const root = snapshot.comments.find((item) => item?.id === id);
+  if (
+    !root ||
+    root.pull_request_review_id !== claim.reviewId ||
+    root.in_reply_to_id != null ||
+    !authored(root, assignment) ||
+    commitSha(root.original_commit_id) !== claim.headSha ||
+    typeof root.body !== "string" ||
+    !root.body.trim()
+  )
+    return null;
+  return digest([root.body, root.path]);
+}
+
+function savedProof(assignment: PrAssignment) {
+  return assignment.proof?.startsWith("{") ? object(JSON.parse(assignment.proof)) : undefined;
+}
+
+export function verifiedOriginalFinding(
+  snapshot: PublicationSnapshot,
+  assignment: PrAssignment,
+  id: number,
+) {
+  const { claim } = assignment;
+  if (!claim || !("reviewId" in claim) || !claim.findingIds.includes(id)) return false;
+  const prior = savedProof(assignment);
+  const review = reviewPublication(snapshot, assignment, claim);
+  const original = findingProof(snapshot, assignment, claim, id);
+  return Boolean(
+    review &&
+    original &&
+    prior?.review === digest([review.body, review.state]) &&
+    object(prior?.findings)?.[id] === original,
+  );
+}
+
+async function dispositionProof(
+  github: PublicationReader,
+  target: PullRequestTarget,
+  snapshot: PublicationSnapshot,
+  assignment: PrAssignment,
+  disposition: Disposition,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const reply = snapshot.comments.find((item) => item?.id === disposition.replyId);
+  const body = lines(reply?.body);
+  if (
+    !reply ||
+    !authored(reply, assignment) ||
+    reply.in_reply_to_id !== disposition.findingId ||
+    !publishedSince(reply.created_at, assignment.createdAt) ||
+    body[0] !== `Decision: ${disposition.decision}` ||
+    !body.slice(1).some((line) => line && !/^https?:\/\//i.test(line))
+  )
+    return null;
+  let issueBody: unknown;
+  if (disposition.issueNumber !== null) {
+    const issueUrl = `https://github.com/${target.repository}/issues/${disposition.issueNumber}`;
+    if (!body.some((line) => normalizeLink(line) === issueUrl)) return null;
+    issueBody = await deferredIssueProof(github, target, assignment, disposition, signal);
+    if (issueBody === null) return null;
+  }
+  return digest([reply.body, issueBody]);
+}
+
+export async function verifyDisposition(
+  github: PublicationReader,
+  target: PullRequestTarget,
+  snapshot: PublicationSnapshot,
+  assignment: PrAssignment,
+  disposition: Disposition,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const proof = await dispositionProof(github, target, snapshot, assignment, disposition, signal);
+  return proof !== null && savedProof(assignment)?.[disposition.findingId] === proof;
+}
+
 export async function publicationProof(
   github: PublicationReader,
   target: PullRequestTarget,
@@ -99,19 +204,9 @@ export async function publicationProof(
   const { claim } = assignment;
   if (!claim) return null;
   if ("reviewId" in claim) {
-    const review = snapshot.reviews.find((item) => item?.id === claim.reviewId);
-    const body = lines(review?.body);
-    if (
-      !review ||
-      !authored(review, assignment) ||
-      commitSha(review.commit_id) !== claim.headSha ||
-      !["COMMENTED", claim.outcome === "clean" ? "APPROVED" : "CHANGES_REQUESTED"].includes(
-        String(review.state),
-      ) ||
-      !publishedSince(review.submitted_at, assignment.createdAt) ||
-      body[0] !== `Review outcome: ${claim.outcome}`
-    )
-      return null;
+    const review = reviewPublication(snapshot, assignment, claim);
+    if (!review) return null;
+    const body = lines(review.body);
     const resolutionPrefix = "Resolved finding: ";
     const resolutionLines = body
       .filter((line) => line.startsWith(resolutionPrefix))
@@ -127,49 +222,33 @@ export async function publicationProof(
       (item) => item?.pull_request_review_id === claim.reviewId && item.in_reply_to_id == null,
     );
     if (roots.length !== claim.findingIds.length) return null;
-    const bodies: unknown[] = [];
+    const findings: Record<number, string> = {};
     for (const id of claim.findingIds) {
-      const root = roots.find((item) => item?.id === id);
-      if (
-        !root ||
-        !authored(root, assignment) ||
-        commitSha(root.original_commit_id) !== claim.headSha ||
-        typeof root.body !== "string" ||
-        !root.body.trim()
-      )
-        return null;
-      bodies.push([id, root.body, root.path]);
+      const proof = findingProof(snapshot, assignment, claim, id);
+      if (!proof) return null;
+      findings[id] = proof;
     }
     return {
-      proof: digest([review.body, review.state, bodies]),
+      proof: JSON.stringify({ review: digest([review.body, review.state]), findings }),
       submittedAt: String(review.submitted_at),
     };
   }
 
   if ("dispositions" in claim) {
-    const bodies: unknown[] = [];
+    const findings: Record<number, string> = {};
     for (const disposition of claim.dispositions) {
-      const reply = snapshot.comments.find((item) => item?.id === disposition.replyId);
-      const body = lines(reply?.body);
-      if (
-        !reply ||
-        !authored(reply, assignment) ||
-        reply.in_reply_to_id !== disposition.findingId ||
-        !publishedSince(reply.created_at, assignment.createdAt) ||
-        body[0] !== `Decision: ${disposition.decision}` ||
-        !body.slice(1).some((line) => line && !/^https?:\/\//i.test(line))
-      )
-        return null;
-      let issueBody: unknown;
-      if (disposition.issueNumber !== null) {
-        const issueUrl = `https://github.com/${target.repository}/issues/${disposition.issueNumber}`;
-        if (!body.some((line) => normalizeLink(line) === issueUrl)) return null;
-        issueBody = await deferredIssueProof(github, target, assignment, disposition, signal);
-        if (issueBody === null) return null;
-      }
-      bodies.push([disposition.replyId, reply.body, issueBody]);
+      const proof = await dispositionProof(
+        github,
+        target,
+        snapshot,
+        assignment,
+        disposition,
+        signal,
+      );
+      if (!proof) return null;
+      findings[disposition.findingId] = proof;
     }
-    return { proof: digest(bodies) };
+    return { proof: JSON.stringify(findings) };
   }
 
   const result = object(await github.readCommit(target, claim.publishedHeadSha, signal));

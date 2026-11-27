@@ -14,10 +14,11 @@ import {
 import {
   candidatePublications,
   conflictingReply,
-  deferredIssueProof,
   includesCommit,
   loadPublications,
   publicationProof,
+  verifiedOriginalFinding,
+  verifyDisposition,
   type PublicationReader,
 } from "./pr-evidence.ts";
 import { PullRequestHeadChangedError, statusOf } from "./reconcile.ts";
@@ -241,7 +242,11 @@ export function createPrCoordinator({
       }
 
       const hasPublications = assignments.some(
-        (item) => !item.superseded && item.claim && item.input.role !== "implementer",
+        (item) =>
+          item.claim &&
+          item.input.role !== "implementer" &&
+          (!item.superseded ||
+            (item.proof && "reviewId" in item.claim && item.claim.findingIds.length > 0)),
       );
       const snapshot = hasPublications
         ? await loadPublications(github, target, signal)
@@ -387,6 +392,53 @@ export function createPrCoordinator({
         if (!assignment.proof) pr.corroborate(assignment, evidence.proof);
       }
 
+      const resolved = new Set(
+        verifiedReviews
+          .filter(({ assignment }) => assignment.headSha === workflow.headSha)
+          .flatMap(({ resolvedFindingIds }) => resolvedFindingIds),
+      );
+      const needsReplacement: number[] = [];
+      let renewedAdjudication: AssignmentInput | undefined;
+      for (const { assignment, findingIds } of replacedReviews.values()) {
+        const needsAdjudication: number[] = [];
+        for (const id of findingIds) {
+          if (resolved.has(id)) continue;
+          const fresh = dispositions.get(id);
+          const prior = fresh ?? historicalDispositions.get(id);
+          const rootVerified = verifiedOriginalFinding(snapshot, assignment, id);
+          if (!rootVerified && prior?.item.decision === "reject") continue;
+          if (
+            prior &&
+            (rootVerified || prior.item.decision === "defer") &&
+            (fresh ||
+              (await verifyDisposition(
+                github,
+                target,
+                snapshot,
+                prior.assignment,
+                prior.item,
+                signal,
+              )))
+          ) {
+            dispositions.set(id, prior);
+            if (
+              prior.item.decision === "escalate" &&
+              direction &&
+              direction.id > prior.assignment.operatorVersion
+            )
+              needsAdjudication.push(id);
+            continue;
+          }
+          if (rootVerified) needsAdjudication.push(id);
+          else needsReplacement.push(id);
+        }
+        if (!renewedAdjudication && needsAdjudication.length)
+          renewedAdjudication = {
+            role: "adjudicator",
+            reviewId: assignment.id,
+            findingIds: needsAdjudication,
+          };
+      }
       const conflict = [...dispositions.values()].find(({ item, assignment }) =>
         conflictingReply(snapshot, item, assignment),
       );
@@ -399,58 +451,6 @@ export function createPrCoordinator({
         return false;
       }
 
-      const resolved = new Set(
-        verifiedReviews
-          .filter(({ assignment }) => assignment.headSha === workflow.headSha)
-          .flatMap(({ resolvedFindingIds }) => resolvedFindingIds),
-      );
-      const needsReplacement: number[] = [];
-      let renewedAdjudication: AssignmentInput | undefined;
-      for (const { assignment, findingIds } of replacedReviews.values()) {
-        const needsAdjudication: number[] = [];
-        let rootsVerified: boolean | undefined;
-        for (const id of findingIds) {
-          if (resolved.has(id)) continue;
-          const fresh = dispositions.get(id);
-          const prior = fresh ?? historicalDispositions.get(id);
-          if (prior?.item.decision === "reject") continue;
-          if (
-            prior?.item.decision === "defer" &&
-            (await deferredIssueProof(github, target, prior.assignment, prior.item, signal))
-          )
-            continue;
-          rootsVerified ??=
-            (await publicationProof(github, target, snapshot, assignment, signal))?.proof ===
-            assignment.proof;
-          if (!rootsVerified) {
-            needsReplacement.push(id);
-            continue;
-          }
-          if (prior && (prior.item.decision === "accept" || prior.item.decision === "escalate")) {
-            if (
-              fresh ||
-              (await publicationProof(github, target, snapshot, prior.assignment, signal))
-                ?.proof === prior.assignment.proof
-            ) {
-              dispositions.set(id, prior);
-              if (
-                prior.item.decision === "escalate" &&
-                direction &&
-                direction.id > prior.assignment.operatorVersion
-              )
-                needsAdjudication.push(id);
-              continue;
-            }
-          }
-          needsAdjudication.push(id);
-        }
-        if (!renewedAdjudication && needsAdjudication.length)
-          renewedAdjudication = {
-            role: "adjudicator",
-            reviewId: assignment.id,
-            findingIds: needsAdjudication,
-          };
-      }
       const accepted = [...dispositions.values()]
         .filter(({ item }) => item.decision === "accept" && !resolved.has(item.findingId))
         .map(({ item }) => item.findingId);

@@ -80,6 +80,7 @@ function fixture() {
   const reviewer = { id: config.reviewer.producerId };
   const adjudicator = { id: config.adjudicator.producerId };
   let finding = false;
+  let findingCount = 1;
   let resolvePrevious = true;
   let decision: Disposition["decision"] = "accept";
   let unavailable: "not_started" | "unknown" | "failed" | null = null;
@@ -163,7 +164,7 @@ function fixture() {
     let structuredOutput: unknown;
     if (input.role === "reviewer") {
       const reviewId = nextId++;
-      const findingIds = finding ? [nextId++] : [];
+      const findingIds = finding ? Array.from({ length: findingCount }, () => nextId++) : [];
       if (findingIds.length) latestFinding = findingIds[0]!;
       const resolvedFindingIds = resolvePrevious ? input.previousFindingIds : [];
       const outcome = finding ? "findings" : "clean";
@@ -342,6 +343,9 @@ function fixture() {
     target,
     set discovery(value: number[]) {
       discovery = value;
+    },
+    set findingCount(value: number) {
+      findingCount = value;
     },
     set hasFinding(value: boolean) {
       finding = value;
@@ -729,6 +733,11 @@ describe("autonomous PR coordination", () => {
     await f.tick();
     expect(f.roles).toEqual(["reviewer", "adjudicator", "adjudicator", "reviewer"]);
     expect(f.workflow?.state).toBe("ready");
+    const renewedReply = f.comments.at(-1)!;
+    f.comments.splice(f.comments.indexOf(renewedReply), 1);
+    await f.tick();
+    expect(f.workflow?.state).toBe("awaiting_review");
+    expect(f.roles.at(-1)).toBe("adjudicator");
   });
 
   it("skips obsolete deferral evidence after a replacement review verifies the finding is fixed", async () => {
@@ -758,6 +767,72 @@ describe("autonomous PR coordination", () => {
     f.unavailableIssues = true;
     await f.tick();
     expect(f.workflow?.state).toBe("ready");
+  });
+
+  it("renews only the surviving original finding after replacing both publications", async () => {
+    const f = fixture();
+    f.hasFinding = true;
+    f.findingCount = 2;
+    f.decision = "defer";
+    for (let i = 0; i < 3; i += 1) await f.tick();
+    expect(f.workflow?.state).toBe("ready");
+    const [removed, remaining] = f.comments.slice(0, 2).map((item) => Number(item.id));
+    f.comments.splice(0, 1);
+    f.issues.clear();
+    await f.tick();
+    for (const { id: executionId } of f.calls) {
+      f.store.prWorkflows().operate(id, {
+        kind: "replace_evidence",
+        executionId,
+        reason: "One root comment and the issues disappeared.",
+      });
+    }
+    f.store
+      .prWorkflows()
+      .operate(id, { kind: "resume", reason: "Renew evidence for the available finding." });
+    f.hasFinding = false;
+    await f.tick();
+    expect(f.assignments.at(-1)?.input).toMatchObject({
+      role: "adjudicator",
+      findingIds: [remaining],
+    });
+    await f.tick();
+    expect(f.assignments.at(-1)?.input).toEqual({
+      role: "reviewer",
+      previousFindingIds: [removed],
+    });
+  });
+
+  it("pauses on a conflicting reply to a renewed disposition before dispatching a revision", async () => {
+    const f = fixture();
+    f.hasFinding = true;
+    f.decision = "defer";
+    for (let i = 0; i < 3; i += 1) await f.tick();
+    const finding = f.findingId;
+    f.issues.clear();
+    await f.tick();
+    f.store.prWorkflows().operate(id, {
+      kind: "replace_evidence",
+      executionId: f.calls[0]!.id,
+      reason: "The original deferral was lost.",
+    });
+    f.store.prWorkflows().operate(id, { kind: "resume", reason: "Renew the disposition." });
+    f.decision = "accept";
+    f.check = "pending";
+    f.resolvePrevious = false;
+    f.hasFinding = false;
+    await f.tick();
+    await f.tick();
+    f.comments.push({
+      id: 1000,
+      user: { id: config.adjudicator.producerId },
+      in_reply_to_id: finding,
+      body: "Decision: reject\nContradicts the accepted disposition.",
+    });
+    f.check = "passed";
+    await f.tick();
+    expect(f.attention?.reason).toMatch(/conflicting dispositions/);
+    expect(f.roles).not.toContain("implementer");
   });
 
   it("requires reasoning alongside a mixed-case issue link", async () => {
