@@ -65,6 +65,7 @@ function fixture() {
   let nextId = 1;
   let retainedCommit = true;
   let throttlePublications = false;
+  let unavailablePullRequest = false;
   let conflictingRex = false;
   let clock = Date.now() + 180_000;
   const calls: Array<Parameters<Execute>[0]> = [];
@@ -97,6 +98,7 @@ function fixture() {
       return discovery;
     },
     async readPullRequest() {
+      if (unavailablePullRequest) throw new Error("GitHub no longer exposes this pull request.");
       return { ...snapshot };
     },
     async readChecks(_: unknown, sha: string) {
@@ -317,6 +319,9 @@ function fixture() {
     calls,
     recoveries,
     completions,
+    set unavailablePullRequest(value: boolean) {
+      unavailablePullRequest = value;
+    },
     set conflictingRex(value: boolean) {
       conflictingRex = value;
     },
@@ -694,6 +699,48 @@ describe("autonomous PR coordination", () => {
     expect(f.workflow?.state).toBe("ready");
   });
 
+  it("requires renewed evidence after a replaced review's deferred issue disappears", async () => {
+    const f = fixture();
+    f.hasFinding = true;
+    f.decision = "defer";
+    for (let i = 0; i < 3; i += 1) await f.tick();
+    expect(f.workflow?.state).toBe("ready");
+    const finding = f.findingId;
+    f.issues.clear();
+    await f.tick();
+    f.store.prWorkflows().operate(id, {
+      kind: "replace_evidence",
+      executionId: f.calls[0]!.id,
+      reason: "The deferred issue disappeared.",
+    });
+    f.store
+      .prWorkflows()
+      .operate(id, { kind: "resume", reason: "Confirm what remains unresolved." });
+    f.hasFinding = false;
+    f.resolvePrevious = false;
+    await f.tick();
+    expect(f.assignments.at(-1)?.input).toEqual({
+      role: "reviewer",
+      previousFindingIds: [finding],
+    });
+    await f.tick();
+    expect(f.workflow?.state).toBe("escalated");
+  });
+
+  it("requires reasoning alongside a mixed-case issue link", async () => {
+    const f = fixture();
+    f.hasFinding = true;
+    f.decision = "defer";
+    await f.tick();
+    await f.tick();
+    const reply = f.comments.at(-1)!;
+    reply.body = String(reply.body)
+      .replace("This is the disposition reasoning.\n", "")
+      .replace("https://", "HTTPS://");
+    await f.tick();
+    expect(f.workflow?.state).toBe("escalated");
+  });
+
   it("recovers an outstanding turn on a merged PR in later sweeps without dispatch", async () => {
     const f = fixture();
     f.unavailable = "unknown";
@@ -703,7 +750,8 @@ describe("autonomous PR coordination", () => {
     f.snapshot.merged = true;
     await f.tick();
     expect(f.workflow?.githubStatus).toBe("merged");
-    await f.tick();
+    f.discovery = [];
+    f.unavailablePullRequest = true;
     f.beforeInspect = () => {
       f.store.agentExecutions().recordRemote(executionId, {
         nativeId: "merged-native",

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { commitSha, object, positiveInteger } from "./github-data.ts";
+import { GitHubResponseError } from "./github-app.ts";
 import type { PullRequestTarget } from "./github-api.ts";
 import {
   decisions,
@@ -56,6 +57,36 @@ function publishedSince(item: unknown, timestamp: string) {
   if (typeof item !== "string") return false;
   // REST timestamps have second precision.
   return Date.parse(item) >= Math.floor(Date.parse(timestamp) / 1000) * 1000;
+}
+
+export async function deferredIssueProof(
+  github: PublicationReader,
+  target: PullRequestTarget,
+  assignment: PrAssignment,
+  disposition: Disposition,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  if (disposition.issueNumber === null) return null;
+  let issue;
+  try {
+    issue = object(await github.readIssue(target, disposition.issueNumber, signal));
+  } catch (error) {
+    if (error instanceof GitHubResponseError && error.status === 404) return null;
+    throw error;
+  }
+  if (
+    !issue ||
+    issue.number !== disposition.issueNumber ||
+    issue.pull_request ||
+    !authored(issue, assignment) ||
+    !publishedSince(issue.created_at, assignment.createdAt) ||
+    typeof issue.body !== "string" ||
+    !issue.body
+      .split(/\s/)
+      .some((link) => normalizeLink(link) === findingUrl(target, disposition.findingId))
+  )
+    return null;
+  return issue.body;
 }
 
 export async function publicationProof(
@@ -126,27 +157,15 @@ export async function publicationProof(
         reply.in_reply_to_id !== disposition.findingId ||
         !publishedSince(reply.created_at, assignment.createdAt) ||
         body[0] !== `Decision: ${disposition.decision}` ||
-        !body.slice(1).some((line) => line && !line.startsWith("https://"))
+        !body.slice(1).some((line) => line && !/^https?:\/\//i.test(line))
       )
         return null;
       let issueBody: unknown;
       if (disposition.issueNumber !== null) {
         const issueUrl = `https://github.com/${target.repository}/issues/${disposition.issueNumber}`;
         if (!body.some((line) => normalizeLink(line) === issueUrl)) return null;
-        const issue = object(await github.readIssue(target, disposition.issueNumber, signal));
-        if (
-          !issue ||
-          issue.number !== disposition.issueNumber ||
-          issue.pull_request ||
-          !authored(issue, assignment) ||
-          !publishedSince(issue.created_at, assignment.createdAt) ||
-          typeof issue.body !== "string" ||
-          !issue.body
-            .split(/\s/)
-            .some((link) => normalizeLink(link) === findingUrl(target, disposition.findingId))
-        )
-          return null;
-        issueBody = issue.body;
+        issueBody = await deferredIssueProof(github, target, assignment, disposition, signal);
+        if (issueBody === null) return null;
       }
       bodies.push([disposition.replyId, reply.body, issueBody]);
     }

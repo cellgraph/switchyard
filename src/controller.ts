@@ -133,6 +133,24 @@ export function createController({
     if (abandoned) reportError(`Recovered ${abandoned} agent execution(s) with unknown outcomes.`);
     retries.prune(now());
     retireInactiveGitHubRetry(rateLimits, isRetryOwnerActive);
+    let succeeded = true;
+    for (const [target, selectionEntry] of selection) {
+      if (!selectionEntry.discover) continue;
+      for (const workflow of store.listWorkflows(target.repository)) {
+        if (signal?.aborted) return false;
+        const { pullRequest } = workflow.identity;
+        if (workflow.githubStatus !== "merged") selectionEntry.pullRequests.add(pullRequest);
+        else if (coordinate && pr.needsExecutionRecovery(workflow.id)) {
+          try {
+            await coordinate({ ...target, pullRequest }, signal);
+          } catch (error) {
+            if (signal?.aborted) return false;
+            reportError(`${workflow.id}: ${describeError(error)}`);
+            succeeded = false;
+          }
+        }
+      }
+    }
     const secondary = rateLimits.get("secondary");
     if (secondary && (isSecondaryLimitPaused(secondary) || secondary.retryAt > now())) {
       reportError(
@@ -142,15 +160,10 @@ export function createController({
       );
       return false;
     }
-    let succeeded = true;
     for (const [target, { discover, pullRequests }] of selection) {
       if (signal?.aborted) return false;
       if (discover) {
         for (const { pullRequest } of pr.requests(target.repository)) pullRequests.add(pullRequest);
-        for (const workflow of store.listWorkflows(target.repository)) {
-          if (workflow.githubStatus !== "merged" || pr.needsExecutionRecovery(workflow.id))
-            pullRequests.add(workflow.identity.pullRequest);
-        }
         const discovered = await attempt(target, undefined, async () => {
           for (const number of await github.listOpenPullRequests(target, signal))
             pullRequests.add(number);

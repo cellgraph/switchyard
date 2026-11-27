@@ -14,6 +14,7 @@ import {
 import {
   candidatePublications,
   conflictingReply,
+  deferredIssueProof,
   includesCommit,
   loadPublications,
   publicationProof,
@@ -254,10 +255,15 @@ export function createPrCoordinator({
 
       const replacedReviews = new Set<string>();
       const replacementFindings = new Set<number>();
-      const historicalDispositions = new Map<number, Disposition>();
-      for (const { claim, proof, superseded } of assignments) {
+      const historicalDispositions = new Map<
+        number,
+        { item: Disposition; assignment: PrAssignment }
+      >();
+      for (const assignment of assignments) {
+        const { claim, proof, superseded } = assignment;
         if (proof && !superseded && claim && "dispositions" in claim) {
-          for (const item of claim.dispositions) historicalDispositions.set(item.findingId, item);
+          for (const item of claim.dispositions)
+            historicalDispositions.set(item.findingId, { item, assignment });
         }
       }
       for (const assignment of assignments) {
@@ -269,8 +275,14 @@ export function createPrCoordinator({
         ) {
           replacedReviews.add(assignment.id);
           for (const id of assignment.claim.findingIds) {
-            const decision = historicalDispositions.get(id)?.decision;
-            if (decision !== "reject" && decision !== "defer") replacementFindings.add(id);
+            const prior = historicalDispositions.get(id);
+            if (prior?.item.decision === "reject") continue;
+            if (
+              prior?.item.decision === "defer" &&
+              (await deferredIssueProof(github, target, prior.assignment, prior.item, signal))
+            )
+              continue;
+            replacementFindings.add(id);
           }
         }
       }
