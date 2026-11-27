@@ -51,9 +51,9 @@ export SWITCHYARD_DB_PATH=/path/to/switchyard.sqlite
 npm start -- /path/to/switchyard.json
 ```
 
-Set `GITHUB_WEBHOOK_SECRET` from your secret store to enable the receiver on `127.0.0.1`. The optional `SWITCHYARD_WEBHOOK_PORT` defaults to `3000`. Webhook intake is optional. The default reconciliation interval is 60 seconds. Set `reconcileIntervalMs` to `0` for continuous operation driven by webhooks after startup. In that mode, another notification, an operator sweep or a restart can recover a missed or deferred observation.
+Set `GITHUB_WEBHOOK_SECRET` from your secret store to enable the receiver on `127.0.0.1`. The optional `SWITCHYARD_WEBHOOK_PORT` defaults to `3000`. Continuous operation always runs periodic sweeps, including when the webhook receiver is enabled. Set `reconcileIntervalMs` to an integer from 1 through 2,147,483,647 milliseconds or omit it for the 60-second default.
 
-Use `npm start -- --worker-status` to inspect the worker and its tracked workflows. Stop the continuous worker before running `npm start -- --once /path/to/switchyard.json` against the same database. One-off mode performs a full sweep using the same policy. See the [operating guide](unattended.md).
+Use `npm start -- --worker-status` to inspect the worker and its tracked workflows. Stop the continuous worker before running `npm start -- --once /path/to/switchyard.json` against the same database. One-off mode performs one full sweep and exits. See the [operating guide](unattended.md).
 
 ### Webhook signals and recovery
 

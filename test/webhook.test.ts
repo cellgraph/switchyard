@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createController, runController } from "../src/controller.ts";
 import type { GitHubReader, PullRequestState } from "../src/github-api.ts";
+import { GitHubTransientError } from "../src/github-app.ts";
 import { createReconciler } from "../src/reconcile.ts";
 import { WorkflowStore } from "../src/store.ts";
 import { createWebhookServer } from "../src/webhook.ts";
@@ -44,6 +45,7 @@ beforeEach(async () => {
     reconcile: createReconciler(store, github),
     reportError: vi.fn(),
     signal: abort.signal,
+    now: () => Date.now(),
   });
   notify = vi.fn(controller.notify);
   server = createWebhookServer({ secret, notify, reportError: vi.fn(), maxBodyBytes: 4096 });
@@ -125,7 +127,7 @@ describe("authenticated transient GitHub notifications", () => {
       store,
       repositories: [target],
       onceOnly: false,
-      reconcileIntervalMs: 0,
+      reconcileIntervalMs: 60_000,
       signal: abort.signal,
       log(entry) {
         if (entry.event === "reconciliation_finished" && ++passes === 2) finished.resolve();
@@ -147,6 +149,44 @@ describe("authenticated transient GitHub notifications", () => {
       waiting.resolve({ ...state });
       abort.abort();
       await run;
+    }
+  });
+
+  it("recovers a transient discovery failure on the periodic sweep with webhooks enabled", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    const interval = 60_000;
+    const outcomes: unknown[] = [];
+    vi.mocked(github.listOpenPullRequests).mockRejectedValueOnce(
+      new GitHubTransientError("Discovery temporarily unavailable", {
+        retryAt: Date.now() + 30_000,
+      }),
+    );
+    const run = runController({
+      controller,
+      store,
+      repositories: [target],
+      onceOnly: false,
+      reconcileIntervalMs: interval,
+      signal: abort.signal,
+      log(entry) {
+        if (entry.event === "reconciliation_finished") outcomes.push(entry.succeeded);
+      },
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(interval - 1);
+      expect(outcomes).toEqual([false]);
+      expect(github.listOpenPullRequests).toHaveBeenCalledTimes(1);
+      expect(workflow()).toBeNull();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(outcomes).toEqual([false, true]);
+      expect(github.listOpenPullRequests).toHaveBeenCalledTimes(2);
+      expect(workflow()).toMatchObject({ state: "awaiting_review", headSha: headA });
+      expect(notify).not.toHaveBeenCalled();
+    } finally {
+      abort.abort();
+      await run;
+      vi.useRealTimers();
     }
   });
 

@@ -4,7 +4,7 @@ The worker discovers pull requests in enabled repositories and observes eligible
 
 ## Run and inspect
 
-Use a [fresh SQLite path](state-model.md#sqlite-baseline). Set the App client ID and private key path in the environment. Supply `GITHUB_WEBHOOK_SECRET` to enable the receiver. Without a secret the worker runs on startup and at the configured interval.
+Use a [fresh SQLite path](state-model.md#sqlite-baseline). Set the App client ID and private key path in the environment. Supply `GITHUB_WEBHOOK_SECRET` to enable the receiver. The worker runs a startup sweep and continues at the configured positive interval with or without a webhook secret.
 
 ```sh
 export SWITCHYARD_DB_PATH=/absolute/path/to/switchyard-dev.sqlite

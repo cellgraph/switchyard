@@ -27,8 +27,8 @@ export function loadConfig(path: string) {
     repositories.push({ repository, installationId });
   }
   const interval = config.reconcileIntervalMs ?? 60_000;
-  if ((interval !== 0 && !positiveInteger(interval)) || interval > 2_147_483_647)
-    throw new Error("reconcileIntervalMs must be between 0 and 2147483647.");
+  if (!positiveInteger(interval) || interval > 2_147_483_647)
+    throw new Error("reconcileIntervalMs must be an integer between 1 and 2147483647.");
   const requiredChecks = new Map<string, string[]>();
   if (config.requiredChecks !== undefined) {
     const entries = object(config.requiredChecks);

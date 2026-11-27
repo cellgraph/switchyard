@@ -104,8 +104,6 @@ async function main(): Promise<void> {
   let server: ReturnType<typeof createWebhookServer> | undefined;
 
   try {
-    if (!onceOnly && !secret && config.reconcileIntervalMs === 0)
-      throw new Error("Continuous reconciliation needs a webhook secret or a positive interval.");
     const github = makeReader(store, config.repositories);
     const controller = createController({
       store,

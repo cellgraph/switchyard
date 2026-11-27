@@ -245,10 +245,9 @@ export async function runController({
   const workerId = claim.record.id;
   const report = (event: string, details = {}) =>
     log({ timestamp: at(), workerId, event, ...details });
-  const periodic =
-    !onceOnly && reconcileIntervalMs > 0
-      ? setInterval(controller.scheduleSweep, reconcileIntervalMs)
-      : undefined;
+  const periodic = onceOnly
+    ? undefined
+    : setInterval(controller.scheduleSweep, reconcileIntervalMs);
   try {
     report("worker_started", {
       pid: process.pid,

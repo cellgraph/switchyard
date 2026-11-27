@@ -496,6 +496,7 @@ describe("repository configuration", () => {
     { requiredChecks: { "owner/one": ["CI"], "Owner/One": ["CI"] } },
     { requiredChecks: { "owner/one": [] } },
     { requiredChecks: { "owner/one": ["CI", "CI"] } },
+    { reconcileIntervalMs: 0 },
     { reconcileIntervalMs: -1 },
     { reconcileIntervalMs: 2_147_483_648 },
   ])("rejects invalid configuration %j", (overrides) => {
