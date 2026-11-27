@@ -73,6 +73,8 @@ Inspect `state: "ready"` with `githubStatus: "eligible"` and the matching `headS
 
 Use a disposable repository, an isolated controller config and a fresh SQLite path to verify a candidate on the two VMs. Test the exact candidate checkout and dependencies on both machines, with a dedicated Rex session and private state directory. Keep the production service and database outside this run. Observe a ready fixture PR with passing checks and leave it open.
 
+The [Phase D verification report](phase-d-verification.md) records the candidate, fixture and observed evidence.
+
 Production cutover requires separate operator authorization. Record the deployed Git commit, service configuration, environment and database paths before starting.
 
 1. Prepare the reviewed Switchyard checkout, pinned Node and locked npm dependencies on both machines. Test controller-to-Rex connectivity and scoped App reads. Confirm the expected repository, role IDs and required Check Runs.
