@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { record, validRexId, type RexPlacement } from "./agent-config.ts";
 import type { createAgentStore, ExecutionRecord, SessionRecord } from "./agent-store.ts";
-import type { AgentTurn } from "./agent.ts";
+import type { AgentResult, AgentTurn } from "./agent.ts";
 import { readEvidence, type ExecutionCorrelation } from "./remote-execution.ts";
 
 type RexCommand = (binary: string, args: string[]) => Promise<string>;
@@ -97,7 +97,15 @@ export function createRexExecution(
     return { state: "unavailable" };
   }
 
-  async function inspect(id: string) {
+  async function inspect(
+    id: string,
+    reread = true,
+  ): Promise<{
+    execution: ExecutionRecord;
+    session: SessionRecord;
+    observation: { process: ProcessEvidence; evidence: "valid" | "unavailable" | "conflicting" };
+    result?: Extract<AgentResult, { outcome: "completed" }>;
+  }> {
     const { execution, rex, correlation, directory } = attempt(id);
     const blockId = execution.remote!.blockId;
     let process = await processEvidence(rex, blockId);
@@ -105,14 +113,8 @@ export function createRexExecution(
       temporary(async (local) => {
         const path = join(local, "evidence.json");
         try {
-          await command(
-            rex,
-            "cp",
-            "-s",
-            rex.session,
-            ":" + posix.join(directory, "evidence.json"),
-            path,
-          );
+          // Rex can transfer through another session on this endpoint if the original block is gone.
+          await command(rex, "cp", ":" + posix.join(directory, "evidence.json"), path);
         } catch {
           return { state: "unavailable" } as const;
         }
@@ -164,6 +166,14 @@ export function createRexExecution(
       );
 
     const saved = attempt(id);
+    // A concurrent observer can commit completion while this read holds an interim snapshot.
+    if (
+      reread &&
+      saved.execution.status === "completed" &&
+      !result &&
+      execution.status !== "completed"
+    )
+      return inspect(id, false);
     return {
       execution: saved.execution,
       session: saved.session,
@@ -276,15 +286,11 @@ export function createRexExecution(
       for (;;) {
         const stopping = signal?.aborted;
         const inspected = stopping ? await cancel(id) : await inspect(id);
-        if (inspected.execution.status === "completed" && !inspected.result) {
-          // Another observer may have committed completion after our read of the interim file.
-          const final = await inspect(id);
-          if (!final.result)
-            throw new Error(
-              "The execution completed but its correlated Rex result is unavailable. Inspect the same execution.",
-            );
-          return { ...inspected, ...final };
-        }
+        if (!stopping && signal?.aborted) continue;
+        if (inspected.execution.status === "completed" && !inspected.result)
+          throw new Error(
+            "The execution completed but its correlated Rex result is unavailable. Inspect the same execution.",
+          );
         if (
           stopping ||
           (inspected.execution.status !== "running" &&

@@ -23,10 +23,12 @@ let runs: Map<
 >;
 let stageFails: boolean;
 let disconnect: boolean;
+let sessionLost: boolean;
 let loseAck: boolean;
 let hideEvidence: boolean;
 let targetBlock: string | undefined;
 let pauseRead: (() => Promise<void>) | undefined;
+let pauseProcess: (() => Promise<void>) | undefined;
 const context = () => ({ provider: "codex" as const, workingDirectory: root });
 const intent = (id = "execution", prompt = "offline fixture") => ({
   id,
@@ -48,6 +50,7 @@ const transport = vi.fn(async (binary: string, args: string[]) => {
   expect(executions.get("execution")?.remote?.key).toBeDefined();
   const command = args[3];
   if (disconnect) throw new Error("transport unavailable");
+  if (sessionLost && args.includes(rex.session)) throw new Error("Rex session not found");
   if (command === "cp") {
     const [source, destination] = args.slice(-2) as [string, string];
     if (source.startsWith(":")) {
@@ -95,6 +98,11 @@ const transport = vi.fn(async (binary: string, args: string[]) => {
   const entry = runs.get(blockId);
   if (!entry) throw new Error("block not found");
   if (command === "block") {
+    if (pauseProcess) {
+      const pause = pauseProcess;
+      pauseProcess = undefined;
+      await pause();
+    }
     const { child } = entry;
     return JSON.stringify(
       child.exitCode !== null || child.signalCode
@@ -125,9 +133,10 @@ beforeEach(async () => {
   };
   await mkdir(rex.stateDirectory, { mode: 0o700 });
   runs = new Map();
-  stageFails = disconnect = loseAck = hideEvidence = false;
+  stageFails = disconnect = sessionLost = loseAck = hideEvidence = false;
   targetBlock = undefined;
   pauseRead = undefined;
+  pauseProcess = undefined;
   transport.mockClear();
 });
 
@@ -180,8 +189,14 @@ it("reconciles a lost launch acknowledgement after restart without replay and re
   await expect(restarted.execute(intent("retry"))).rejects.toThrow("already has");
   await writeFile(join(statePath(launched.execution), "release"), "");
   await runs.get(blockId)!.exited;
+  sessionLost = true;
   const recovered = await restarted.recover();
-  expect(recovered).toMatchObject([{ execution: { status: "completed", remote: { blockId } } }]);
+  expect(recovered).toMatchObject([
+    {
+      execution: { status: "completed", remote: { blockId } },
+      observation: { process: { state: "unavailable" }, evidence: "valid" },
+    },
+  ]);
   const result = await restarted.inspect("execution");
   expect(result).toMatchObject({
     session: { id: launched.session.id, agentName: "reviewer", placement: "rex" },
@@ -223,6 +238,30 @@ it("cancels only the correlated block and preserves unknown when cancellation yi
   });
   expect(runs.get(secondBlock!)!.child.exitCode).toBeNull();
   await expect(stat(join(statePath(one.execution), "interrupted"))).resolves.toBeDefined();
+});
+
+it("requests cancellation if interruption arrives during a failed Rex poll", async () => {
+  const controller = subsystem();
+  const abort = new AbortController();
+  const entered = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  pauseProcess = async () => {
+    entered.resolve();
+    await resume.promise;
+    throw new Error("Rex process query interrupted");
+  };
+  const dispatched = controller.execute({
+    ...intent("execution", "wait for release"),
+    signal: abort.signal,
+  });
+  const held = await waiting("execution");
+  await entered.promise;
+  abort.abort();
+  resume.resolve();
+  expect(await dispatched).toMatchObject({ interruption: "requested" });
+  expect(targetBlock).toBe(held.remote!.blockId);
+  await runs.get(targetBlock!)!.exited;
+  expect((await controller.inspect(held.id)).execution.status).toBe("unknown");
 });
 
 it("holds after connection loss and rejects corrupted or rewritten correlated evidence", async () => {
@@ -292,18 +331,34 @@ it("records local staging failure as known non-execution before contacting Rex",
   expect((await controller.execute(intent("retry"))).execution.status).toBe("completed");
 });
 
-it.each(["available", "unavailable"])(
-  "requires the verified result after concurrent recovery when the final file is %s",
-  async (availability) => {
+it.each([
+  ["dispatch", "available"],
+  ["dispatch", "unavailable"],
+  ["inspect", "available"],
+])(
+  "%s rechecks the final file after concurrent recovery when it is %s",
+  async (operation, availability) => {
     const controller = subsystem();
+    if (operation === "inspect") {
+      loseAck = true;
+      await controller.execute(intent("execution", "wait for release"));
+      await waiting("execution");
+      loseAck = hideEvidence = false;
+      expect(await controller.inspect("execution")).toMatchObject({
+        execution: { remote: { blockId: expect.any(String) } },
+      });
+    }
     const copied = Promise.withResolvers<void>();
     const resume = Promise.withResolvers<void>();
     pauseRead = async () => {
       copied.resolve();
       await resume.promise;
     };
-    const dispatched = controller.execute(intent("execution", "wait for release"));
-    const checked = dispatched.then(
+    const observing =
+      operation === "inspect"
+        ? controller.inspect("execution")
+        : controller.execute(intent("execution", "wait for release"));
+    const checked = observing.then(
       (value) => ({ value }),
       (error: unknown) => ({ error }),
     );
