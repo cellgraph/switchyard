@@ -1,6 +1,6 @@
 # Review evidence and inspection
 
-Phase B1 retired automatic Codex review ingestion and controller-authored review and disposition comments. In B2, review and PR comment webhooks signal lifecycle and CI observation through the same read-only reconciler used for discovery. Agents will retrieve and publish substantive review content in Phase D.
+Phase B1 retired automatic Codex review ingestion and controller-authored review and disposition comments. In B2, review and PR comment webhooks signal lifecycle and CI observation through the same read-only reconciler used for discovery. Named agents retrieve and publish substantive review and disposition content through the [autonomous workflow](autonomous-pr-workflow.md).
 
 GitHub holds reviews, individual findings, disposition reasoning and issue content. The SQLite evidence store records structured metadata for later review corroboration:
 

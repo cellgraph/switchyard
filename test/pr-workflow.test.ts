@@ -46,6 +46,7 @@ function fixture() {
   const directory = mkdtempSync(join(tmpdir(), "switchyard-pr-test-"));
   const path = join(directory, "workflow.sqlite");
   let store = new WorkflowStore(path);
+  const configured = structuredClone(config);
   cleanups.push(() => {
     store.close();
     rmSync(directory, { recursive: true, force: true });
@@ -59,6 +60,7 @@ function fixture() {
   };
   let discovery = [target.pullRequest];
   let check: CheckOutcome = "passed";
+  let dependentCheck: CheckOutcome | null = null;
   let nextId = 1;
   let clock = Date.now() + 180_000;
   const calls: Array<Parameters<Execute>[0]> = [];
@@ -73,10 +75,11 @@ function fixture() {
   let finding = false;
   let resolvePrevious = true;
   let decision: Disposition["decision"] = "accept";
-  let unavailable: "not_started" | "unknown" | null = null;
+  let unavailable: "not_started" | "unknown" | "failed" | null = null;
   let interrupt = false;
   let unsigned = false;
   let beforeDispatch: (() => void) | undefined;
+  let beforeInspect: ((id: string) => void) | undefined;
   let editEvidence: ((role: PrRole) => void) | undefined;
   const published = () => new Date(clock).toISOString();
   let latestFinding = 0;
@@ -90,7 +93,10 @@ function fixture() {
       return { ...snapshot };
     },
     async readChecks(_: unknown, sha: string) {
-      return [{ name: "quality", sha, outcome: check }];
+      return [
+        { name: "quality", sha, outcome: check },
+        ...(dependentCheck === null ? [] : [{ name: "dependent", sha, outcome: dependentCheck }]),
+      ];
     },
     async readReviews() {
       return reviews;
@@ -117,7 +123,17 @@ function fixture() {
       .find((item) => item.id === request.assignmentId)!;
     const role = assignment.input.role;
     beforeDispatch?.();
-    const authorized = agent.authorizeRemoteDispatch(request.id, request.mayLaunch);
+    let launchAllowed;
+    try {
+      launchAllowed = await request.confirmLaunch?.();
+    } catch (error) {
+      agent.recordRemote(request.id, {
+        outcome: { outcome: "not_started", reason: "Fixture launch fence." },
+      });
+      throw error;
+    }
+    const authorized =
+      launchAllowed && agent.authorizeRemoteDispatch(request.id, request.mayLaunch);
     const outcome = unavailable ?? (authorized ? null : "not_started");
     if (outcome) {
       agent.recordRemote(request.id, { outcome: { outcome, reason: "Fixture interruption." } });
@@ -212,7 +228,9 @@ function fixture() {
   };
 
   function build() {
-    const reconcile = createReconciler(store, github, () => ["quality"]);
+    const reconcile = createReconciler(store, github, () =>
+      dependentCheck === null ? ["quality"] : ["quality", "dependent"],
+    );
     const coordinator = createPrCoordinator({
       store,
       github,
@@ -220,6 +238,7 @@ function fixture() {
       now: () => clock,
       async inspect(id) {
         recoveries.push(id);
+        beforeInspect?.(id);
         const agent = store.agentExecutions();
         const execution = agent.get(id)!;
         const result = outputs.get(id);
@@ -240,7 +259,7 @@ function fixture() {
       repositories: [target],
       reconcile,
       reportError: () => {},
-      coordinate: (target) => coordinator(target, config),
+      coordinate: (target) => coordinator(target, configured),
     });
     return { reconcile, coordinator, controller };
   }
@@ -292,6 +311,9 @@ function fixture() {
     set check(value: CheckOutcome) {
       check = value;
     },
+    set dependentCheck(value: CheckOutcome) {
+      dependentCheck = value;
+    },
     set decision(value: Disposition["decision"]) {
       decision = value;
     },
@@ -310,6 +332,10 @@ function fixture() {
     set beforeDispatch(value: typeof beforeDispatch) {
       beforeDispatch = value;
     },
+    set beforeInspect(value: typeof beforeInspect) {
+      beforeInspect = value;
+    },
+    configured,
     set editEvidence(value: typeof editEvidence) {
       editEvidence = value;
     },
@@ -324,7 +350,7 @@ function fixture() {
     },
     async tick() {
       await flows.reconcile(target);
-      return flows.coordinator(target, config);
+      return flows.coordinator(target, configured);
     },
     restart() {
       store.close();
@@ -449,6 +475,60 @@ describe("autonomous PR coordination", () => {
       expect(f.allowance.revisions.reservedOrUsed).toBe(1);
     },
   );
+
+  it("fixes a known failure when a dependent check was skipped", async () => {
+    const f = fixture();
+    f.check = "failed";
+    f.dependentCheck = "unknown";
+    await f.tick();
+    await f.tick();
+    expect(f.assignments.at(-1)?.input).toMatchObject({
+      role: "implementer",
+      failedChecks: ["quality"],
+    });
+    await f.tick();
+    await f.tick();
+    expect(f.workflow?.state).toBe("awaiting_review");
+    f.dependentCheck = "passed";
+    await f.tick();
+    expect(f.workflow?.state).toBe("ready");
+  });
+
+  it("can review a new head after an old clean review disappears", async () => {
+    const f = fixture();
+    await f.tick();
+    await f.tick();
+    f.reviews.length = 0;
+    f.move(1);
+    await f.tick();
+    await f.tick();
+    expect(f.roles).toEqual(["reviewer", "reviewer"]);
+    expect(f.workflow).toMatchObject({ state: "ready", headSha: heads[1] });
+  });
+
+  it("can continue after the operator accounts for an uncorroborated terminal assignment", async () => {
+    const f = fixture();
+    f.editEvidence = () => {
+      f.reviews[0]!.user = { id: 666 };
+    };
+    await f.tick();
+    await f.tick();
+    expect(f.workflow?.state).toBe("escalated");
+    f.store.prWorkflows().operate(id, {
+      kind: "abandon",
+      executionId: f.calls[0]!.id,
+      reason: "Inspected the incorrect publication.",
+    });
+    f.store
+      .prWorkflows()
+      .operate(id, { kind: "resume", reason: "Run a fresh review within the allowance." });
+    f.editEvidence = undefined;
+    await f.tick();
+    await f.tick();
+    expect(f.roles).toEqual(["reviewer", "reviewer"]);
+    expect(f.allowance.reviews.reservedOrUsed).toBe(2);
+    expect(f.workflow?.state).toBe("ready");
+  });
 
   it("retains accepted findings across an external head change until the new review explicitly resolves them", async () => {
     const f = fixture();
@@ -661,6 +741,100 @@ describe("autonomous PR coordination", () => {
       output.mockRestore();
     }
   });
+
+  it("rechecks GitHub eligibility after staging and does not authorize a stale launch", async () => {
+    const f = fixture();
+    f.beforeDispatch = () => {
+      f.snapshot.state = "closed";
+      f.move(1);
+    };
+    await expect(f.tick()).rejects.toThrow("head changed");
+    expect(f.store.agentExecutions().get(f.calls[0]!.id)).toMatchObject({
+      status: "not_started",
+      remote: { launchAuthorized: false },
+    });
+    expect(f.workflow).toMatchObject({
+      state: "stopped",
+      githubStatus: "closed",
+      headSha: heads[1],
+    });
+  });
+
+  it("reconciles an outstanding Rex attempt on a closed PR before authorizing another PR", async () => {
+    const f = fixture();
+    const otherId = "cellgraph/fixture#6";
+    const closed = {
+      id: otherId,
+      identity: { repository: target.repository, pullRequest: 6 },
+      headSha: heads[0]!,
+      state: "awaiting_review",
+      githubStatus: "eligible",
+      requiredChecks: ["quality"],
+      checks: [],
+      escalationReason: null,
+    } as const;
+    f.store.createWorkflow({ ...closed, checks: [], requiredChecks: ["quality"] });
+    const other = f.store
+      .prWorkflows()
+      .reserve(
+        { workflow: f.store.getWorkflow(otherId)!, version: 0 },
+        { role: "reviewer", previousFindingIds: [] },
+        "reviewer",
+        config.reviewer.producerId,
+      )!;
+    const agent = f.store.agentExecutions();
+    agent.claim({ id: other.executionId, assignmentId: other.id, ...config.reviewer.agent });
+    expect(agent.authorizeRemoteDispatch(other.executionId)).toBe(true);
+    f.store.transition(otherId, { type: "github_pull_request", status: "closed", sha: heads[0]! });
+    f.restart();
+    f.beforeInspect = (executionId) => {
+      if (executionId !== other.executionId) return;
+      f.store.agentExecutions().recordRemote(executionId, {
+        blockId: "block:22222222-2222-2222-2222-222222222222",
+        nativeId: "previous-native",
+        digest: "fixture-result",
+        outcome: { outcome: "completed" },
+      });
+    };
+    await f.tick();
+    expect(f.recoveries).toContain(other.executionId);
+    expect(f.roles).toEqual(["reviewer"]);
+    expect(f.store.getWorkflow(otherId)?.githubStatus).toBe("closed");
+  });
+
+  it.each(["abandoned continuation", "changed Rex executable"])(
+    "starts a fresh Implementer session after %s",
+    async (cause) => {
+      const f = fixture();
+      f.check = "failed";
+      await f.tick();
+      await f.tick();
+      f.check = "failed";
+      await f.tick();
+      if (cause === "abandoned continuation") {
+        f.unavailable = "failed";
+        await f.tick();
+        const failed = f.calls.at(-1)!;
+        expect(failed.sessionId).toBeDefined();
+        await f.tick();
+        f.store.prWorkflows().operate(id, {
+          kind: "abandon",
+          executionId: failed.id,
+          reason: "The previous native session was removed.",
+        });
+        f.store
+          .prWorkflows()
+          .operate(id, { kind: "resume", reason: "Start a fresh native session." });
+        f.unavailable = null;
+      } else {
+        f.configured.implementer.agent.rex!.executable = "/opt/new-rex";
+      }
+      await f.tick();
+      const next = f.calls.at(-1)!;
+      expect(next.sessionId).toBeUndefined();
+      expect(next.rex?.executable).toBe(f.configured.implementer.agent.rex!.executable);
+    },
+  );
 
   it("fences a staged launch after operator stop and observes closure, reopen and merge", async () => {
     const f = fixture();

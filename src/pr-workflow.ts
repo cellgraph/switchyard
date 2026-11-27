@@ -45,6 +45,27 @@ export function createPrCoordinator({
   const executions = store.agentExecutions();
   const reviews = store.reviews();
 
+  async function inspectExisting(id: string) {
+    executions.recoverRemotePrelaunch(id);
+    const execution = executions.get(id)!;
+    return execution.status === "not_started" ? { execution } : await inspect(id);
+  }
+
+  async function reconcileOtherExecutions(workflowId: string) {
+    for (const id of pr.blockingExecutions(workflowId)) {
+      const result = await inspectExisting(id);
+      // A correlated process exit can free this placement for other PRs. The original
+      // assignment still needs native evidence or an operator decision.
+      if (
+        (result.execution.status === "running" || result.execution.status === "unknown") &&
+        !result.execution.remote?.resultDigest &&
+        (!("observation" in result) || result.observation.process.state !== "exited")
+      )
+        return false;
+    }
+    return true;
+  }
+
   return async (target: PullRequestTarget, config: PrWorkflowConfig, signal?: AbortSignal) => {
     const workflow = store.findWorkflow(target.repository, target.pullRequest);
     if (!isActive(workflow) || workflow.githubStatus !== "eligible") return false;
@@ -67,8 +88,8 @@ export function createPrCoordinator({
       checkGitHubDrain(signal);
       if (!pr.unchanged(guard)) return false;
       const status = statusOf(latest, target.repository);
-      if (latest.headSha !== workflow!.headSha || status !== "eligible") {
-        store.transition(workflow!.id, {
+      if (latest.headSha !== guard.workflow.headSha || status !== "eligible") {
+        store.transition(guard.workflow.id, {
           type: "github_pull_request",
           status,
           sha: latest.headSha,
@@ -98,17 +119,17 @@ export function createPrCoordinator({
                 item.id !== assignment.id &&
                 item.input.role === "implementer" &&
                 item.agentName === assignment.agentName &&
-                item.producerId === assignment.producerId &&
-                item.proof,
+                item.producerId === assignment.producerId,
             )
           : undefined;
-      const previousExecution = prior && executions.get(prior.executionId);
+      const previousExecution = prior?.proof && executions.get(prior.executionId);
       const session = previousExecution ? executions.session(previousExecution.sessionId) : null;
       const rex = configured.agent.rex;
       const contextMatches =
         session?.rex &&
         rex &&
         session.rex.endpoint === rex.endpoint &&
+        session.rex.executable === rex.executable &&
         session.rex.executor === rex.executor &&
         session.rex.stateDirectory === rex.stateDirectory &&
         session.rex.node === rex.node &&
@@ -127,12 +148,14 @@ export function createPrCoordinator({
           direction && direction.id <= assignment.operatorVersion ? direction.reason : undefined,
         ),
         ...(signal ? { signal } : {}),
+        confirmLaunch: confirmHead,
         mayLaunch: () => !signal?.aborted && pr.unchanged(guard),
+        waitForResult: false,
       });
       const claim = parseClaim(assignment, result.result?.structuredOutput);
       if (claim) pr.capture(assignment, claim);
       // A follow-up pass reconciles any result against a fresh PR and CI snapshot.
-      return result.execution.status !== "not_started";
+      return result.execution.status !== "not_started" && result.execution.status !== "running";
     }
 
     try {
@@ -143,11 +166,9 @@ export function createPrCoordinator({
         (!pending.claim || execution.status !== "completed") &&
         execution.status !== "not_started"
       ) {
-        executions.recoverRemotePrelaunch(execution.id);
-        execution = executions.get(execution.id);
-        if (execution?.status !== "not_started") {
-          const recovered = await inspect(pending.executionId);
-          execution = recovered.execution;
+        const recovered = await inspectExisting(execution.id);
+        execution = recovered.execution;
+        if ("observation" in recovered) {
           const claim = parseClaim(pending, recovered.result?.structuredOutput);
           if (claim) {
             pr.capture(pending, claim);
@@ -202,6 +223,15 @@ export function createPrCoordinator({
       for (const assignment of assignments) {
         if (assignment.superseded || !assignment.claim) continue;
         const { claim } = assignment;
+        if (
+          "reviewId" in claim &&
+          claim.outcome === "clean" &&
+          claim.headSha !== workflow.headSha
+        ) {
+          // An old clean review has no findings to carry onto the new head.
+          if (!assignment.proof) pr.supersede(assignment);
+          continue;
+        }
         const revision = "publishedHeadSha" in claim;
         if (revision && assignment.proof) continue;
         if (revision && claim.publishedHeadSha !== workflow.headSha) {
@@ -312,10 +342,11 @@ export function createPrCoordinator({
             workflow.requiredChecks?.includes(item.name),
         )
         .map((item) => item.name);
-      const checksSettled = workflow.requiredChecks?.every((name) =>
-        workflow.checks.some(
-          (check) => check.name === name && ["passed", "failed"].includes(check.outcome),
-        ),
+      const checksPending = workflow.checks.some(
+        (check) =>
+          check.sha === workflow.headSha &&
+          check.outcome === "pending" &&
+          workflow.requiredChecks?.includes(check.name),
       );
       let next: AssignmentInput | undefined;
       for (const { assignment, findingIds } of verifiedReviews) {
@@ -345,7 +376,7 @@ export function createPrCoordinator({
         return false;
       }
       if (!next && !reviewed) next = { role: "reviewer", previousFindingIds: accepted };
-      if (!next && (accepted.length || failedChecks.length) && checksSettled)
+      if (!next && (accepted.length || failedChecks.length) && !checksPending)
         next = { role: "implementer", findingIds: accepted, failedChecks };
       if (!next) {
         if (pending && (!execution || execution.status === "not_started")) pr.supersede(pending);
@@ -364,7 +395,7 @@ export function createPrCoordinator({
         JSON.stringify(unlaunched.input) === JSON.stringify(next) &&
         unlaunched.operatorVersion === guard.version;
       if (unlaunched && !sameTask) pr.supersede(unlaunched);
-      if (pr.otherRunning(workflow.id)) return false;
+      if (!(await reconcileOtherExecutions(workflow.id))) return false;
       const { reviews: reviewSlots, revisions } = pr.allowances(workflow.id);
       if (!sameTask && next.role !== "adjudicator") {
         const noReview = reviewSlots.reservedOrUsed >= reviewSlots.authorized;

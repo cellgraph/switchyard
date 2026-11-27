@@ -257,8 +257,14 @@ export function createRexExecution(
         prompt,
         outputSchema,
         signal,
+        confirmLaunch,
         mayLaunch,
-      }: Pick<AgentTurn, "prompt" | "outputSchema" | "signal"> & { mayLaunch?: () => boolean },
+        waitForResult = true,
+      }: Pick<AgentTurn, "prompt" | "outputSchema" | "signal"> & {
+        confirmLaunch?: () => Promise<boolean>;
+        mayLaunch?: () => boolean;
+        waitForResult?: boolean;
+      },
     ) {
       const id = execution.id;
       const { rex, correlation, directory } = attempt(id);
@@ -285,6 +291,16 @@ export function createRexExecution(
         });
       } catch {
         return notStarted("Could not stage the Rex request before dispatch.");
+      }
+      if (signal?.aborted) return notStarted("Canceled before Rex dispatch.");
+      if (confirmLaunch) {
+        try {
+          if (!(await confirmLaunch()))
+            return notStarted("Rex dispatch preconditions no longer apply.");
+        } catch (error) {
+          notStarted("Could not confirm Rex dispatch preconditions.");
+          throw error;
+        }
       }
       if (signal?.aborted) return notStarted("Canceled before Rex dispatch.");
       if (!executions.authorizeRemoteDispatch(id, mayLaunch))
@@ -322,6 +338,7 @@ export function createRexExecution(
       const blocks = record(ack)?.block_ids;
       const blockId = Array.isArray(blocks) && blocks.length === 1 ? blocks[0] : undefined;
       if (validRexId(blockId, "block")) executions.recordRemoteAcknowledgement(id, blockId);
+      if (!waitForResult) return saved();
 
       for (;;) {
         const stopping = signal?.aborted;

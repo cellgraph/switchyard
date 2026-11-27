@@ -56,8 +56,8 @@ const ids = { type: "array", items: id };
 const schemas = {
   reviewer: schema({
     headSha: sha,
-    reviewId: id,
-    outcome: { type: "string", enum: ["clean", "findings"] },
+    reviewId: { type: ["integer", "null"] },
+    outcome: { type: "string", enum: ["clean", "findings", "incomplete"] },
     findingIds: ids,
     resolvedFindingIds: ids,
   }),
@@ -73,7 +73,7 @@ const schemas = {
       }),
     },
   }),
-  implementer: schema({ headSha: sha, publishedHeadSha: sha }),
+  implementer: schema({ headSha: sha, publishedHeadSha: { type: ["string", "null"] } }),
 };
 
 function idList(value: unknown): number[] | undefined {
@@ -171,7 +171,7 @@ export function assignmentTurn(
         "Publish one submitted GitHub COMMENT review with commit_id set to the exact target head. Publish each actionable finding as a root inline comment in that same review. Start the review body with 'Review outcome: clean' or 'Review outcome: findings', then summarize validation.",
         "For each prior finding you independently verify as fixed at this head, add a separate 'Resolved finding: FULL_FINDING_URL' line to the review body. Leave unresolved prior findings out of resolvedFindingIds. Avoid duplicating prior findings as new inline comments.",
         `Prior accepted findings: ${JSON.stringify(links(input.previousFindingIds))}`,
-        "Return the numeric REST review ID, outcome, all root inline finding IDs, and the resolved prior finding IDs. Return empty arrays where applicable.",
+        "Return the numeric REST review ID, outcome, all root inline finding IDs, and the resolved prior finding IDs. Return empty arrays where applicable. When you cannot publish a complete review return outcome incomplete and a null reviewId.",
       );
       break;
     case "adjudicator":
@@ -186,7 +186,7 @@ export function assignmentTurn(
         `Fix the accepted findings: ${JSON.stringify(links(input.findingIds))}`,
         `Investigate and fix these required CI failures: ${JSON.stringify(input.failedChecks)}`,
         "Use a separate worktree at the exact head and validate the change. Create a single signed commit directly on the target head and push it to this PR's existing branch. Never force push, change another branch, or create another PR. Verify that GitHub reports the signature as verified.",
-        "Return the target head and the published commit SHA as publishedHeadSha. If the head has moved or you cannot complete the publication, report the failure without inventing evidence.",
+        "Return the target head and the published commit SHA as publishedHeadSha. If the head has moved or you cannot complete the publication, return null as publishedHeadSha.",
       );
       break;
   }

@@ -181,6 +181,45 @@ async function waiting(id: string): Promise<ExecutionRecord> {
   });
 }
 
+it("can return after launch and recover the terminal result in a separate observation", async () => {
+  const controller = subsystem();
+  const launched = await controller.execute({
+    ...intent("execution", "wait for release"),
+    waitForResult: false,
+  });
+  expect(launched.execution).toMatchObject({
+    status: "running",
+    remote: { launchAuthorized: true },
+  });
+  expect(launched.result).toBeUndefined();
+  const execution = await waiting("execution");
+  await writeFile(join(statePath(execution), "release"), "");
+  await vi.waitFor(async () => {
+    expect(await controller.inspect("execution")).toMatchObject({
+      execution: { status: "completed" },
+      result: { outcome: "completed" },
+    });
+  });
+  expect(runs.size).toBe(1);
+});
+
+it("fences a staged launch when fresh external confirmation fails", async () => {
+  const controller = subsystem();
+  const confirmLaunch = async () => {
+    const execution = controller.executions.get("execution")!;
+    await expect(stat(join(statePath(execution), "request.json"))).resolves.toBeDefined();
+    throw new Error("Fixture no longer eligible.");
+  };
+  await expect(controller.execute({ ...intent(), confirmLaunch })).rejects.toThrow(
+    "no longer eligible",
+  );
+  expect(controller.executions.get("execution")).toMatchObject({
+    status: "not_started",
+    remote: { launchAuthorized: false },
+  });
+  expect(runs.size).toBe(0);
+});
+
 it("releases a claim after its controller is killed after staging and retries under a new ID", async () => {
   const killed = spawnSync(
     process.execPath,

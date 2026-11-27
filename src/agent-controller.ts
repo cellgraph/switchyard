@@ -17,7 +17,11 @@ import { createNativeAgent } from "./native-agent.ts";
 import { createRexExecution } from "./rex-execution.ts";
 
 type Assignment = ExecutionIntent &
-  Pick<AgentTurn, "prompt" | "outputSchema" | "signal"> & { mayLaunch?: () => boolean };
+  Pick<AgentTurn, "prompt" | "outputSchema" | "signal"> & {
+    confirmLaunch?: () => Promise<boolean>;
+    mayLaunch?: () => boolean;
+    waitForResult?: boolean;
+  };
 
 const persistenceRetryDelays = [25, 75];
 

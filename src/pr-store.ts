@@ -149,14 +149,14 @@ export function createPrStore(
             SELECT assignment.id FROM pr_assignments AS assignment
             JOIN agent_executions AS execution ON execution.id=assignment.execution_id
             WHERE assignment.workflow_id=? AND assignment.execution_id=?
-              AND assignment.proof IS NULL AND assignment.claim IS NULL
+              AND assignment.proof IS NULL
               AND assignment.superseded=0 AND execution.status IN ('failed','completed')
           `,
             )
             .get(id, action.executionId);
           if (!isOperatorHeld(workflow) || !eligible)
             throw new Error(
-              "Abandonment requires a held, terminal execution without a usable result.",
+              "Abandonment requires a held, terminal execution without corroborated publication evidence.",
             );
           db.prepare("UPDATE pr_assignments SET superseded=1 WHERE id=?").run(eligible.id!);
         }
@@ -280,18 +280,18 @@ export function createPrStore(
         assignment.id,
       );
     },
-    otherRunning(workflowId: string) {
-      return Boolean(
-        db
-          .prepare(
-            `
-        SELECT 1 FROM pr_assignments JOIN agent_executions ON agent_executions.id=pr_assignments.execution_id
+    blockingExecutions(workflowId: string): string[] {
+      return db
+        .prepare(
+          `
+        SELECT agent_executions.id FROM pr_assignments
+        JOIN agent_executions ON agent_executions.id=pr_assignments.execution_id
         WHERE workflow_id!=? AND agent_executions.status IN ('running','unknown')
-          AND remote_result_digest IS NULL LIMIT 1
+          AND remote_result_digest IS NULL
       `,
-          )
-          .get(workflowId),
-      );
+        )
+        .all(workflowId)
+        .map((row) => String(row.id));
     },
     allowances(id: string) {
       const counts = db
