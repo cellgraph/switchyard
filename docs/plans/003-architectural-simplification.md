@@ -45,7 +45,7 @@ The A2 baseline records sessions separately from execution attempts. It records 
 
 **Acceptance.** The report records successful start and continuation with both providers after independent Switchyard process exits and recovery. The offline suite exercises native calls, structured results, failure and cancellation where supported, duplicate claims and ambiguous recovery. Local verification used the existing native accounts and settings. Separately metered API requests require operator direction.
 
-**Gate before long-lived Codex dispatch.** The real SDK and an offline child reproduce the uncaught stdin `EPIPE` on the pinned and latest stable versions tested. Keep standalone invocation for A3. Before running the adapter within a long-lived controller, verify a supported SDK release handles the early-exit fixture in process and retains conservative outcomes. A separate option is to keep SDK execution in a supervised process and verify in the selected execution mechanism that it confines the crash, correlates durable intent and results, and holds unresolved claims without replay after process loss. Evaluate that option when selecting the Phase C mechanism. The current standalone process establishes local containment. Long-lived integration remains gated. [Deferred finding from PR #26](https://github.com/cellgraph/switchyard/pull/26#discussion_r4711789830)
+**Long-lived Codex dispatch.** The pinned SDK can terminate its Node process with an uncaught stdin `EPIPE` when the native child exits early. Standalone local invocation retains its process boundary. The C2 Rex executor provides the boundary for long-lived controller dispatch and keeps the original controller-owned claim held if the remote process crashes. [Deferred finding from PR #26](https://github.com/cellgraph/switchyard/pull/26#discussion_r4711789830)
 
 ### Phase B — Establish read-only GitHub reconciliation
 
@@ -68,21 +68,21 @@ Phase B2 uses one reconciliation worker for startup, periodic sweeps, authentica
 - Store observed eligibility with the PR lifecycle status. GitHub can stop and reactivate a workflow under the same ID. An operator hold remains effective across lifecycle and head changes. A final eligible observation and durable generation guard protect changes to active state and exact-head evidence, including overlapping reads at the same head.
 - Scope discovery retries to the enabled repository and keep installation-wide authentication and primary limits, shared secondary limits and per-PR or same-commit retry deadlines where applicable. A failed discovery reports partial progress and does not imply closure. Manual and continuous runs share the same SQLite ownership claim and inspection command.
 
-**Acceptance.** Offline fixtures cover authenticated transient signalling, missed, duplicate and out-of-order notifications, paginated discovery, eligibility changes, overlapping observations, SQLite compatibility, retry scopes and native execution recovery. Phase B establishes read-only observation. The [Phase C](#phase-c--investigate-rex-then-implement-explicit-remote-placement) placement spike, [Phase D](#phase-d--complete-the-pr-workflow-cli-and-cutover) role integration and [GraphQL production gate](#remaining-implementation-choices) remain open.
+**Acceptance.** Offline fixtures cover authenticated transient signalling, missed, duplicate and out-of-order notifications, paginated discovery, eligibility changes, overlapping observations, SQLite compatibility, retry scopes and native execution recovery. Phase B establishes read-only observation. The [Phase D](#phase-d--complete-the-pr-workflow-cli-and-cutover) role integration and GraphQL production gate remain open.
 
 ### Phase C — Investigate Rex, then implement explicit remote placement
 
 #### C1 — Rex execution mechanism spike
 
-The [C1 spike report](../rex-execution-spike.md) records live VM-to-Mac launch, reconnection, exit evidence, file transfer, cancellation, native session continuation and the offline Codex SDK crash. It recommends the Rex CLI plus a thin executor, subject to operator acceptance of the mechanism and production access boundary.
+The [C1 spike report](../rex-execution-spike.md) records the VM-to-Mac experiments and supports using the Rex CLI with a thin executor. The Mac experiments informed the transport choice.
 
-#### C2 — Explicit remote placement
+#### C2 — Explicit remote execution
 
-Select the transport and lifecycle behavior needed for authenticated dispatch, result correlation and recovery. If Rex proves unsuitable, consult the [historical HTTP worker implementation and tests](../distributed-workers.md) against the simplified contract. Treat a disconnect or expired claim as uncertainty when it cannot prove non-execution. Use the same logical execution and result interface for local and remote placement.
+The initial self-hosting topology uses two persistent Linux VMs. The `switchyard` account on `switchyard-controller.exe.xyz` owns SQLite and connects with Rex over SSH to the `exedev` account's Rex socket on `switchyard-agent.exe.xyz`. Named agent configurations explicitly select local or Rex placement and supply the native invocation context. The operator maintains access, subscriptions and Git credentials.
 
-Introduce named agent configurations as concrete placement and role needs emerge in Phases C and D. They can describe the communication mechanism, placement, runtime, model and invocation context. Consider attribution and appropriately scoped access on distributed hosts and as roles act more independently.
+Switchyard claims attempts before dispatch. Rex launches a single-assignment Node executor using the existing native adapters. Private files provide stable correlation, early native references and atomic final results. The controller can inspect an existing attempt after process or connection loss, interrupt the correlated block and resolve a held attempt from valid evidence. Uncertainty holds the assignment and session. Only affirmative non-execution permits an explicit retry. [Execution guide](../agent-sessions.md)
 
-**Acceptance.** Document the spike and transport decision before implementation. Demonstrate explicitly placed execution and continuation on the operator's VM and Mac mini, with their configured runtimes. A temporarily unavailable target waits. Disconnect and reconnect tests show established outcomes can be reconciled and uncertain work pauses without duplicate execution. Confirm cancellation and inspection behavior for the selected transport. Dynamic scheduling, capability negotiation, load balancing, automatic failover and session migration are outside this phase.
+**Acceptance.** The [C2 verification report](../rex-execution-verification.md) records both providers' start and continuation, repeated result retrieval, controller restart, disconnect and lost acknowledgement, targeted cancellation and the offline A3 SDK crash on disposable state on the two VMs. The active polling controller and its database remain in service. Deployment and workflow role dispatch are Phase D work.
 
 ### Phase D — Complete the PR workflow, CLI and cutover
 
@@ -119,4 +119,4 @@ Persist plan, increment, assignment and PR progress so the controller can resume
 
 - Establish the exact GitHub identities and reference checks that corroborate native structured results, including how to handle evidence edited, deleted or no longer attributable. Determine the minimal source of truth for required-check names and producer identity.
 - Confirm the CLI treatment of a GitHub-reopened PR, preserving its history and limits. An explicit operator stop remains in effect until operator action.
-- Select remote execution from the Phase C spike. Investigate notification integration during deployment without making it a release dependency.
+- Investigate notification integration during deployment without making it a release dependency.

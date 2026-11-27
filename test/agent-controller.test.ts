@@ -8,6 +8,7 @@ import type { AgentResult, AgentTurn } from "../src/agent.ts";
 import { WorkflowStore } from "../src/store.ts";
 import {
   crashAfterSession,
+  earlyExitStub,
   executionContext as context,
   runSdkWithEarlyExit,
 } from "./fixtures/execution.ts";
@@ -196,7 +197,7 @@ it("recovers a dead owner once and holds its assignment and native session witho
 
 it("keeps an offline Codex SDK early exit held without replay", () => {
   const executable = join(dir, "early-exit-codex");
-  writeFileSync(executable, '#!/bin/sh\n: > "$0.started"\nexit 2\n', { mode: 0o700 });
+  writeFileSync(executable, earlyExitStub, { mode: 0o700 });
 
   const worker = runSdkWithEarlyExit(path, executable);
   expect(worker.error).toBeUndefined();

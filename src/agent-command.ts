@@ -2,14 +2,19 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, writeSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { loadNamedAgent } from "./agent-config.ts";
 import { createAgentController } from "./agent-controller.ts";
 import type { ExecutionIntent } from "./agent-store.ts";
+import { createRexExecution } from "./rex-execution.ts";
 import { WorkflowStore } from "./store.ts";
 
 const usage = [
   "agent run --provider codex|claude-code [--cwd DIR] [--model MODEL] [--config-dir DIR] --prompt FILE [--schema FILE]",
+  "agent run --agent NAME --agents FILE --prompt FILE [--schema FILE]",
   "agent run --session SESSION_ID --prompt FILE [--schema FILE]",
   "agent status EXECUTION_ID",
+  "agent inspect EXECUTION_ID",
+  "agent cancel EXECUTION_ID",
   "agent recover",
 ].join("\n");
 
@@ -22,6 +27,8 @@ export async function runAgentCommand(args: string[], dbPath: string): Promise<b
       args: rest,
       options: {
         provider: { type: "string" },
+        agent: { type: "string" },
+        agents: { type: "string" },
         cwd: { type: "string" },
         model: { type: "string" },
         "config-dir": { type: "string" },
@@ -32,16 +39,14 @@ export async function runAgentCommand(args: string[], dbPath: string): Promise<b
         execution: { type: "string" },
       },
     });
-    const { provider, cwd, model, session, prompt, schema } = values;
+    const { provider, agent, agents, cwd, model, session, prompt, schema } = values;
     const configDirectory = values["config-dir"];
+    const inline = [provider, cwd, model, configDirectory].some((value) => value !== undefined);
     if (
       !prompt ||
-      (session !== undefined &&
-        (!session ||
-          provider !== undefined ||
-          cwd !== undefined ||
-          model !== undefined ||
-          configDirectory !== undefined))
+      (session !== undefined && (!session || inline || agent !== undefined)) ||
+      (agent !== undefined && (!agent || !agents || inline)) ||
+      (agent === undefined && agents !== undefined)
     )
       throw new Error(usage);
     const id = values.execution ?? randomUUID();
@@ -49,6 +54,8 @@ export async function runAgentCommand(args: string[], dbPath: string): Promise<b
     let intent: ExecutionIntent;
     if (session) {
       intent = { id, assignmentId, sessionId: session };
+    } else if (agent) {
+      intent = { id, assignmentId, ...loadNamedAgent(agents!, agent) };
     } else {
       if (provider !== "codex" && provider !== "claude-code") throw new Error(usage);
       intent = {
@@ -100,13 +107,31 @@ export async function runAgentCommand(args: string[], dbPath: string): Promise<b
     return true;
   }
 
-  if ((command !== "status" || rest.length !== 1) && (command !== "recover" || rest.length !== 0))
+  if (
+    (!(command === "status" || command === "inspect" || command === "cancel") ||
+      rest.length !== 1) &&
+    (command !== "recover" || rest.length !== 0)
+  )
     throw new Error(usage);
   const store = new WorkflowStore(dbPath);
   try {
     const executions = store.agentExecutions();
+    const remote = createRexExecution(executions);
     if (command === "recover") {
-      console.info(JSON.stringify({ unknownExecutions: executions.recover() }));
+      const unknownExecutions = executions.recover();
+      const remoteExecutions = await remote.recover();
+      console.info(
+        JSON.stringify({
+          unknownExecutions,
+          ...(remoteExecutions.length ? { remoteExecutions } : {}),
+        }),
+      );
+    } else if (command === "inspect") {
+      console.info(JSON.stringify(await remote.inspect(rest[0]!)));
+    } else if (command === "cancel") {
+      const result = await remote.cancel(rest[0]!);
+      console.info(JSON.stringify(result));
+      if (result.interruption !== "requested") process.exitCode = 1;
     } else {
       const execution = executions.get(rest[0]!);
       if (!execution) throw new Error("Execution record not found.");

@@ -12,7 +12,7 @@ A persistent VM controller uses SQLite and reads GitHub state. Authenticated web
 
 Phase B2 automatically discovers open, non-draft, same-repository PRs in enabled GitHub repositories. A read-only GitHub App observes lifecycle and exact-head CI through startup, periodic sweeps, authenticated webhook signals and operator requests. SQLite retains workflows and evidence references. See the [GitHub App guide](docs/github-app.md), [operating guide](docs/unattended.md) and [review evidence guide](docs/reviews.md).
 
-The standalone [agent CLI](docs/agent-sessions.md) supports explicit local Codex and Claude Code assignments. Phase C investigates Rex and explicit remote placement. Phase D adds autonomous review, adjudication, implementation, handoff and the deployment cutover. The [native execution verification report](docs/native-execution-verification.md) records the Codex SDK gate for long-lived dispatch.
+The [agent CLI](docs/agent-sessions.md) supports explicit local and Rex-placed Codex and Claude Code assignments. The controller owns execution state on its Linux VM and runs remote native turns on a dedicated Linux agent VM. Phase D adds autonomous review, adjudication, implementation, handoff and the deployment cutover.
 
 [ADR-0006](docs/adr/0006-orchestrate-through-native-tools.md) records the accepted architecture, [Plan 003](docs/plans/003-architectural-simplification.md) sequences implementation, and the [architecture overview](docs/architecture.md#current-implementation) describes current behavior.
 
