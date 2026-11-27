@@ -42,7 +42,7 @@ export function localProcessAlive(pid: number | null): boolean {
 }
 
 const applicationId = 0x53575944; // SWYD
-const schemaVersion = 19;
+const schemaVersion = 20;
 const unsupportedDatabase =
   "Unsupported Switchyard database identity or schema version. Use a fresh SWITCHYARD_DB_PATH for this implementation.";
 

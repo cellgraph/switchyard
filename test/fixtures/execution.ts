@@ -1,4 +1,15 @@
 import { spawnSync } from "node:child_process";
+import { Codex } from "@openai/codex-sdk";
+
+export const earlyExitPrompt = "x".repeat(4 * 1024 * 1024);
+export const earlyExitStub = '#!/bin/sh\nprintf "started\\n" >> "$0.started"\nexit 2\n';
+
+export async function runSdkEarlyExitTurn(executable: string, prompt: string): Promise<never> {
+  const sdk = new Codex({ codexPathOverride: executable, env: {} });
+  const { events } = await sdk.startThread().runStreamed(prompt);
+  for await (const event of events) throw new Error("Unexpected SDK event: " + event.type);
+  throw new Error("SDK stream ended without reporting the fixture failure.");
+}
 
 export const executionContext = { provider: "codex", workingDirectory: "/fixture" } as const;
 
@@ -12,19 +23,15 @@ export function runSdkWithEarlyExit(dbPath: string, executable: string) {
       "-e",
       `
         import assert from "node:assert/strict";
-        import { Codex } from "@openai/codex-sdk";
+        import { earlyExitPrompt, runSdkEarlyExitTurn } from ${JSON.stringify(import.meta.url)};
         import { createAgentController } from ${JSON.stringify(controller)};
         import { WorkflowStore } from ${JSON.stringify(store)};
         const store = new WorkflowStore(process.argv[1]);
         let sdkError;
         const controller = createAgentController(store.agentExecutions(), () => ({
           async start(turn) {
-            const sdk = new Codex({ codexPathOverride: process.argv[2], env: {} });
             try {
-              const { events } = await sdk.startThread().runStreamed(turn.prompt);
-              for await (const event of events) {
-                throw new Error("Unexpected SDK event: " + event.type);
-              }
+              await runSdkEarlyExitTurn(process.argv[2], turn.prompt);
             } catch (error) {
               sdkError = error;
               throw error;
@@ -33,7 +40,7 @@ export function runSdkWithEarlyExit(dbPath: string, executable: string) {
           },
         }));
         const run = await controller.execute({
-          id: "early-exit", assignmentId: "sdk-assignment", prompt: "x".repeat(4 * 1024 * 1024),
+          id: "early-exit", assignmentId: "sdk-assignment", prompt: earlyExitPrompt,
           context: ${JSON.stringify(executionContext)},
         });
         // The controller translates any adapter exception to unknown. Verify the actual SDK error.

@@ -1,5 +1,5 @@
-import { isAbsolute } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { parseAgentContext, parseRexPlacement, validIdentifier } from "./agent-config.ts";
 import {
   validNativeId,
   type AgentAdapter,
@@ -8,8 +8,8 @@ import {
   type AgentTurn,
 } from "./agent.ts";
 import { type createAgentStore, type ExecutionIntent } from "./agent-store.ts";
-import { createClaudeAgent } from "./claude-agent.ts";
-import { createCodexAgent } from "./codex-agent.ts";
+import { createNativeAgent } from "./native-agent.ts";
+import { createRexExecution } from "./rex-execution.ts";
 
 type Assignment = ExecutionIntent & Pick<AgentTurn, "prompt" | "outputSchema" | "signal">;
 
@@ -24,26 +24,32 @@ function sqliteContention(error: unknown): boolean {
 
 export function createAgentController(
   executions: ReturnType<typeof createAgentStore>,
-  adapterFor: (context: AgentContext) => AgentAdapter = (context) =>
-    context.provider === "codex" ? createCodexAgent(context) : createClaudeAgent(context),
+  adapterFor: (context: AgentContext) => AgentAdapter = createNativeAgent,
+  remote = createRexExecution(executions),
 ) {
   return {
     async execute(assignment: Assignment) {
       const { id, assignmentId, context, prompt, outputSchema, signal } = assignment;
-      if (![id, assignmentId].every((value) => /^[a-z0-9][a-z0-9._:-]{0,199}$/i.test(value)))
+      if (![id, assignmentId].every(validIdentifier))
         throw new Error("Execution and assignment IDs must be short identifiers.");
       if (!prompt.trim()) throw new Error("An assignment prompt is required.");
-      if (
-        context &&
-        (!isAbsolute(context.workingDirectory) ||
-          (context.configDirectory !== undefined && !isAbsolute(context.configDirectory)))
-      )
-        throw new Error(
-          "The working directory and any native config directory must be absolute paths.",
-        );
+      if (assignment.agentName !== undefined && !validIdentifier(assignment.agentName))
+        throw new Error("An agent name must be a short identifier.");
 
-      const claim = executions.claim(assignment);
+      const rex = assignment.rex && parseRexPlacement(assignment.rex);
+      const claim = executions.claim(
+        context
+          ? {
+              id,
+              assignmentId,
+              context: parseAgentContext(context, Boolean(rex)),
+              ...(assignment.agentName === undefined ? {} : { agentName: assignment.agentName }),
+              ...(rex ? { rex } : {}),
+            }
+          : assignment,
+      );
       if (!claim.claimed) return { execution: claim.execution, session: claim.session };
+      if (claim.session.rex) return remote.dispatch(claim.execution, claim.session, assignment);
 
       let nativeId = claim.session.nativeId;
       let conflictingSession = false;

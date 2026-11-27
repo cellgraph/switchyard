@@ -64,7 +64,7 @@ describe("fresh database and durable review references", () => {
   it("sets both identity and version for a fresh database", () => {
     using raw = new DatabaseSync(path, { readOnly: true });
     expect(raw.prepare("PRAGMA application_id").get()?.application_id).toBe(0x53575944);
-    expect(raw.prepare("PRAGMA user_version").get()?.user_version).toBe(19);
+    expect(raw.prepare("PRAGMA user_version").get()?.user_version).toBe(20);
     const tables = raw
       .prepare("SELECT name FROM sqlite_schema WHERE type='table'")
       .all()

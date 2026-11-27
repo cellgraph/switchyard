@@ -11,6 +11,7 @@ import {
   type GitHubRepository,
 } from "./github-app.ts";
 import { PullRequestHeadChangedError } from "./reconcile.ts";
+import { createRexExecution } from "./rex-execution.ts";
 import { localProcessAlive, type WorkflowStore } from "./store.ts";
 import type { ReconcileHint } from "./webhook.ts";
 import { isOperatorHeld } from "./workflow.ts";
@@ -254,6 +255,14 @@ export async function runController({
       repositories,
       interruptedRun: claim.interruptedRun,
     });
+    for (const { execution, observation } of await createRexExecution(
+      store.agentExecutions(),
+    ).recover(signal))
+      report("remote_execution_observed", {
+        executionId: execution.id,
+        status: execution.status,
+        observation,
+      });
     controller.scheduleSweep();
     while (!signal.aborted) {
       await controller.waitForWork();
