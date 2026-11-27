@@ -253,8 +253,7 @@ export function createPrCoordinator({
         resolvedFindingIds: number[];
       }> = [];
 
-      const replacedReviews = new Set<string>();
-      const replacementFindings = new Set<number>();
+      const replacedReviews = new Map<string, { assignment: PrAssignment; findingIds: number[] }>();
       const historicalDispositions = new Map<
         number,
         { item: Disposition; assignment: PrAssignment }
@@ -273,24 +272,18 @@ export function createPrCoordinator({
           assignment.claim &&
           "reviewId" in assignment.claim
         ) {
-          replacedReviews.add(assignment.id);
-          for (const id of assignment.claim.findingIds) {
-            const prior = historicalDispositions.get(id);
-            if (prior?.item.decision === "reject") continue;
-            if (
-              prior?.item.decision === "defer" &&
-              (await deferredIssueProof(github, target, prior.assignment, prior.item, signal))
-            )
-              continue;
-            replacementFindings.add(id);
-          }
+          replacedReviews.set(assignment.id, {
+            assignment,
+            findingIds: assignment.claim.findingIds,
+          });
         }
       }
       for (const assignment of assignments) {
         if (
           assignment.superseded ||
           !assignment.claim ||
-          (assignment.input.role === "adjudicator" &&
+          (assignment.proof &&
+            assignment.input.role === "adjudicator" &&
             replacedReviews.has(assignment.input.reviewId))
         )
           continue;
@@ -411,7 +404,53 @@ export function createPrCoordinator({
           .filter(({ assignment }) => assignment.headSha === workflow.headSha)
           .flatMap(({ resolvedFindingIds }) => resolvedFindingIds),
       );
-      const needsReplacement = [...replacementFindings].filter((id) => !resolved.has(id));
+      const needsReplacement: number[] = [];
+      let renewedAdjudication: AssignmentInput | undefined;
+      for (const { assignment, findingIds } of replacedReviews.values()) {
+        const needsAdjudication: number[] = [];
+        let rootsVerified: boolean | undefined;
+        for (const id of findingIds) {
+          if (resolved.has(id)) continue;
+          const fresh = dispositions.get(id);
+          const prior = fresh ?? historicalDispositions.get(id);
+          if (prior?.item.decision === "reject") continue;
+          if (
+            prior?.item.decision === "defer" &&
+            (await deferredIssueProof(github, target, prior.assignment, prior.item, signal))
+          )
+            continue;
+          rootsVerified ??=
+            (await publicationProof(github, target, snapshot, assignment, signal))?.proof ===
+            assignment.proof;
+          if (!rootsVerified) {
+            needsReplacement.push(id);
+            continue;
+          }
+          if (prior && (prior.item.decision === "accept" || prior.item.decision === "escalate")) {
+            if (
+              fresh ||
+              (await publicationProof(github, target, snapshot, prior.assignment, signal))
+                ?.proof === prior.assignment.proof
+            ) {
+              dispositions.set(id, prior);
+              if (
+                prior.item.decision === "escalate" &&
+                direction &&
+                direction.id > prior.assignment.operatorVersion
+              )
+                needsAdjudication.push(id);
+              continue;
+            }
+          }
+          needsAdjudication.push(id);
+        }
+        if (!renewedAdjudication && needsAdjudication.length)
+          renewedAdjudication = {
+            role: "adjudicator",
+            reviewId: assignment.id,
+            findingIds: needsAdjudication,
+          };
+      }
       const accepted = [...dispositions.values()]
         .filter(({ item }) => item.decision === "accept" && !resolved.has(item.findingId))
         .map(({ item }) => item.findingId);
@@ -432,8 +471,9 @@ export function createPrCoordinator({
           check.outcome === "pending" &&
           workflow.requiredChecks?.includes(check.name),
       );
-      let next: AssignmentInput | undefined;
+      let next: AssignmentInput | undefined = renewedAdjudication;
       for (const { assignment, findingIds } of verifiedReviews) {
+        if (next) break;
         const missing = findingIds.filter((id) => {
           const known = dispositions.get(id);
           return (

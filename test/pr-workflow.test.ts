@@ -66,6 +66,7 @@ function fixture() {
   let retainedCommit = true;
   let throttlePublications = false;
   let unavailablePullRequest = false;
+  let unavailableIssues = false;
   let conflictingRex = false;
   let clock = Date.now() + 180_000;
   const calls: Array<Parameters<Execute>[0]> = [];
@@ -115,6 +116,7 @@ function fixture() {
       return comments;
     },
     async readIssue(_: unknown, number: number) {
+      if (unavailableIssues) throw new Error("GitHub issue endpoint unavailable.");
       return issues.get(number);
     },
     async readCommit(_: unknown, sha: string) {
@@ -319,6 +321,9 @@ function fixture() {
     calls,
     recoveries,
     completions,
+    set unavailableIssues(value: boolean) {
+      unavailableIssues = value;
+    },
     set unavailablePullRequest(value: boolean) {
       unavailablePullRequest = value;
     },
@@ -699,7 +704,7 @@ describe("autonomous PR coordination", () => {
     expect(f.workflow?.state).toBe("ready");
   });
 
-  it("requires renewed evidence after a replaced review's deferred issue disappears", async () => {
+  it("renews a lost deferral when the original finding can still be adjudicated", async () => {
     const f = fixture();
     f.hasFinding = true;
     f.decision = "defer";
@@ -713,18 +718,46 @@ describe("autonomous PR coordination", () => {
       executionId: f.calls[0]!.id,
       reason: "The deferred issue disappeared.",
     });
+    f.store.prWorkflows().operate(id, { kind: "resume", reason: "Publish a new deferral." });
+    f.hasFinding = false;
+    await f.tick();
+    expect(f.assignments.at(-1)?.input).toMatchObject({
+      role: "adjudicator",
+      findingIds: [finding],
+    });
+    await f.tick();
+    await f.tick();
+    expect(f.roles).toEqual(["reviewer", "adjudicator", "adjudicator", "reviewer"]);
+    expect(f.workflow?.state).toBe("ready");
+  });
+
+  it("skips obsolete deferral evidence after a replacement review verifies the finding is fixed", async () => {
+    const f = fixture();
+    f.hasFinding = true;
+    f.decision = "defer";
+    for (let i = 0; i < 3; i += 1) await f.tick();
+    const finding = f.findingId;
+    f.issues.clear();
+    f.comments.length = 0;
+    await f.tick();
+    f.store.prWorkflows().operate(id, {
+      kind: "replace_evidence",
+      executionId: f.calls[0]!.id,
+      reason: "The original comment and issue were removed.",
+    });
     f.store
       .prWorkflows()
-      .operate(id, { kind: "resume", reason: "Confirm what remains unresolved." });
+      .operate(id, { kind: "resume", reason: "Review the correction independently." });
+    f.move(1);
     f.hasFinding = false;
-    f.resolvePrevious = false;
     await f.tick();
     expect(f.assignments.at(-1)?.input).toEqual({
       role: "reviewer",
       previousFindingIds: [finding],
     });
+    f.unavailableIssues = true;
     await f.tick();
-    expect(f.workflow?.state).toBe("escalated");
+    expect(f.workflow?.state).toBe("ready");
   });
 
   it("requires reasoning alongside a mixed-case issue link", async () => {
