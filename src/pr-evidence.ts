@@ -42,6 +42,12 @@ function lines(body: unknown): string[] {
   return typeof body === "string" ? body.split(/\r?\n/).map((line) => line.trim()) : [];
 }
 
+function normalizeLink(link: string): string {
+  return link.replace(/^https:\/\/github\.com\/[^/]+\/[^/]+/i, (repository) =>
+    repository.toLowerCase(),
+  );
+}
+
 function authored(item: Record<string, unknown> | undefined, assignment: PrAssignment) {
   return object(item?.user)?.id === assignment.producerId;
 }
@@ -75,10 +81,11 @@ export async function publicationProof(
       body[0] !== `Review outcome: ${claim.outcome}`
     )
       return null;
-    const resolutionLines = body.filter((line) => line.startsWith("Resolved finding: "));
-    const expectedResolutions = claim.resolvedFindingIds.map(
-      (id) => `Resolved finding: ${findingUrl(target, id)}`,
-    );
+    const resolutionPrefix = "Resolved finding: ";
+    const resolutionLines = body
+      .filter((line) => line.startsWith(resolutionPrefix))
+      .map((line) => normalizeLink(line.slice(resolutionPrefix.length)));
+    const expectedResolutions = claim.resolvedFindingIds.map((id) => findingUrl(target, id));
     if (
       resolutionLines.length !== expectedResolutions.length ||
       expectedResolutions.some((line) => !resolutionLines.includes(line))
@@ -125,7 +132,7 @@ export async function publicationProof(
       let issueBody: unknown;
       if (disposition.issueNumber !== null) {
         const issueUrl = `https://github.com/${target.repository}/issues/${disposition.issueNumber}`;
-        if (!body.includes(issueUrl)) return null;
+        if (!body.some((line) => normalizeLink(line) === issueUrl)) return null;
         const issue = object(await github.readIssue(target, disposition.issueNumber, signal));
         if (
           !issue ||
@@ -134,7 +141,9 @@ export async function publicationProof(
           !authored(issue, assignment) ||
           !publishedSince(issue.created_at, assignment.createdAt) ||
           typeof issue.body !== "string" ||
-          !issue.body.split(/\s/).includes(findingUrl(target, disposition.findingId))
+          !issue.body
+            .split(/\s/)
+            .some((link) => normalizeLink(link) === findingUrl(target, disposition.findingId))
         )
           return null;
         issueBody = issue.body;

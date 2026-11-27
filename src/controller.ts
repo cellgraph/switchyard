@@ -148,7 +148,8 @@ export function createController({
       if (discover) {
         for (const { pullRequest } of pr.requests(target.repository)) pullRequests.add(pullRequest);
         for (const workflow of store.listWorkflows(target.repository)) {
-          if (workflow.githubStatus !== "merged") pullRequests.add(workflow.identity.pullRequest);
+          if (workflow.githubStatus !== "merged" || pr.needsExecutionRecovery(workflow.id))
+            pullRequests.add(workflow.identity.pullRequest);
         }
         const discovered = await attempt(target, undefined, async () => {
           for (const number of await github.listOpenPullRequests(target, signal))

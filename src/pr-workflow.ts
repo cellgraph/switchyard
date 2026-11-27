@@ -73,20 +73,27 @@ export function createPrCoordinator({
     signal?: AbortSignal,
   ) => {
     const workflow = store.findWorkflow(target.repository, target.pullRequest);
-    if (!isActive(workflow) || workflow.githubStatus !== "eligible") return false;
+    if (!workflow) return false;
     checkGitHubDrain(signal);
-    if (!configuration) {
-      if (workflow.state === "ready")
+    const assignments = pr.list(workflow.id);
+    const pending = assignments.findLast((item) => !item.proof && !item.superseded);
+    if (!configuration || !isActive(workflow) || workflow.githubStatus !== "eligible") {
+      if (!configuration && workflow.state === "ready")
         store.transition(workflow.id, { type: "readiness", ready: false });
+      if (pending && pr.needsExecutionRecovery(workflow.id)) {
+        const observed = await inspectExisting(pending.executionId);
+        if ("observation" in observed) {
+          const claim = parseClaim(pending, observed.result?.structuredOutput);
+          if (claim) pr.capture(pending, claim);
+        }
+      }
       return false;
     }
     const config = configuration;
     const guard = { workflow, version: pr.version(workflow.id) };
-    const assignments = pr.list(workflow.id);
     const direction = pr
       .events(workflow.id)
       .findLast((event) => event.kind === "direction" || event.kind === "replace_evidence");
-    const pending = assignments.findLast((item) => !item.proof && !item.superseded);
     const reference = pullUrl(target);
 
     const pause = (reason: string, action: string, references: string[] = []) =>
@@ -167,6 +174,10 @@ export function createPrCoordinator({
       });
       const claim = parseClaim(assignment, result.result?.structuredOutput);
       if (claim) pr.capture(assignment, claim);
+      if (result.execution.status === "not_started" && !signal?.aborted && pr.unchanged(guard))
+        throw new Error(
+          `Rex assignment ${assignment.executionId} did not start: ${result.execution.reason ?? "No launch evidence."}`,
+        );
       // A follow-up pass reconciles any result against a fresh PR and CI snapshot.
       return result.execution.status !== "not_started" && result.execution.status !== "running";
     }
@@ -243,6 +254,12 @@ export function createPrCoordinator({
 
       const replacedReviews = new Set<string>();
       const replacementFindings = new Set<number>();
+      const historicalDispositions = new Map<number, Disposition>();
+      for (const { claim, proof, superseded } of assignments) {
+        if (proof && !superseded && claim && "dispositions" in claim) {
+          for (const item of claim.dispositions) historicalDispositions.set(item.findingId, item);
+        }
+      }
       for (const assignment of assignments) {
         if (
           assignment.superseded &&
@@ -251,7 +268,10 @@ export function createPrCoordinator({
           "reviewId" in assignment.claim
         ) {
           replacedReviews.add(assignment.id);
-          for (const id of assignment.claim.findingIds) replacementFindings.add(id);
+          for (const id of assignment.claim.findingIds) {
+            const decision = historicalDispositions.get(id)?.decision;
+            if (decision !== "reject" && decision !== "defer") replacementFindings.add(id);
+          }
         }
       }
       for (const assignment of assignments) {

@@ -659,6 +659,65 @@ describe("autonomous PR coordination", () => {
     expect(f.calls).toHaveLength(1);
   });
 
+  it("can replace a deleted rejected finding without claiming a code fix", async () => {
+    const f = fixture();
+    f.hasFinding = true;
+    f.decision = "reject";
+    for (let i = 0; i < 3; i += 1) await f.tick();
+    expect(f.workflow?.state).toBe("ready");
+    f.comments.length = 0;
+    await f.tick();
+    f.store.prWorkflows().operate(id, {
+      kind: "replace_evidence",
+      executionId: f.calls[0]!.id,
+      reason: "The original review was removed.",
+    });
+    f.store.prWorkflows().operate(id, { kind: "resume", reason: "Review the unchanged head." });
+    f.hasFinding = false;
+    await f.tick();
+    expect(f.assignments.at(-1)?.input).toEqual({ role: "reviewer", previousFindingIds: [] });
+    await f.tick();
+    expect(f.workflow?.state).toBe("ready");
+  });
+
+  it("accepts canonical repository casing in deferred issue and finding links", async () => {
+    const f = fixture();
+    f.hasFinding = true;
+    f.decision = "defer";
+    await f.tick();
+    await f.tick();
+    const reply = f.comments.at(-1)!;
+    reply.body = String(reply.body).replace("cellgraph/fixture", "CellGraph/Fixture");
+    const issue = f.issues.values().next().value as { body: string };
+    issue.body = issue.body.replace("cellgraph/fixture", "CellGraph/Fixture");
+    await f.tick();
+    expect(f.workflow?.state).toBe("ready");
+  });
+
+  it("recovers an outstanding turn on a merged PR in later sweeps without dispatch", async () => {
+    const f = fixture();
+    f.unavailable = "unknown";
+    await f.tick();
+    const executionId = f.calls[0]!.id;
+    f.snapshot.state = "closed";
+    f.snapshot.merged = true;
+    await f.tick();
+    expect(f.workflow?.githubStatus).toBe("merged");
+    await f.tick();
+    f.beforeInspect = () => {
+      f.store.agentExecutions().recordRemote(executionId, {
+        nativeId: "merged-native",
+        digest: "merged-result",
+        blockId: "block:22222222-2222-2222-2222-222222222222",
+        outcome: { outcome: "completed" },
+      });
+    };
+    f.controller.scheduleSweep();
+    expect(await f.controller.runPass()).toBe(true);
+    expect(f.store.agentExecutions().get(executionId)?.status).toBe("completed");
+    expect(f.calls).toHaveLength(1);
+  });
+
   it("requires a new review to account for deleted verified findings after operator replacement", async () => {
     const f = fixture();
     f.hasFinding = true;
@@ -773,7 +832,7 @@ describe("autonomous PR coordination", () => {
     const f = fixture();
     f.unavailable = "not_started";
     f.useRealTime();
-    await f.tick();
+    await expect(f.tick()).rejects.toThrow("did not start");
     expect(f.allowance.reviews.reservedOrUsed).toBe(0);
     await f.tick();
     const assignment = f.assignments[0]!;

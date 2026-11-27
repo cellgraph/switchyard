@@ -290,6 +290,20 @@ export function createPrStore(
         assignment.id,
       );
     },
+    needsExecutionRecovery(workflowId: string): boolean {
+      return Boolean(
+        db
+          .prepare(
+            `
+        SELECT 1 FROM pr_assignments
+        JOIN agent_executions ON agent_executions.id=pr_assignments.execution_id
+        WHERE workflow_id=? AND superseded=0 AND agent_executions.status IN ('running','unknown')
+          AND remote_result_digest IS NULL LIMIT 1
+      `,
+          )
+          .get(workflowId),
+      );
+    },
     blockingExecutions(workflowId: string): string[] {
       return db
         .prepare(
