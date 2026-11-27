@@ -1,9 +1,10 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { RexPlacement } from "../src/agent-config.ts";
@@ -27,7 +28,11 @@ let disconnect: boolean;
 let sessionLost: boolean;
 let loseAck: boolean;
 let hideEvidence: boolean;
+let acknowledgementBlock: string | undefined;
 let targetBlock: string | undefined;
+let pauseStage: (() => Promise<void>) | undefined;
+let pauseAck: (() => Promise<void>) | undefined;
+let pauseBlockInspect: (() => Promise<void>) | undefined;
 let pauseRead: (() => Promise<void>) | undefined;
 let pauseProcess: (() => Promise<void>) | undefined;
 const context = () => ({ provider: "codex" as const, workingDirectory: root });
@@ -66,6 +71,7 @@ const transport = vi.fn(async (binary: string, args: string[]) => {
     }
     if (stageFails) throw new Error("failed to stage");
     await cp(source, join(destination.slice(1), basename(source)), { recursive: true });
+    if (pauseStage) await pauseStage();
     return "";
   }
   if (command === "run") {
@@ -87,10 +93,12 @@ const transport = vi.fn(async (binary: string, args: string[]) => {
       hideEvidence = true;
       throw new Error("lost launch acknowledgement");
     }
-    return JSON.stringify({ block_ids: [blockId] });
+    if (pauseAck) await pauseAck();
+    return JSON.stringify({ block_ids: [acknowledgementBlock ?? blockId] });
   }
   if (command === "block" && args[4] === "inspect") {
     const blockId = args.at(-2)!;
+    if (pauseBlockInspect) await pauseBlockInspect();
     return JSON.stringify({
       session_id: rex.session,
       block: { block_id: blockId, label: runs.get(blockId)?.label },
@@ -137,7 +145,10 @@ beforeEach(async () => {
   runs = new Map();
   stageFails = disconnect = sessionLost = loseAck = hideEvidence = false;
   launchError = undefined;
+  acknowledgementBlock = undefined;
   targetBlock = undefined;
+  pauseStage = pauseAck = undefined;
+  pauseBlockInspect = undefined;
   pauseRead = undefined;
   pauseProcess = undefined;
   transport.mockClear();
@@ -152,8 +163,8 @@ afterEach(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
-function subsystem() {
-  const executions = store.agentExecutions();
+function subsystem(connection = store) {
+  const executions = connection.agentExecutions();
   const remote = createRexExecution(executions, transport);
   const local = vi.fn(() => {
     throw new Error("Remote assignment reached local adapter.");
@@ -170,11 +181,171 @@ async function waiting(id: string): Promise<ExecutionRecord> {
   });
 }
 
+it("releases a claim after its controller is killed after staging and retries under a new ID", async () => {
+  const killed = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `
+    import { cp } from "node:fs/promises";
+    import { basename, join } from "node:path";
+    import { setTimeout as delay } from "node:timers/promises";
+    import { createAgentController } from "./src/agent-controller.ts";
+    import { createRexExecution } from "./src/rex-execution.ts";
+    import { WorkflowStore } from "./src/store.ts";
+
+    const executions = new WorkflowStore(process.argv[1]).agentExecutions();
+    const remote = createRexExecution(executions, async (_, args) => {
+      if (args[3] !== "cp") throw new Error("Expected staging only");
+      const [source, destination] = args.slice(-2);
+      await cp(source, join(destination.slice(1), basename(source)), { recursive: true });
+      process.kill(process.pid, "SIGKILL");
+      await delay(60_000);
+    });
+    await createAgentController(executions, undefined, remote).execute(JSON.parse(process.argv[2]));
+  `,
+      db,
+      JSON.stringify(intent()),
+    ],
+    { encoding: "utf8", env: { ...process.env, TMPDIR: root }, timeout: 4000 },
+  );
+  expect(killed.signal, killed.stderr).toBe("SIGKILL");
+  const staged = store.agentExecutions().get("execution")!;
+  expect(staged).toMatchObject({ status: "running", remote: { launchAuthorized: false } });
+  await expect(stat(join(statePath(staged), "request.json"))).resolves.toBeDefined();
+
+  store.close();
+  store = new WorkflowStore(db);
+  const restarted = subsystem();
+  expect(await restarted.recover()).toMatchObject([
+    { execution: { status: "not_started", remote: { launchAuthorized: false } } },
+  ]);
+  expect(await restarted.recover()).toEqual([]);
+  expect((await restarted.execute(intent())).execution.status).toBe("not_started");
+  expect(transport).not.toHaveBeenCalled();
+  const retried = await restarted.execute(intent("retry"));
+  expect(retried.execution).toMatchObject({
+    status: "completed",
+    remote: { launchAuthorized: true },
+  });
+  expect(retried.execution.remote?.key).not.toBe(staged.remote?.key);
+  expect(runs.size).toBe(1);
+});
+
+it("leaves live staging alone and prevents dispatch once prelaunch recovery wins", async () => {
+  const controller = subsystem();
+  const staged = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  pauseStage = async () => {
+    staged.resolve();
+    await resume.promise;
+  };
+  const dispatch = controller.execute(intent());
+  try {
+    await staged.promise;
+    const observerStore = new WorkflowStore(db);
+    try {
+      const observer = subsystem(observerStore);
+      expect((await observer.inspect("execution")).execution.status).toBe("running");
+      expect(await observer.recover()).toMatchObject([{ execution: { status: "running" } }]);
+      await expect(observer.execute(intent("retry"))).rejects.toThrow("already has");
+      expect(transport.mock.calls).toHaveLength(1);
+
+      const owner = vi.spyOn(process, "kill").mockImplementationOnce(() => {
+        throw Object.assign(new Error("fixture owner exited"), { code: "ESRCH" });
+      });
+      try {
+        expect(await observer.recover()).toMatchObject([{ execution: { status: "not_started" } }]);
+      } finally {
+        owner.mockRestore();
+      }
+    } finally {
+      observerStore.close();
+    }
+  } finally {
+    resume.resolve();
+    await dispatch;
+  }
+  expect((await dispatch).execution.status).toBe("not_started");
+  expect(runs.size).toBe(0);
+});
+
+it("preserves launch authorization when recovery read staging state first", async () => {
+  const dispatcher = subsystem();
+  const { execution } = dispatcher.executions.claim(intent());
+  const observerStore = new WorkflowStore(db);
+  try {
+    const observer = subsystem(observerStore);
+    const probe = vi.spyOn(process, "kill").mockImplementationOnce(() => {
+      expect(dispatcher.executions.authorizeRemoteDispatch(execution.id)).toBe(true);
+      throw Object.assign(new Error("fixture owner exited"), { code: "ESRCH" });
+    });
+    try {
+      expect(await observer.recover()).toMatchObject([
+        { execution: { status: "unknown", remote: { launchAuthorized: true } } },
+      ]);
+    } finally {
+      probe.mockRestore();
+    }
+    expect(dispatcher.executions.authorizeRemoteDispatch(execution.id)).toBe(false);
+    await expect(observer.execute(intent("retry"))).rejects.toThrow("already has");
+    expect(runs.size).toBe(0);
+  } finally {
+    observerStore.close();
+  }
+});
+
+it("upgrades old Rex claims conservatively and preserves accepted final digests", async () => {
+  const controller = subsystem();
+  const completed = await controller.execute(intent());
+  const { execution: pending } = controller.executions.claim({
+    ...intent("pending"),
+    assignmentId: "other",
+  });
+  const oldBlockId = "block:" + randomUUID();
+  store.close();
+  {
+    using old = new DatabaseSync(db);
+    old
+      .prepare("UPDATE agent_executions SET remote_block_id=? WHERE id=?")
+      .run(oldBlockId, pending.id);
+    old.exec(`
+      ALTER TABLE agent_executions DROP COLUMN remote_launch_authorized;
+      ALTER TABLE agent_executions DROP COLUMN remote_acknowledged_block_id;
+      PRAGMA user_version = 20;
+    `);
+  }
+  store = new WorkflowStore(db);
+  const restarted = subsystem();
+  expect(await restarted.recover()).toMatchObject([
+    {
+      execution: {
+        status: "unknown",
+        remote: { launchAuthorized: true, acknowledgedBlockId: oldBlockId, blockId: null },
+      },
+    },
+  ]);
+  expect(await restarted.inspect(completed.execution.id)).toMatchObject({
+    execution: {
+      status: "completed",
+      remote: {
+        blockId: completed.execution.remote!.blockId,
+        resultDigest: completed.execution.remote!.resultDigest,
+      },
+    },
+    result: { outcome: "completed", response: "fixture done" },
+  });
+});
+
 it("reconciles a lost launch acknowledgement after restart without replay and retrieves the same result", async () => {
   loseAck = true;
   const first = subsystem();
   const launched = await first.execute(intent("execution", "wait for release"));
-  expect(launched.execution).toMatchObject({ status: "unknown", remote: { blockId: null } });
+  expect(launched.execution).toMatchObject({
+    status: "unknown",
+    remote: { launchAuthorized: true, blockId: null },
+  });
   await waiting("execution");
   expect(first.local).not.toHaveBeenCalled();
   const blockId = [...runs.keys()][0]!;
@@ -207,6 +378,165 @@ it("reconciles a lost launch acknowledgement after restart without replay and re
   });
   expect(await restarted.inspect("execution")).toEqual(result);
   expect(runs.size).toBe(1);
+});
+
+it("accepts correlated final evidence over a wrong acknowledgement after restart and session removal", async () => {
+  acknowledgementBlock = "block:" + randomUUID();
+  hideEvidence = true;
+  const launched = await subsystem().execute(intent("execution", "wait for release"));
+  expect(launched.execution).toMatchObject({
+    status: "unknown",
+    remote: { acknowledgedBlockId: acknowledgementBlock, blockId: null },
+  });
+  await waiting("execution");
+  const [blockId] = runs.keys();
+  await writeFile(join(statePath(launched.execution), "release"), "");
+  await runs.get(blockId!)!.exited;
+  hideEvidence = false;
+  sessionLost = true;
+  store.close();
+  store = new WorkflowStore(db);
+
+  const restarted = subsystem();
+  const result = await restarted.inspect("execution");
+  expect(result).toMatchObject({
+    execution: {
+      status: "completed",
+      remote: {
+        acknowledgedBlockId: acknowledgementBlock,
+        blockId,
+        blockConflict: expect.stringContaining("acknowledgement conflicts"),
+        resultDigest: expect.any(String),
+      },
+    },
+    observation: { process: { state: "unavailable" }, evidence: "valid" },
+    result: { outcome: "completed", response: "fixture done" },
+  });
+  expect(await restarted.inspect("execution")).toEqual(result);
+  expect(runs.size).toBe(1);
+});
+
+it("retains a late conflicting acknowledgement without changing concurrently accepted final evidence", async () => {
+  acknowledgementBlock = "block:" + randomUUID();
+  const launched = Promise.withResolvers<void>();
+  const acknowledge = Promise.withResolvers<void>();
+  pauseAck = async () => {
+    launched.resolve();
+    await acknowledge.promise;
+  };
+  const dispatch = subsystem().execute(intent());
+  let final;
+  try {
+    await launched.promise;
+    const [blockId] = runs.keys();
+    await runs.get(blockId!)!.exited;
+    const observerStore = new WorkflowStore(db);
+    try {
+      final = await subsystem(observerStore).inspect("execution");
+      expect(final.execution).toMatchObject({
+        status: "completed",
+        remote: { blockId, acknowledgedBlockId: null, resultDigest: expect.any(String) },
+      });
+    } finally {
+      observerStore.close();
+    }
+  } finally {
+    acknowledge.resolve();
+    await dispatch;
+  }
+  expect(await dispatch).toEqual({
+    ...final,
+    execution: {
+      ...final!.execution,
+      remote: {
+        ...final!.execution.remote,
+        acknowledgedBlockId: acknowledgementBlock,
+        blockConflict: expect.stringContaining("acknowledgement conflicts"),
+      },
+    },
+  });
+  expect(runs.size).toBe(1);
+});
+
+it("requires executor evidence to cancel even when an acknowledgement points to a matching running block", async () => {
+  const controller = subsystem();
+  const abort = new AbortController();
+  hideEvidence = true;
+  const dispatch = controller.execute({
+    ...intent("execution", "wait for release"),
+    signal: abort.signal,
+  });
+  try {
+    const held = await waiting("execution");
+    const [blockId] = runs.keys();
+    expect(held.remote).toMatchObject({ acknowledgedBlockId: blockId, blockId: null });
+    expect((await controller.cancel(held.id)).interruption).toBe("unavailable");
+    expect(targetBlock).toBeUndefined();
+  } finally {
+    abort.abort();
+    await dispatch;
+  }
+  expect(await dispatch).toMatchObject({ interruption: "unavailable" });
+  expect(targetBlock).toBeUndefined();
+  hideEvidence = false;
+  expect((await controller.cancel("execution")).interruption).toBe("requested");
+  expect(targetBlock).toBe([...runs.keys()][0]);
+});
+
+it("rejects a final file that conflicts with a previously correlated executor block", async () => {
+  const controller = subsystem();
+  loseAck = true;
+  const { execution } = await controller.execute(intent("execution", "wait for release"));
+  await waiting(execution.id);
+  hideEvidence = false;
+  const [blockId] = runs.keys();
+  expect((await controller.inspect(execution.id)).execution.remote?.blockId).toBe(blockId);
+  const path = join(statePath(execution), "evidence.json");
+  const interim = JSON.parse(await readFile(path, "utf8"));
+  await writeFile(
+    path,
+    JSON.stringify({
+      ...interim,
+      blockId: "block:" + randomUUID(),
+      result: { outcome: "completed", response: "conflicting block" },
+    }),
+  );
+  expect(await controller.inspect(execution.id)).toMatchObject({
+    execution: { status: "unknown", remote: { blockId, resultDigest: null } },
+    observation: { evidence: "conflicting" },
+  });
+  await writeFile(join(statePath(execution), "release"), "");
+  await runs.get(blockId!)!.exited;
+  expect((await controller.inspect(execution.id)).execution.status).toBe("completed");
+});
+
+it("rechecks the final result before sending cancellation after a concurrent inspection", async () => {
+  const controller = subsystem();
+  loseAck = true;
+  const { execution } = await controller.execute(intent("execution", "wait for release"));
+  await waiting(execution.id);
+  hideEvidence = false;
+  const checking = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  pauseBlockInspect = async () => {
+    checking.resolve();
+    await resume.promise;
+  };
+  const cancel = controller.cancel(execution.id);
+  try {
+    await checking.promise;
+    await writeFile(join(statePath(execution), "release"), "");
+    await [...runs.values()][0]!.exited;
+    expect((await controller.inspect(execution.id)).execution.status).toBe("completed");
+  } finally {
+    resume.resolve();
+    await cancel;
+  }
+  expect(await cancel).toMatchObject({
+    interruption: "unavailable",
+    execution: { status: "completed" },
+  });
+  expect(targetBlock).toBeUndefined();
 });
 
 it("cancels only the correlated block and preserves unknown when cancellation yields no known outcome", async () => {
@@ -262,7 +592,7 @@ it("requests cancellation if interruption arrives during a failed Rex poll", asy
   abort.abort();
   resume.resolve();
   expect(await dispatched).toMatchObject({ interruption: "requested" });
-  expect(targetBlock).toBe(held.remote!.blockId);
+  expect(targetBlock).toBe(held.remote!.acknowledgedBlockId);
   await runs.get(targetBlock!)!.exited;
   expect((await controller.inspect(held.id)).execution.status).toBe("unknown");
 });

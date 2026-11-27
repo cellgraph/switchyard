@@ -10,7 +10,7 @@ import type { FindingDisposition, ReviewMetadata } from "../src/review.ts";
 const workflowId = "owner/repo#7";
 const head = "a".repeat(40);
 const nextHead = "b".repeat(40);
-const currentSchemaVersion = 20;
+const currentSchemaVersion = 21;
 const completedAt = "2026-01-01T00:00:00.000Z";
 const review = {
   id: "review-1",

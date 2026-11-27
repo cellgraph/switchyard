@@ -24,7 +24,10 @@ export type ExecutionIntent = {
 type RemoteAttempt = {
   key: string;
   expectedNativeId: string | null;
+  launchAuthorized: boolean;
+  acknowledgedBlockId: string | null;
   blockId: string | null;
+  blockConflict?: string;
   resultDigest: string | null;
 };
 
@@ -63,6 +66,8 @@ export const agentSchema = `
     owner_pid INTEGER,
     remote_key TEXT UNIQUE,
     expected_native_id TEXT,
+    remote_launch_authorized INTEGER NOT NULL DEFAULT 1 CHECK(remote_launch_authorized IN (0,1)),
+    remote_acknowledged_block_id TEXT,
     remote_block_id TEXT,
     remote_result_digest TEXT,
     reason TEXT,
@@ -87,17 +92,49 @@ export function createAgentStore(
         SELECT id, assignment_id AS assignmentId, session_id AS sessionId, status,
                reason, claimed_at AS claimedAt, finished_at AS finishedAt,
                remote_key AS key, expected_native_id AS expectedNativeId,
+               remote_launch_authorized AS launchAuthorized,
+               remote_acknowledged_block_id AS acknowledgedBlockId,
                remote_block_id AS blockId, remote_result_digest AS resultDigest
         FROM agent_executions WHERE id=?
       `,
       )
       .get(id) as
-      (ExecutionRecord & Omit<RemoteAttempt, "key"> & { key: string | null }) | undefined;
+      | (ExecutionRecord &
+          Omit<RemoteAttempt, "key" | "launchAuthorized"> & {
+            key: string | null;
+            launchAuthorized: number;
+          })
+      | undefined;
     if (!row) return null;
-    const { key, expectedNativeId, blockId, resultDigest, ...execution } = row;
+    const {
+      key,
+      expectedNativeId,
+      launchAuthorized,
+      acknowledgedBlockId,
+      blockId,
+      resultDigest,
+      ...execution
+    } = row;
     return {
       ...execution,
-      ...(key === null ? {} : { remote: { key, expectedNativeId, blockId, resultDigest } }),
+      ...(key === null
+        ? {}
+        : {
+            remote: {
+              key,
+              expectedNativeId,
+              launchAuthorized: launchAuthorized === 1,
+              acknowledgedBlockId,
+              blockId,
+              resultDigest,
+              ...(acknowledgedBlockId && blockId && acknowledgedBlockId !== blockId
+                ? {
+                    blockConflict:
+                      "The Rex launch acknowledgement conflicts with executor evidence.",
+                  }
+                : {}),
+            },
+          }),
     };
   }
 
@@ -161,7 +198,7 @@ export function createAgentStore(
         `
         UPDATE agent_sessions SET native_id=?
         WHERE id=(
-          SELECT session_id FROM agent_executions WHERE id=? AND status='running' AND owner_pid=?
+          SELECT session_id FROM agent_executions WHERE id=? AND remote_key IS NULL AND status='running' AND owner_pid=?
         ) AND (native_id IS NULL OR native_id=?)
       `,
       )
@@ -181,6 +218,51 @@ export function createAgentStore(
         .all()
         .map((row) => String(row.id));
     },
+    authorizeRemoteDispatch(id: string): boolean {
+      return (
+        db
+          .prepare(
+            `
+        UPDATE agent_executions SET remote_launch_authorized=1
+        WHERE id=? AND remote_key IS NOT NULL AND status='running'
+          AND remote_launch_authorized=0 AND owner_pid=?
+      `,
+          )
+          .run(id, process.pid).changes === 1
+      );
+    },
+    recoverRemotePrelaunch(id: string): void {
+      const owner = db
+        .prepare(
+          `
+        SELECT owner_pid AS pid FROM agent_executions
+        WHERE id=? AND remote_key IS NOT NULL AND status='running' AND remote_launch_authorized=0
+      `,
+        )
+        .get(id) as { pid: number } | undefined;
+      if (!owner || ownerAlive(owner.pid)) return;
+      // This update and dispatch authorization compete for the same pending claim.
+      db.prepare(
+        `
+        UPDATE agent_executions SET status='not_started', reason=?, finished_at=?, owner_pid=NULL
+        WHERE id=? AND status='running' AND remote_launch_authorized=0 AND owner_pid=?
+      `,
+      ).run(
+        "Execution owner exited before authorizing Rex dispatch.",
+        new Date().toISOString(),
+        id,
+        owner.pid,
+      );
+    },
+    recordRemoteAcknowledgement(id: string, blockId: string): void {
+      db.prepare(
+        `
+        UPDATE agent_executions SET remote_acknowledged_block_id=?
+        WHERE id=? AND remote_key IS NOT NULL AND remote_launch_authorized=1
+          AND remote_acknowledged_block_id IS NULL
+      `,
+      ).run(blockId, id);
+    },
     recordRemote(
       id: string,
       evidence: {
@@ -194,6 +276,14 @@ export function createAgentStore(
         const execution = get(id);
         if (!execution?.remote) throw new Error("Remote execution record not found.");
         const remote = execution.remote;
+        if (
+          !remote.launchAuthorized &&
+          (evidence.outcome?.outcome !== "not_started" ||
+            evidence.blockId ||
+            evidence.nativeId !== undefined ||
+            evidence.digest)
+        )
+          return false;
         const saved = session(execution.sessionId)!;
         const unresolved = execution.status === "running" || execution.status === "unknown";
         if (
@@ -315,17 +405,18 @@ export function createAgentStore(
         // The insert records intent and takes the dispatch claim in the same transaction.
         db.prepare(
           `
-          INSERT INTO agent_executions (id, assignment_id, session_id, status, owner_pid, claimed_at, remote_key, expected_native_id)
-          VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+          INSERT INTO agent_executions (id, assignment_id, session_id, status, owner_pid, claimed_at, remote_key, expected_native_id, remote_launch_authorized)
+          VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
         `,
         ).run(
           input.id,
           input.assignmentId,
           record.id,
-          record.rex ? null : process.pid,
+          process.pid,
           now,
           record.rex ? randomUUID() : null,
           record.rex ? record.nativeId : null,
+          record.rex ? 0 : 1,
         );
         return { claimed: true, execution: get(input.id)!, session: record };
       });
@@ -334,7 +425,9 @@ export function createAgentStore(
     finish(id: string, outcome: Outcome, nativeId: string | null) {
       return transaction(() => {
         const execution = get(id);
-        const owner = db.prepare("SELECT owner_pid FROM agent_executions WHERE id=?").get(id);
+        const owner = db
+          .prepare("SELECT owner_pid FROM agent_executions WHERE id=? AND remote_key IS NULL")
+          .get(id);
         if (execution?.status !== "running" || owner?.owner_pid !== process.pid)
           throw new Error("Execution no longer belongs to this process.");
         if (outcome.outcome === "completed" && nativeId === null)

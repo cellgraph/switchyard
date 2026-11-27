@@ -106,9 +106,18 @@ export function createRexExecution(
     observation: { process: ProcessEvidence; evidence: "valid" | "unavailable" | "conflicting" };
     result?: Extract<AgentResult, { outcome: "completed" }>;
   }> {
-    const { execution, rex, correlation, directory } = attempt(id);
-    const blockId = execution.remote!.blockId;
-    let process = await processEvidence(rex, blockId);
+    const { execution, session, rex, correlation, directory } = attempt(id);
+    const remote = execution.remote!;
+    if (!remote.launchAuthorized)
+      return {
+        execution,
+        session,
+        observation: { process: { state: "unavailable" }, evidence: "unavailable" },
+      };
+
+    // The acknowledgement can bridge startup until the executor publishes its block.
+    let processBlockId = remote.blockId ?? remote.acknowledgedBlockId;
+    let process = await processEvidence(rex, processBlockId);
     async function read() {
       try {
         return await temporary(async (local) => {
@@ -132,9 +141,12 @@ export function createRexExecution(
       }
     }
     let observed = await read();
-    if (!blockId && observed.state === "valid") {
+    if (!remote.blockId && observed.state === "valid") {
       const observedBlock = observed.evidence.blockId;
-      process = await processEvidence(rex, observedBlock);
+      if (observedBlock !== processBlockId) {
+        processBlockId = observedBlock;
+        process = await processEvidence(rex, processBlockId);
+      }
       // If the executor exited since the first read, a final atomic replacement may be available.
       if (process.state === "exited" && !observed.evidence.result) {
         const latest = await read();
@@ -165,23 +177,21 @@ export function createRexExecution(
     else if (process.state !== "running" && !finalObserved)
       hold(
         id,
-        process.state === "exited"
+        process.state === "exited" && (remote.blockId || state === "valid")
           ? "The Rex process exited without a confirmed native outcome."
           : "Could not confirm the Rex process or native outcome.",
       );
 
-    const saved = attempt(id);
+    const current = executions.get(id)!;
+    const verifiedBlockId = current.remote!.blockId;
+    if (verifiedBlockId !== processBlockId && (verifiedBlockId || process.state !== "running"))
+      process = { state: "unavailable" };
     // A concurrent observer can commit final evidence while this read holds an interim snapshot.
-    if (
-      reread &&
-      !finalObserved &&
-      !execution.remote!.resultDigest &&
-      saved.execution.remote!.resultDigest
-    )
+    if (reread && !finalObserved && !remote.resultDigest && current.remote!.resultDigest)
       return inspect(id, false);
     return {
-      execution: saved.execution,
-      session: saved.session,
+      execution: current,
+      session: executions.session(current.sessionId)!,
       observation: { process, evidence: state },
       ...(result ? { result } : {}),
     };
@@ -189,10 +199,12 @@ export function createRexExecution(
 
   async function cancel(id: string) {
     const inspected = await inspect(id);
-    const { execution, rex } = attempt(id);
+    const { execution, session } = inspected;
+    const rex = session.rex!;
     const blockId = execution.remote!.blockId;
     if (
       !blockId ||
+      execution.remote!.resultDigest ||
       (execution.status !== "running" && execution.status !== "unknown") ||
       inspected.observation.evidence === "conflicting" ||
       inspected.observation.process.state !== "running"
@@ -212,6 +224,12 @@ export function createRexExecution(
     } catch {
       return { ...inspected, interruption: "unavailable" as const };
     }
+    const current = executions.get(id)!;
+    if (
+      current.remote!.resultDigest ||
+      (current.status !== "running" && current.status !== "unknown")
+    )
+      return { ...(await inspect(id)), interruption: "unavailable" as const };
     try {
       await command(rex, "send-key", "-s", rex.session, "-b", blockId, "ctrl+c");
     } catch {
@@ -226,6 +244,7 @@ export function createRexExecution(
     async recover() {
       const observations = [];
       for (const id of executions.unresolvedRemote()) {
+        executions.recoverRemotePrelaunch(id);
         const { execution, observation } = await inspect(id);
         observations.push({ execution, observation });
       }
@@ -238,9 +257,13 @@ export function createRexExecution(
     ) {
       const id = execution.id;
       const { rex, correlation, directory } = attempt(id);
+      const saved = () => ({
+        execution: executions.get(id)!,
+        session: executions.session(session.id)!,
+      });
       const notStarted = (reason: string) => {
         executions.recordRemote(id, { outcome: { outcome: "not_started", reason } });
-        return { execution: executions.get(id)!, session: executions.session(session.id)! };
+        return saved();
       };
 
       if (signal?.aborted) return notStarted("Canceled before Rex dispatch.");
@@ -259,6 +282,7 @@ export function createRexExecution(
         return notStarted("Could not stage the Rex request before dispatch.");
       }
       if (signal?.aborted) return notStarted("Canceled before Rex dispatch.");
+      if (!executions.authorizeRemoteDispatch(id)) return saved();
 
       let ack: unknown;
       try {
@@ -291,8 +315,7 @@ export function createRexExecution(
       }
       const blocks = record(ack)?.block_ids;
       const blockId = Array.isArray(blocks) && blocks.length === 1 ? blocks[0] : undefined;
-      if (validRexId(blockId, "block") && !executions.recordRemote(id, { blockId }))
-        hold(id, "The Rex launch acknowledgement conflicts with the recorded block.");
+      if (validRexId(blockId, "block")) executions.recordRemoteAcknowledgement(id, blockId);
 
       for (;;) {
         const stopping = signal?.aborted;

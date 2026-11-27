@@ -42,7 +42,7 @@ export function localProcessAlive(pid: number | null): boolean {
 }
 
 const applicationId = 0x53575944; // SWYD
-const schemaVersion = 20;
+const schemaVersion = 21;
 const unsupportedDatabase =
   "Unsupported Switchyard database identity or schema version. Use a fresh SWITCHYARD_DB_PATH for this implementation.";
 
@@ -346,12 +346,24 @@ export class WorkflowStore {
       url.searchParams.set("immutable", "1");
       using probe = new DatabaseSync(url.href, { readOnly: true });
       const { id, version } = databaseIdentity(probe);
-      if (id !== applicationId || version !== schemaVersion) throw new Error(unsupportedDatabase);
+      if (id !== applicationId || (version !== schemaVersion && version !== 20))
+        throw new Error(unsupportedDatabase);
     }
 
     this.#transaction(() => {
       const { id, version } = databaseIdentity(this.#db);
       if (id === applicationId && version === schemaVersion) return;
+      if (id === applicationId && version === 20) {
+        // Older attempts may have dispatched. Only a recorded final digest proves block correlation.
+        this.#db.exec(`
+          ALTER TABLE agent_executions ADD COLUMN remote_launch_authorized INTEGER NOT NULL DEFAULT 1 CHECK(remote_launch_authorized IN (0,1));
+          ALTER TABLE agent_executions ADD COLUMN remote_acknowledged_block_id TEXT;
+          UPDATE agent_executions SET remote_acknowledged_block_id=remote_block_id, remote_block_id=NULL
+            WHERE remote_key IS NOT NULL AND remote_result_digest IS NULL;
+          PRAGMA user_version = ${schemaVersion};
+        `);
+        return;
+      }
       if (
         id !== 0 ||
         version !== 0 ||
