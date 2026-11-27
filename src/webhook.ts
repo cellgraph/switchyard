@@ -1,7 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { object, positiveInteger, repositoryName } from "./github-data.ts";
-import type { WorkflowStore } from "./store.ts";
 
 export type ReconcileHint = {
   repository: string;
@@ -18,7 +17,14 @@ class InvalidDelivery extends Error {
   }
 }
 
-const lifecycleActions = new Set(["opened", "reopened", "synchronize", "closed"]);
+const lifecycleActions = new Set([
+  "opened",
+  "reopened",
+  "synchronize",
+  "closed",
+  "ready_for_review",
+  "converted_to_draft",
+]);
 const reviewActions = new Set(["submitted", "edited", "dismissed"]);
 const commentActions = new Set(["created", "edited", "deleted"]);
 
@@ -43,9 +49,16 @@ function normalize(event: string, payload: Record<string, unknown>): ReconcileHi
       break;
     }
     case "check_run":
-    case "check_suite":
+    case "check_suite": {
+      const associated = object(payload[event])?.pull_requests;
+      const number =
+        Array.isArray(associated) && associated.length === 1
+          ? object(associated[0])?.number
+          : undefined;
+      pullRequest = positiveInteger(number) ? number : null;
+      break;
+    }
     case "status":
-      // Fork check events can omit their PR association and status events have no PR number.
       pullRequest = null;
       break;
     default:
@@ -71,15 +84,6 @@ function validHint(value: unknown): value is ReconcileHint {
   );
 }
 
-export function readReconcileHint(payload: unknown): ReconcileHint | null | undefined {
-  const receipt = object(payload);
-  if (receipt?.githubWebhookVersion === 1 && (receipt.hint === null || validHint(receipt.hint)))
-    return receipt.hint;
-  if (validHint(payload)) return payload;
-  // An unversioned null can be an opaque Phase 1 receipt and needs fallback routing.
-  return undefined;
-}
-
 function header(request: IncomingMessage, name: string): string | undefined {
   const values = request.headersDistinct[name];
   return values?.length === 1 ? values[0] : undefined;
@@ -100,12 +104,12 @@ async function readBody(request: IncomingMessage, limit: number): Promise<Buffer
 
 export function createWebhookServer({
   secret,
-  store,
+  notify,
   reportError,
   maxBodyBytes = 25 * 1024 * 1024,
 }: {
   secret: string;
-  store: Pick<WorkflowStore, "receiveDelivery">;
+  notify: (hint: ReconcileHint) => void;
   reportError: (message: string) => void;
   maxBodyBytes?: number;
 }) {
@@ -144,14 +148,12 @@ export function createWebhookServer({
         throw new InvalidDelivery(400);
       }
       if (!payload) throw new InvalidDelivery(400);
-      store.receiveDelivery(deliveryId.toLowerCase(), {
-        githubWebhookVersion: 1,
-        hint: normalize(event, payload),
-      });
+      const hint = normalize(event, payload);
+      if (hint) notify(hint);
       response.writeHead(202).end();
     } catch (error) {
       const status = error instanceof InvalidDelivery ? error.status : 503;
-      if (status === 503) reportError("Unable to receive or persist a GitHub webhook delivery.");
+      if (status === 503) reportError("Unable to signal GitHub reconciliation.");
       response.writeHead(status, { connection: "close" }).end();
     }
   };

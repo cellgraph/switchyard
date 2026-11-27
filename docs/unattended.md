@@ -1,39 +1,33 @@
-# Unattended polling
+# Operating the reconciliation worker
 
-The unattended worker observes configured GitHub PRs. It refreshes lifecycle and exact-head CI evidence and reports operator stops and escalations. Review-driven readiness is unavailable in Phase B1. See the [GitHub App guide](github-app.md) for authentication and the [architecture overview](architecture.md#current-implementation) for the current execution paths.
-
-## Configuration
-
-List repositories, App installation IDs and exact PR numbers. The worker polls at startup and waits `reconcileIntervalMs` after each pass. The default is 60,000 ms. Worker mode requires a positive interval and processes targets in configuration order.
-
-```json
-{
-  "reconcileIntervalMs": 60000,
-  "repositories": [
-    { "repository": "owner/repo", "installationId": 123, "pullRequests": [42, 43] },
-    { "repository": "owner/tools", "installationId": 456, "pullRequests": [7] }
-  ],
-  "requiredChecks": {
-    "owner/repo#42": ["Quality checks"]
-  }
-}
-```
-
-The optional `requiredChecks` map uses configured lowercase `owner/repo#PR` keys and nonempty lists of unique check names. CI evidence is recorded for all configured PRs. Keep the App private key outside the configuration file.
+The worker discovers pull requests in enabled repositories and observes eligible PRs and their exact-head CI. Run it with or without an authenticated webhook receiver using the same command. The GitHub App guide describes the installation, [repository configuration](github-app.md#configure-enabled-repositories) and [retry behavior](github-app.md#rate-limits-and-retries).
 
 ## Run and inspect
+
+Use a [fresh SQLite path](state-model.md#sqlite-baseline). Set the App client ID and private key path in the environment. Supply `GITHUB_WEBHOOK_SECRET` to enable the receiver. The worker runs a startup sweep and continues at the configured positive interval with or without a webhook secret.
 
 ```sh
 export SWITCHYARD_DB_PATH=/absolute/path/to/switchyard-dev.sqlite
 export GITHUB_APP_CLIENT_ID=YOUR_APP_CLIENT_ID
 export GITHUB_APP_PRIVATE_KEY_PATH=/absolute/path/to/github-app.pem
-npm start -- --worker /absolute/path/to/config.json
+npm start -- /absolute/path/to/config.json
 ```
 
-Use a [fresh SQLite path](state-model.md#sqlite-baseline). In a second terminal with the same path, run `npm start -- --worker-status` to inspect the last run, poll timestamps, PR heads, lifecycle state and any attention reason. Worker stdout emits JSON events for poll outcomes, changes to PR state and requests for operator attention.
+Use the same database path in a second terminal to inspect the worker and its tracked PRs. The JSON output includes the enabled repositories, process state, last pass timestamps and success, current PR heads and GitHub status, and operator holds. Worker logs report pass outcomes and repository or PR errors. Review references have their own inspection command.
+
+```sh
+npm start -- --worker-status
+npm start -- --review-status owner/repo#7
+```
+
+Stop the continuous worker before running a one-off sweep against the same database. The command exits with a failure status if a discovery or observation fails or is deferred. Other successful updates from the same pass are retained.
+
+```sh
+npm start -- --once /absolute/path/to/config.json
+```
 
 ## Stop and restart
 
-Press Ctrl-C or send SIGINT or SIGTERM to the launcher or worker PID shown in status. The worker drains active GitHub reads and skips queued reads and later pages. A duplicate worker exits while the recorded owner is live. A replacement can claim the database after the owner exits. GitHub retry deadlines persist across restarts. A rejected credential pauses requests for its installation for five minutes. The worker logs the installation ID and retry deadline.
+Press Ctrl-C or send SIGINT or SIGTERM to the worker PID. Shutdown allows a sent request to settle, including any rate-limit headers, and skips queued reads, later pages and unstarted targets. The worker records its stop in SQLite. A second reconciliation process cannot claim the database while the recorded worker is live. A replacement can claim it after the owner exits.
 
-This mode uses polling only. Use the [GitHub App controller](github-app.md#run-the-controller) for webhook intake or a manual refresh. Use the [local execution CLI](agent-sessions.md) to run an explicit assignment.
+Restart runs a full sweep and rediscovers work missed while the process was stopped. SQLite preserves GitHub retry deadlines and operator holds. Native recovery marks execution claims with lost owners as uncertain and keeps their sessions held for inspection. Local assignments use the separate [agent CLI](agent-sessions.md).

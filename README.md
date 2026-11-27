@@ -10,9 +10,9 @@ A persistent VM controller uses SQLite and reads GitHub state. Authenticated web
 
 ## Status and setup
 
-Phase B1 observes the lifecycle and exact-head CI of explicitly configured GitHub PRs through startup, polling, manual refresh and authenticated webhooks backed by the SQLite inbox. The GitHub App requests read-only installation tokens. Automatic Codex review ingestion and controller publication have been retired. SQLite can hold structured review and finding references, and review-driven handoff is temporarily unavailable. See the [GitHub App guide](docs/github-app.md), [unattended polling](docs/unattended.md) and [review evidence guide](docs/reviews.md).
+Phase B2 automatically discovers open, non-draft, same-repository PRs in enabled GitHub repositories. A read-only GitHub App observes lifecycle and exact-head CI through startup, periodic sweeps, authenticated webhook signals and operator requests. SQLite retains workflows and evidence references. See the [GitHub App guide](docs/github-app.md), [operating guide](docs/unattended.md) and [review evidence guide](docs/reviews.md).
 
-Phase B2 replaces delivery processing with transient webhook signals and adds repository-level discovery and eligibility. Autonomous Reviewer, Adjudicator and Implementer assignments come later. The standalone [agent CLI](docs/agent-sessions.md) supports explicit local Codex and Claude Code assignments independent of a PR. The [native execution verification report](docs/native-execution-verification.md) records the results and the Codex SDK gate for long-lived dispatch.
+The standalone [agent CLI](docs/agent-sessions.md) supports explicit local Codex and Claude Code assignments. Phase C investigates Rex and explicit remote placement. Phase D adds autonomous review, adjudication, implementation, handoff and the deployment cutover. The [native execution verification report](docs/native-execution-verification.md) records the Codex SDK gate for long-lived dispatch.
 
 [ADR-0006](docs/adr/0006-orchestrate-through-native-tools.md) records the accepted architecture, [Plan 003](docs/plans/003-architectural-simplification.md) sequences implementation, and the [architecture overview](docs/architecture.md#current-implementation) describes current behavior.
 

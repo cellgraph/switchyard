@@ -49,7 +49,7 @@ The A2 baseline records sessions separately from execution attempts. It records 
 
 ### Phase B — Establish read-only GitHub reconciliation
 
-#### B1 — Read-only GitHub boundary and legacy review removal
+#### B1 — Read-only GitHub boundary and legacy review removal (PR #28)
 
 Remove automatic Codex marker ingestion and controller-owned review and disposition publication before redesigning reconciliation. This removes the obsolete review source before expanding observation to repository-level discovery.
 
@@ -62,9 +62,13 @@ Remove automatic Codex marker ingestion and controller-owned review and disposit
 
 #### B2 — Discovery and transient reconciliation signals
 
-Keep signature validation and request handling in `src/webhook.ts`. Acknowledge authenticated signals promptly and coalesce work in memory as needed. Consolidate startup, webhook, periodic and operator reconciliation through one path. Discover open, non-draft, same-repository PRs in explicitly enabled repositories regardless of author. Read current GitHub lifecycle and eligibility, including closures, merges and reopens. Replace the SQLite delivery inbox and its claim, retry and replay paths. Preserve workflow history, execution attempts, exact-head checks, retry deadlines and durable operator stops.
+Phase B2 uses one reconciliation worker for startup, periodic sweeps, authenticated webhook signals and the operator's one-off sweep. Repository configuration supplies enabled names, App installations and optional required-check names per repository. Paginated listings supply PR numbers. Individual reads determine current head, lifecycle and eligibility regardless of author. A successful discovery union includes tracked PRs that may no longer be open. Confirmed merges end periodic observation unless GitHub or a hint names the PR again.
 
-**Acceptance.** Invalid signatures are rejected. Startup, webhook, periodic and operator reconciliation converge on authoritative GitHub state after missed, duplicate or out-of-order signals. Tests cover author-independent discovery, draft and fork exclusion, and lifecycle changes. Superseded observations cannot advance the workflow.
+- Coalesce pending hints by repository and PR in memory. A pass takes its own set of hints so arrivals during a read can trigger another pass. Startup and periodic discovery recover missed signals and deferred observations. Continuous operation requires a positive periodic interval even with webhooks enabled. SQLite schema 19 removes the delivery inbox, claims and replay and preserves the Switchyard application ID, workflow evidence and native execution recovery. Deployment and cutover remain in Phase D.
+- Store observed eligibility with the PR lifecycle status. GitHub can stop and reactivate a workflow under the same ID. An operator hold remains effective across lifecycle and head changes. A final eligible observation and durable generation guard protect changes to active state and exact-head evidence, including overlapping reads at the same head.
+- Scope discovery retries to the enabled repository and keep installation-wide authentication and primary limits, shared secondary limits and per-PR or same-commit retry deadlines where applicable. A failed discovery reports partial progress and does not imply closure. Manual and continuous runs share the same SQLite ownership claim and inspection command.
+
+**Acceptance.** Offline fixtures cover authenticated transient signalling, missed, duplicate and out-of-order notifications, paginated discovery, eligibility changes, overlapping observations, SQLite compatibility, retry scopes and native execution recovery. Phase B establishes read-only observation. The [Phase C](#phase-c--investigate-rex-then-implement-explicit-remote-placement) placement spike, [Phase D](#phase-d--complete-the-pr-workflow-cli-and-cutover) role integration and [GraphQL production gate](#remaining-implementation-choices) remain open.
 
 ### Phase C — Investigate Rex, then implement explicit remote placement
 

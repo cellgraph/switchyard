@@ -7,6 +7,7 @@ export type WorkflowIdentity = {
   pullRequest: number;
 };
 export type CheckEvidence = { name: string; sha: string; outcome: CheckOutcome };
+export type GitHubPullRequestStatus = "eligible" | "draft" | "fork" | "closed" | "merged";
 export type Workflow = {
   id: string;
   identity: WorkflowIdentity;
@@ -15,12 +16,12 @@ export type Workflow = {
   requiredChecks: string[] | null;
   checks: CheckEvidence[];
   escalationReason: string | null;
-  closedByGitHub?: true;
+  githubStatus?: GitHubPullRequestStatus;
 };
 
 export type WorkflowCommand =
   | { type: "head_changed"; sha: string }
-  | { type: "github_pull_request"; sha: string; state: "open" | "closed" }
+  | { type: "github_pull_request"; sha: string; status: GitHubPullRequestStatus }
   | { type: "checks_received"; evidence: CheckEvidence[]; configuredNames: string[] | null }
   | { type: "escalate"; reason: string }
   | { type: "stop"; reason: string };
@@ -45,12 +46,8 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
   const from = current.state;
   const reason = transitionReason(command, current.headSha);
 
-  const mayChangeGitHubClosure =
-    current.closedByGitHub === true &&
-    (command.type === "github_pull_request" ||
-      command.type === "escalate" ||
-      command.type === "stop");
-  if ((current.state === "stopped" && !mayChangeGitHubClosure) || current.state === "escalated") {
+  const held = isOperatorHeld(current);
+  if (held && command.type !== "github_pull_request") {
     throw new InvalidTransitionError(
       `Cannot transition a ${current.state} workflow without a future explicit recovery action.`,
     );
@@ -61,25 +58,22 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
       if (!command.sha)
         throw new InvalidTransitionError("A GitHub pull request requires a head SHA.");
       if (command.sha !== current.headSha) setHead(next, command.sha);
-      if (command.state === "closed" || current.closedByGitHub) {
-        next.checks = [];
-        if (command.state === "closed") {
-          next.state = "stopped";
-          next.closedByGitHub = true;
-          next.escalationReason = "GitHub pull request is closed.";
-        } else {
-          next.state = "awaiting_review";
-          next.escalationReason = null;
-          delete next.closedByGitHub;
-        }
-      }
+      next.githubStatus = command.status;
+      if (!held) next.state = command.status === "eligible" ? "awaiting_review" : "stopped";
+      if (next.state !== "awaiting_review") next.checks = [];
       break;
     case "head_changed":
+      if (current.state !== "awaiting_review")
+        throw new InvalidTransitionError(
+          "An inactive workflow requires an authoritative GitHub observation.",
+        );
       if (!command.sha || command.sha === current.headSha)
         throw new InvalidTransitionError("A head change requires a new non-empty SHA.");
       setHead(next, command.sha);
       break;
     case "checks_received":
+      if (current.state !== "awaiting_review")
+        throw new InvalidTransitionError("Cannot record current checks for an inactive workflow.");
       if (command.evidence.some((check) => check.sha !== current.headSha))
         throw new InvalidTransitionError("Check evidence must match the current head SHA.");
       next.checks = command.evidence;
@@ -90,23 +84,29 @@ export function transitionWorkflow(current: Workflow, command: WorkflowCommand):
         throw new InvalidTransitionError("An escalation requires a reason.");
       next.state = "escalated";
       next.escalationReason = command.reason;
-      delete next.closedByGitHub;
+      next.checks = [];
       break;
     case "stop":
       if (!command.reason.trim()) throw new InvalidTransitionError("Stopping requires a reason.");
       next.state = "stopped";
       next.escalationReason = command.reason;
-      delete next.closedByGitHub;
+      next.checks = [];
       break;
   }
   return { workflow: next, from, to: next.state, reason, headSha: next.headSha };
 }
 
+export function isOperatorHeld(workflow: Workflow | null): boolean {
+  return (
+    workflow !== null &&
+    (workflow.state === "escalated" ||
+      (workflow.state === "stopped" && workflow.escalationReason !== null))
+  );
+}
+
 function setHead(workflow: Workflow, sha: string): void {
   workflow.headSha = sha;
   workflow.checks = [];
-  workflow.escalationReason = null;
-  workflow.state = "awaiting_review";
 }
 
 function transitionReason(command: WorkflowCommand, headSha: string): string {
@@ -114,7 +114,7 @@ function transitionReason(command: WorkflowCommand, headSha: string): string {
     case "head_changed":
       return `head_changed to ${command.sha}`;
     case "github_pull_request":
-      return `github_pull_request ${command.state} at ${command.sha}`;
+      return `github_pull_request ${command.status} at ${command.sha}`;
     case "checks_received":
       return `checks_received for ${headSha}: ${command.evidence.map((check) => `${check.name}=${check.outcome}`).join(", ") || "no check evidence"}`;
     case "escalate":

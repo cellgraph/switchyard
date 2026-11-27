@@ -1,573 +1,275 @@
 import { createHmac } from "node:crypto";
 import { once } from "node:events";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createController } from "../src/controller.ts";
+import { createController, runController } from "../src/controller.ts";
 import type { GitHubReader, PullRequestState } from "../src/github-api.ts";
-import { GitHubRateLimitError } from "../src/github-app.ts";
+import { GitHubTransientError } from "../src/github-app.ts";
 import { createReconciler } from "../src/reconcile.ts";
 import { WorkflowStore } from "../src/store.ts";
 import { createWebhookServer } from "../src/webhook.ts";
-import type { CheckEvidence } from "../src/workflow.ts";
-import { crashAfterSession } from "./fixtures/execution.ts";
+import { headA, headB, openPull } from "./fixtures/github.ts";
 
 type Fixture = { id: string; event: string; payload: Record<string, unknown> };
 const fixtures = JSON.parse(
   readFileSync(new URL("./fixtures/github-webhooks.json", import.meta.url), "utf8"),
 ) as Record<string, Fixture>;
 const secret = "fixture-only-webhook-secret";
-const headA = "a".repeat(40);
-const headB = "b".repeat(40);
 const target = { repository: "owner/repo", pullRequest: 7, installationId: 42 };
 
-let dir: string;
 let store: WorkflowStore;
 let server: ReturnType<typeof createWebhookServer>;
 let endpoint: string;
-let dbPath: string;
-let now: number;
 let state: PullRequestState;
-let checkOutcome: CheckEvidence["outcome"];
 let github: GitHubReader;
-let reportError: ReturnType<typeof vi.fn<(message: string) => void>>;
+let controller: ReturnType<typeof createController>;
+let notify: ReturnType<typeof vi.fn<typeof controller.notify>>;
+let abort: AbortController;
 
-async function startReceiver(maxBodyBytes?: number): Promise<void> {
-  server = createWebhookServer({
-    secret,
+beforeEach(async () => {
+  store = new WorkflowStore();
+  abort = new AbortController();
+  state = openPull(target.repository);
+  github = {
+    completeReconciliation: vi.fn(),
+    listOpenPullRequests: vi.fn(async () => [target.pullRequest]),
+    readPullRequest: vi.fn(async () => ({ ...state })),
+    readChecks: vi.fn<GitHubReader["readChecks"]>(async (_target, sha) => [
+      { name: "CI", sha, outcome: "passed" },
+    ]),
+  };
+  controller = createController({
     store,
-    reportError,
-    ...(maxBodyBytes === undefined ? {} : { maxBodyBytes }),
+    repositories: [target],
+    github,
+    reconcile: createReconciler(store, github),
+    reportError: vi.fn(),
+    signal: abort.signal,
+    now: () => Date.now(),
   });
+  notify = vi.fn(controller.notify);
+  server = createWebhookServer({ secret, notify, reportError: vi.fn(), maxBodyBytes: 4096 });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const address = server.address();
-  if (!address || typeof address === "string") throw new Error("Missing fixture server address");
+  if (!address || typeof address === "string") throw new Error("Missing fixture server address.");
   endpoint = `http://127.0.0.1:${address.port}/webhooks/github`;
-}
-
-beforeEach(async () => {
-  dir = mkdtempSync(join(tmpdir(), "switchyard-github-"));
-  dbPath = join(dir, "state.sqlite");
-  store = new WorkflowStore(dbPath);
-  now = 100_000;
-  state = { state: "open", headSha: headA };
-  checkOutcome = "passed";
-  reportError = vi.fn();
-  github = {
-    completeReconciliation: vi.fn(),
-    readPullRequest: vi.fn(async () => ({ ...state })),
-    readChecks: vi.fn(async (_target, sha) => [{ name: "CI", sha, outcome: checkOutcome }]),
-  };
-  await startReceiver();
 });
 
 afterEach(async () => {
+  abort.abort();
+  await controller.runPass();
   server.close();
   await once(server, "close");
   store.close();
-  rmSync(dir, { recursive: true, force: true });
 });
 
 function send(
   key: string,
-  options: { id?: string | null; signature?: string | null; body?: string } = {},
+  options: {
+    id?: string | null;
+    signature?: string | null;
+    event?: string;
+    body?: string;
+    payload?: Record<string, unknown>;
+  } = {},
 ): Promise<Response> {
   const { id, event, payload } = fixtures[key]!;
-  // Formatting the JSON makes the signed bytes differ from its reserialization.
-  const body = options.body ?? JSON.stringify(payload, null, 2) + "\n";
+  // Sign the original bytes, including whitespace that reserialization would change.
+  const body = options.body ?? JSON.stringify({ ...payload, ...options.payload }, null, 2) + "\n";
   const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
-  const headers = new Headers({ "x-github-event": event });
+  const headers = new Headers({ "x-github-event": options.event ?? event });
   if (options.id !== null) headers.set("x-github-delivery", options.id ?? id);
   if (options.signature !== null)
     headers.set("x-hub-signature-256", options.signature ?? signature);
   return fetch(endpoint, { method: "POST", headers, body });
 }
 
-function controller(interval = 0) {
-  return createController({
-    store,
-    targets: [target],
-    reconcile: createReconciler(store, github),
-    reportError,
-    reconcileIntervalMs: interval,
-    now: () => now,
-  });
-}
-
 function workflow() {
   return store.findWorkflow(target.repository, target.pullRequest);
 }
 
-describe("GitHub webhook intake and reconciliation", () => {
-  it("rejects bad signatures, delivery IDs, and bodies before writing any records", async () => {
-    const invalid = [
+describe("authenticated transient GitHub notifications", () => {
+  it("rejects invalid signatures, delivery and event headers, bodies and routing fields", async () => {
+    const errors = [
       [{ signature: null }, 401],
       [{ signature: "sha256=abcd" }, 401],
       [{ signature: `sha256=${"0".repeat(64)}` }, 401],
       [{ id: null }, 400],
-      [{ id: "not-a-guid" }, 400],
-      [{ body: "{ broken" }, 400],
-      [{ body: "null" }, 400],
-      [{ body: '{"action":"opened","number":0}' }, 400],
+      [{ id: "invalid" }, 400],
+      [{ event: "invalid-event" }, 400],
+      [{ body: "{broken" }, 400],
+      [{ body: "[]" }, 400],
+      [{ payload: { repository: { full_name: "../repo" } } }, 400],
+      [{ payload: { installation: { id: 0 } } }, 400],
+      [{ payload: { number: "7" } }, 400],
+      [{ body: JSON.stringify({ padding: "x".repeat(4096) }) }, 413],
     ] as const;
-    for (const [options, expected] of invalid)
-      expect((await send("opened", options)).status).toBe(expected);
-    expect(store.pendingDeliveries()).toEqual([]);
-    expect(workflow()).toBeNull();
+    for (const [options, status] of errors)
+      expect((await send("opened", options)).status).toBe(status);
+    expect((await fetch(endpoint)).status).toBe(405);
+    expect((await fetch(`${endpoint}/unknown`, { method: "POST" })).status).toBe(404);
+    expect(notify).not.toHaveBeenCalled();
     expect(github.readPullRequest).not.toHaveBeenCalled();
-    expect(reportError).not.toHaveBeenCalled();
   });
 
-  it("returns a retryable HTTP error on SQLite failure and limits the body", async () => {
-    server.close();
-    await once(server, "close");
-    await startReceiver(100);
-    expect((await send("opened")).status).toBe(413);
-    expect(store.pendingDeliveries()).toEqual([]);
-    vi.spyOn(store, "receiveDelivery").mockImplementationOnce(() => {
-      throw new Error("do not log raw storage error");
+  it("acknowledges while reconciliation is blocked and coalesces repeated hints", async () => {
+    const waiting = Promise.withResolvers<PullRequestState>();
+    const entered = Promise.withResolvers<void>();
+    const finished = Promise.withResolvers<void>();
+    let passes = 0;
+    vi.mocked(github.readPullRequest).mockImplementationOnce(() => {
+      entered.resolve();
+      return waiting.promise;
     });
-    expect((await send("opened", { body: "{}" })).status).toBe(503);
-    expect(reportError).toHaveBeenCalledWith(
-      "Unable to receive or persist a GitHub webhook delivery.",
-    );
-  });
-
-  it("acknowledges before performing GitHub reads and deduplicates delivery IDs", async () => {
-    const { runPass } = controller();
-    await runPass();
-    vi.clearAllMocks();
-    state.headSha = headB;
-    const { id } = fixtures.synchronize!;
-    expect((await send("synchronize")).status).toBe(202);
-    expect((await send("opened", { id: id.toUpperCase() })).status).toBe(202);
-    expect(workflow()?.headSha).toBe(headA);
-    expect(github.readPullRequest).not.toHaveBeenCalled();
-    expect(store.pendingDeliveries()).toEqual([
-      { deliveryId: id, workflowId: null, payload: { githubWebhookVersion: 1, hint: target } },
-    ]);
-    await runPass();
-    expect(workflow()?.headSha).toBe(headB);
-    expect(github.readPullRequest).toHaveBeenCalledTimes(2);
-    expect((await send("synchronize")).status).toBe(202);
-    await runPass();
-    expect(github.readPullRequest).toHaveBeenCalledTimes(2);
-    expect(store.deliveryStatus(id)).toMatchObject({ status: "processed", attempts: 1 });
-  });
-
-  it("observes current state for stale lifecycle events and handles close then reopen", async () => {
-    const { runPass } = controller();
-    await send("opened");
-    await runPass();
-    const id = workflow()!.id;
-    state = { state: "closed", headSha: headB };
-    await send("closed");
-    await runPass();
-    expect(workflow()).toMatchObject({
-      state: "stopped",
-      closedByGitHub: true,
-      headSha: headB,
-      checks: [],
-    });
-
-    state = { state: "open", headSha: headB };
-    await send("reopened");
-    await runPass();
-    expect(workflow()).toMatchObject({ state: "awaiting_review", headSha: headB });
-    expect(workflow()?.closedByGitHub).toBeUndefined();
-
-    const transitions = store.transitions(id);
-    await send("closed", { id: "fa217d36-a510-11ee-9eb4-000000000100" });
-    await send("opened", { id: "fa217d36-a510-11ee-9eb4-000000000101" });
-    vi.clearAllMocks();
-    await runPass();
-    expect(workflow()?.headSha).toBe(headB);
-    expect(store.transitions(id)).toEqual(transitions);
-    expect(github.readPullRequest).toHaveBeenCalledTimes(2);
-  });
-
-  it.each(["review", "reviewComment", "issueComment", "check", "suite", "status"])(
-    "uses %s as a signal to read the PR and its exact-head checks",
-    async (event) => {
-      const { runPass } = controller();
-      await runPass();
-      state.headSha = headB;
-      checkOutcome = "failed";
-      vi.clearAllMocks();
-      expect((await send(event)).status).toBe(202);
-      await runPass();
-      expect(github.readChecks).toHaveBeenCalledWith(target, headB, undefined);
-      expect(workflow()).toMatchObject({
-        headSha: headB,
-        state: "awaiting_review",
-        requiredChecks: null,
-        checks: [{ name: "CI", sha: headB, outcome: "failed" }],
-      });
-    },
-  );
-
-  it("ignores a legacy Codex completion marker in a signed webhook, including on a later poll", async () => {
-    const reconcile = createReconciler(store, github, () => ["CI"]);
-    const { runPass } = createController({
+    const run = runController({
+      controller,
       store,
-      targets: [target],
-      reconcile,
-      reportError,
-      reconcileIntervalMs: 1000,
-      now: () => now,
-    });
-    const payload = {
-      ...fixtures.issueComment!.payload,
-      action: "edited",
-      comment: {
-        user: { login: "chatgpt-codex-connector[bot]" },
-        body: `<!-- codex-review-state:v1
-${JSON.stringify({ code_review: { commit_sha: headA, status: "completed", has_any_findings: false, has_unresolved_findings: false } })}
--->`,
+      repositories: [target],
+      onceOnly: false,
+      reconcileIntervalMs: 60_000,
+      signal: abort.signal,
+      log(entry) {
+        if (entry.event === "reconciliation_finished" && ++passes === 2) finished.resolve();
       },
-    };
-    expect((await send("issueComment", { body: JSON.stringify(payload) })).status).toBe(202);
-    expect(store.pendingDeliveries()[0]?.payload).toEqual({
-      githubWebhookVersion: 1,
-      hint: target,
     });
-    await runPass();
-    now += 1000;
-    await runPass();
-    expect(store.reviews().list(workflow()!.id)).toEqual([]);
-    expect(workflow()).toMatchObject({
-      state: "awaiting_review",
-      requiredChecks: ["CI"],
-      checks: [{ name: "CI", sha: headA, outcome: "passed" }],
-    });
-  });
-
-  it("ignores ordinary issues, untracked PRs, and unexpected installations", async () => {
-    const { runPass } = controller();
-    await runPass();
-    vi.clearAllMocks();
-    const { payload } = fixtures.opened!;
-    expect((await send("ordinaryIssue")).status).toBe(202);
-    expect((await send("opened", { body: JSON.stringify({ ...payload, number: 8 }) })).status).toBe(
-      202,
-    );
-    expect(
-      (
-        await send("review", {
-          body: JSON.stringify({ ...fixtures.review!.payload, installation: { id: 43 } }),
-        })
-      ).status,
-    ).toBe(202);
-    await runPass();
-    expect(github.readPullRequest).not.toHaveBeenCalled();
-    expect(store.pendingDeliveries()).toHaveLength(0);
-  });
-
-  it("retries an observable failure after restart and the durable retry delay", async () => {
-    const { runPass } = controller();
-    await runPass();
-    checkOutcome = "pending";
-    vi.mocked(github.readChecks).mockRejectedValueOnce(new Error("GitHub API unavailable"));
-    await send("check");
-    const id = fixtures.check!.id;
-    expect(await runPass()).toBe(false);
-    expect(store.deliveryStatus(id)).toMatchObject({
-      status: "failed",
-      attempts: 1,
-      error: expect.stringContaining("GitHub API unavailable"),
-      retryAt: now + 30_000,
-    });
-    expect(workflow()?.checks).toEqual([]);
-    expect(reportError).toHaveBeenCalledWith(expect.stringContaining(id));
-
-    store.close();
-    store = new WorkflowStore(dbPath);
-    expect(store.recover()).toEqual({ deliveries: 0, unknownExecutions: 0 });
-    const restarted = controller();
-    now += 29_999;
-    await restarted.runPass();
-    expect(store.deliveryStatus(id)).toMatchObject({ status: "failed", attempts: 1 });
-    now++;
-    await restarted.runPass();
-    expect(store.deliveryStatus(id)).toMatchObject({
-      status: "processed",
-      attempts: 2,
-      error: null,
-      retryAt: null,
-    });
-    expect(workflow()?.checks).toEqual([{ name: "CI", sha: headA, outcome: "pending" }]);
-  });
-
-  it("persists a GitHub retry window longer than the default inbox delay", async () => {
-    const { runPass } = controller();
-    await runPass();
-    const retryAt = now + 60_000;
-    vi.mocked(github.readPullRequest).mockRejectedValueOnce(new GitHubRateLimitError(retryAt, 403));
-    await send("status");
-    const id = fixtures.status!.id;
-    expect(await runPass()).toBe(false);
-    expect(store.deliveryStatus(id)).toMatchObject({ status: "failed", attempts: 1, retryAt });
-    now += 30_000;
-    await runPass();
-    expect(store.deliveryStatus(id)).toMatchObject({ status: "failed", attempts: 1, retryAt });
-    now = retryAt;
-    await runPass();
-    expect(store.deliveryStatus(id)).toMatchObject({ status: "processed", attempts: 2 });
-  });
-
-  it("polls for missed opens, synchronizations, closures and reopens without replaying an operator stop", async () => {
-    const { runPass } = controller(5_000);
-    await runPass();
-    expect(workflow()?.headSha).toBe(headA);
-    state = { state: "closed", headSha: headB };
-    now += 4_999;
-    await runPass();
-    expect(workflow()?.headSha).toBe(headA);
-    now++;
-    await runPass();
-    expect(workflow()).toMatchObject({ headSha: headB, state: "stopped", closedByGitHub: true });
-    store.close();
-    store = new WorkflowStore(dbPath);
-    state.state = "open";
-    const restarted = controller(5_000);
-    await restarted.runPass();
-    expect(workflow()?.state).toBe("awaiting_review");
-    store.transition(workflow()!.id, { type: "stop", reason: "Operator stop" });
-    now += 5_000;
-    await restarted.runPass();
-    expect(workflow()).toMatchObject({ state: "stopped", escalationReason: "Operator stop" });
-    expect(workflow()?.closedByGitHub).toBeUndefined();
-  });
-
-  it("discards a snapshot when the PR changes during the API reads", async () => {
-    const { runPass } = controller();
-    await runPass();
-    vi.mocked(github.readChecks).mockImplementationOnce(async () => {
-      state.headSha = headB;
-      return [{ name: "CI", sha: headA, outcome: "passed" }];
-    });
-    await send("review");
-    expect(await runPass()).toBe(false);
-    expect(workflow()).toMatchObject({ headSha: headB, checks: [] });
-    expect(store.deliveryStatus(fixtures.review!.id)?.error).toContain("head changed");
-  });
-
-  it("keeps newer failing CI when a passing observation of the same head finishes late", async () => {
-    const sha = headA;
-    const requiredChecks = () => ["CI"];
-    const reconcile = createReconciler(store, github, requiredChecks);
-    await reconcile(target);
-    expect(workflow()?.checks).toEqual([{ name: "CI", sha: headA, outcome: "passed" }]);
-
-    const other = new WorkflowStore(dbPath);
-    const reachedFinalRead = Promise.withResolvers<void>();
-    const finalRead = Promise.withResolvers<PullRequestState>();
     try {
-      const delayedReader = {
-        ...github,
-        readPullRequest: vi
-          .fn(github.readPullRequest)
-          .mockImplementationOnce(github.readPullRequest)
-          .mockImplementationOnce(() => {
-            reachedFinalRead.resolve();
-            return finalRead.promise;
-          }),
-      };
-      const delayed = createReconciler(other, delayedReader, requiredChecks)(target);
-      const superseded = expect(delayed).rejects.toThrow(/superseded this observation/);
-      await reachedFinalRead.promise;
-      try {
-        checkOutcome = "failed";
-        await reconcile(target);
-        expect(workflow()?.state).toBe("awaiting_review");
-      } finally {
-        finalRead.resolve({ ...state });
-        await superseded;
-      }
-      expect(workflow()).toMatchObject({
-        headSha: sha,
-        checks: [{ name: "CI", sha, outcome: "failed" }],
-        state: "awaiting_review",
-      });
+      await entered.promise;
+      expect((await send("opened")).status).toBe(202);
+      expect((await send("opened")).status).toBe(202);
+      expect((await send("synchronize")).status).toBe(202);
+      expect(workflow()).toBeNull();
+      waiting.resolve({ ...state });
+      await finished.promise;
+      expect(github.listOpenPullRequests).toHaveBeenCalledTimes(1);
+      expect(github.readPullRequest).toHaveBeenCalledTimes(4);
+      expect(store.listWorkflows(target.repository)).toHaveLength(1);
+      expect(workflow()?.id).toBe("owner/repo#7");
     } finally {
-      other.close();
+      waiting.resolve({ ...state });
+      abort.abort();
+      await run;
     }
   });
 
-  it("honors an operator stop issued while GitHub has closed the PR", async () => {
-    const { runPass } = controller();
-    await runPass();
-    const id = workflow()!.id;
-    state.state = "closed";
-    await send("closed");
-    await runPass();
-    expect(workflow()).toMatchObject({ state: "stopped", closedByGitHub: true });
-
-    store.transition(id, { type: "stop", reason: "Operator stop while closed" });
-    store.close();
-    store = new WorkflowStore(dbPath);
-    store.recover();
-    state.state = "open";
-    await createReconciler(store, github)(target);
-    expect(workflow()).toMatchObject({
-      state: "stopped",
-      escalationReason: "Operator stop while closed",
-    });
-    expect(workflow()?.closedByGitHub).toBeUndefined();
-  });
-
-  it("observes closure and reopening across a restart while an independent execution stays held", async () => {
-    const { runPass } = controller();
-    await runPass();
-    const id = workflow()!.id;
-    state.state = "closed";
-    await send("closed");
-    await runPass();
-    expect(workflow()).toMatchObject({ state: "stopped", closedByGitHub: true });
-
-    const interrupted = crashAfterSession(dbPath);
-    expect(interrupted.signal, interrupted.stderr).toBe("SIGKILL");
-    store.close();
-    store = new WorkflowStore(dbPath);
-    expect(store.recover()).toEqual({ deliveries: 0, unknownExecutions: 1 });
-    expect(workflow()).toMatchObject({ state: "stopped", closedByGitHub: true });
-
-    state = { state: "open", headSha: headB };
-    await createReconciler(store, github)(target);
-    expect(workflow()).toMatchObject({ state: "awaiting_review", headSha: headB });
-    expect(workflow()?.closedByGitHub).toBeUndefined();
-    expect(store.transitions(id)).toContainEqual(
-      expect.objectContaining({
-        from: "stopped",
-        to: "awaiting_review",
-        headSha: headB,
+  it("recovers a transient discovery failure on the periodic sweep with webhooks enabled", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    const interval = 60_000;
+    const outcomes: unknown[] = [];
+    vi.mocked(github.listOpenPullRequests).mockRejectedValueOnce(
+      new GitHubTransientError("Discovery temporarily unavailable", {
+        retryAt: Date.now() + 30_000,
       }),
     );
-    expect(store.agentExecutions().get("interrupted")).toMatchObject({
-      status: "unknown",
-      reason: expect.stringContaining("owner exited"),
+    const run = runController({
+      controller,
+      store,
+      repositories: [target],
+      onceOnly: false,
+      reconcileIntervalMs: interval,
+      signal: abort.signal,
+      log(entry) {
+        if (entry.event === "reconciliation_finished") outcomes.push(entry.succeeded);
+      },
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(interval - 1);
+      expect(outcomes).toEqual([false]);
+      expect(github.listOpenPullRequests).toHaveBeenCalledTimes(1);
+      expect(workflow()).toBeNull();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(outcomes).toEqual([false, true]);
+      expect(github.listOpenPullRequests).toHaveBeenCalledTimes(2);
+      expect(workflow()).toMatchObject({ state: "awaiting_review", headSha: headA });
+      expect(notify).not.toHaveBeenCalled();
+    } finally {
+      abort.abort();
+      await run;
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses current lifecycle and head despite stale or out-of-order payloads", async () => {
+    state = openPull(target.repository, { headSha: headB, draft: true });
+    expect((await send("opened")).status).toBe(202);
+    await controller.runPass();
+    expect(workflow()).toBeNull();
+
+    state.draft = false;
+    expect((await send("opened", { payload: { action: "ready_for_review" } })).status).toBe(202);
+    await controller.runPass();
+    expect(workflow()).toMatchObject({ state: "awaiting_review", headSha: headB });
+    const id = workflow()!.id;
+
+    state.draft = true;
+    expect((await send("opened", { payload: { action: "converted_to_draft" } })).status).toBe(202);
+    await controller.runPass();
+    expect(workflow()).toMatchObject({ id, state: "stopped", githubStatus: "draft", checks: [] });
+
+    state = openPull(target.repository, { state: "closed" });
+    expect((await send("reopened")).status).toBe(202);
+    await controller.runPass();
+    expect(workflow()).toMatchObject({
+      id,
+      state: "stopped",
+      githubStatus: "closed",
+      headSha: headA,
+    });
+
+    state = openPull(target.repository, { headSha: headB });
+    expect((await send("closed")).status).toBe(202);
+    await controller.runPass();
+    expect(workflow()).toMatchObject({
+      id,
+      state: "awaiting_review",
+      githubStatus: "eligible",
+      headSha: headB,
     });
   });
 
-  it.each(["CI", "final head"] as const)(
-    "clears current CI evidence when the %s read fails",
-    async (read) => {
-      const { runPass } = controller();
-      await runPass();
-      expect(workflow()?.checks).toEqual([{ name: "CI", sha: headA, outcome: "passed" }]);
-      if (read === "CI")
-        vi.mocked(github.readChecks).mockRejectedValueOnce(new Error("CI unavailable"));
-      else
-        vi.mocked(github.readPullRequest)
-          .mockResolvedValueOnce({ ...state })
-          .mockRejectedValueOnce(new Error("Final head unavailable"));
-      await send("check");
-      expect(await runPass()).toBe(false);
-      expect(workflow()).toMatchObject({ state: "awaiting_review", headSha: headA, checks: [] });
+  it.each(["review", "reviewComment", "issueComment", "check", "suite", "status"])(
+    "routes supported %s notifications using only repository and PR hints",
+    async (fixture) => {
+      expect((await send(fixture)).status).toBe(202);
+      expect(workflow()).toBeNull();
+      await controller.runPass();
+      const isCI = ["check", "suite", "status"].includes(fixture);
+      expect(notify).toHaveBeenCalledExactlyOnceWith({ ...target, pullRequest: isCI ? null : 7 });
+      expect(github.listOpenPullRequests).toHaveBeenCalledTimes(isCI ? 1 : 0);
+      expect(workflow()).toMatchObject({ state: "awaiting_review", requiredChecks: null });
+      expect(store.reviews().list(workflow()!.id)).toEqual([]);
     },
   );
 
-  it("reconciles pending and interrupted linked and unlinked deliveries after restart", async () => {
-    await controller().runPass();
-    const workflowId = workflow()!.id;
-    store.close();
-    const db = new DatabaseSync(dbPath);
-    const insert = db.prepare(
-      "INSERT INTO deliveries (delivery_id, workflow_id, payload, status, received_at) VALUES (?, ?, ?, ?, ?)",
-    );
-    insert.run(
-      "linked-review",
-      workflowId,
-      '{"action":"review"}',
-      "processing",
-      new Date(now).toISOString(),
-    );
-    insert.run(
-      "unlinked-open",
-      null,
-      '{"action":"opened"}',
-      "pending",
-      new Date(now).toISOString(),
-    );
-    insert.run("opaque-delivery", null, "null", "pending", new Date(now).toISOString());
-    db.close();
-    store = new WorkflowStore(dbPath);
-    expect(store.recover()).toEqual({ deliveries: 1, unknownExecutions: 0 });
-    const deliveryIds = ["linked-review", "unlinked-open", "opaque-delivery"];
-    expect(store.dueDeliveryIds(now, 25)).toEqual(deliveryIds);
-    state.headSha = headB;
-    const { runPass } = controller();
-    vi.mocked(github.readPullRequest).mockRejectedValueOnce(
-      new Error("GitHub unavailable at startup"),
-    );
-    expect(await runPass()).toBe(false);
-    expect(store.deliveryStatus("opaque-delivery")).toMatchObject({
-      status: "failed",
-      retryAt: now + 30_000,
-    });
-    now += 30_000;
-    expect(await runPass()).toBe(true);
-    expect(workflow()).toMatchObject({
-      headSha: headB,
-      state: "awaiting_review",
-    });
-    for (const id of deliveryIds)
-      expect(store.deliveryStatus(id)).toMatchObject({
-        status: "processed",
-        attempts: 2,
-        error: null,
-      });
+  it("routes a check associated with one PR without listing the repository", async () => {
+    expect(
+      (await send("check", { payload: { check_run: { pull_requests: [{ number: 7 }] } } })).status,
+    ).toBe(202);
+    await controller.runPass();
+    expect(notify).toHaveBeenCalledExactlyOnceWith(target);
+    expect(github.listOpenPullRequests).not.toHaveBeenCalled();
+    expect(workflow()?.headSha).toBe(headA);
   });
 
-  it("uses the linked workflow to route a payload after the startup sweep", async () => {
-    const reconcile = vi.fn(createReconciler(store, github));
-    const { runPass } = createController({
-      store,
-      targets: [target, { ...target, pullRequest: 8 }],
-      reconcile,
-      reportError,
-      reconcileIntervalMs: 0,
-      now: () => now,
-    });
-    await runPass();
-    reconcile.mockClear();
-    store.receiveDelivery("linked-review", { action: "review" }, workflow()!.id);
-    expect(await runPass()).toBe(true);
-    expect(reconcile.mock.calls).toEqual([[target]]);
+  it("ignores valid notifications for other installations, repositories and ordinary issues", async () => {
+    expect((await send("opened", { payload: { installation: { id: 43 } } })).status).toBe(202);
+    expect(
+      (await send("opened", { payload: { repository: { full_name: "another/repo" } } })).status,
+    ).toBe(202);
+    expect((await send("status", { payload: { installation: { id: 43 } } })).status).toBe(202);
+    expect((await send("issueComment", { payload: { issue: { number: 7 } } })).status).toBe(202);
+    await controller.runPass();
+    expect(github.readPullRequest).not.toHaveBeenCalled();
+    expect(github.listOpenPullRequests).not.toHaveBeenCalled();
+    expect(workflow()).toBeNull();
   });
 
-  it("retires retry counts when an operator stops a workflow between passes", async () => {
-    const { runPass } = controller();
-    await runPass();
-    const rateLimits = store.githubRateLimits();
-    const retryAt = now + 120_000;
-    const previous = {
-      retryAt,
-      throttledAttempts: 4,
-      retryRequest: "pr:42:owner/repo:7",
-    };
-    rateLimits.set("secondary", previous);
-    await runPass();
-    expect(rateLimits.get("secondary")).toEqual(previous);
-    store.transition(workflow()!.id, { type: "stop", reason: "Operator stopped tracking this PR" });
-    await runPass();
-    expect(rateLimits.get("secondary")).toEqual({
-      retryAt,
-      throttledAttempts: 0,
-      retryRequest: null,
-    });
-  });
-
-  it("records a late closure without clearing a rate limit hit earlier in the pass", async () => {
-    vi.mocked(github.readPullRequest)
-      .mockResolvedValueOnce({ state: "open", headSha: headA })
-      .mockResolvedValueOnce({ state: "closed", headSha: headA });
-    vi.mocked(github.readChecks).mockRejectedValueOnce(new GitHubRateLimitError(now + 60_000));
-    await createReconciler(store, github)(target);
-    expect(workflow()).toMatchObject({ state: "stopped", closedByGitHub: true });
-    expect(github.completeReconciliation).not.toHaveBeenCalled();
+  it("keeps a PR-specific hint when a coalesced repository listing omits the PR", async () => {
+    vi.mocked(github.listOpenPullRequests).mockResolvedValueOnce([]);
+    expect((await send("status")).status).toBe(202);
+    expect((await send("opened")).status).toBe(202);
+    await controller.runPass();
+    expect(workflow()).toMatchObject({ state: "awaiting_review", headSha: headA });
   });
 });

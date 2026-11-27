@@ -1,17 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { WorkflowStore } from "../src/store.js";
 import { InvalidTransitionError, type Workflow } from "../src/workflow.js";
 
-let dir: string | undefined;
 let store: WorkflowStore | undefined;
 afterEach(() => {
   store?.close();
   store = undefined;
-  if (dir) rmSync(dir, { recursive: true, force: true });
-  dir = undefined;
 });
 
 function fixture(): Workflow {
@@ -74,55 +68,5 @@ describe("workflow state and durable store", () => {
       headSha: "def",
       checks: [],
     });
-  });
-
-  it("deduplicates webhook deliveries and processes a delivery only once", async () => {
-    const db = memoryStore();
-    expect(db.receiveDelivery("delivery-1", { action: "opened" }, "wf-1")).toBe(true);
-    expect(db.receiveDelivery("delivery-1", { action: "changed" }, "wf-1")).toBe(false);
-    let calls = 0;
-    expect(
-      await db.processDelivery("delivery-1", () => {
-        calls += 1;
-      }),
-    ).toBe(true);
-    expect(
-      await db.processDelivery("delivery-1", () => {
-        calls += 1;
-      }),
-    ).toBe(false);
-    expect(calls).toBe(1);
-  });
-
-  it("makes a failed delivery visible and retryable", async () => {
-    const db = memoryStore();
-    db.receiveDelivery("delivery-retry", { action: "review" }, "wf-1");
-    await expect(
-      db.processDelivery("delivery-retry", async () => {
-        await Promise.resolve();
-        throw new Error("temporary failure");
-      }),
-    ).rejects.toThrow("temporary failure");
-    expect(db.pendingDeliveries()).toHaveLength(1);
-    let calls = 0;
-    expect(
-      await db.processDelivery("delivery-retry", () => {
-        calls += 1;
-      }),
-    ).toBe(true);
-    expect(calls).toBe(1);
-  });
-
-  it("recovers interrupted processing without losing the delivery", () => {
-    dir = mkdtempSync(join(tmpdir(), "switchyard-"));
-    const path = join(dir, "state.sqlite");
-    store = new WorkflowStore(path);
-    store.createWorkflow(fixture());
-    store.receiveDelivery("delivery-2", { action: "review" }, "wf-1");
-    expect(store.claimDelivery("delivery-2")).toBe(true);
-    store.close();
-    store = new WorkflowStore(path);
-    expect(store.recover()).toEqual({ deliveries: 1, unknownExecutions: 0 });
-    expect(store.pendingDeliveries()).toHaveLength(1);
   });
 });

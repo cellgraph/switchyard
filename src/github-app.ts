@@ -106,6 +106,7 @@ type Token = { value: string; expiresAt: number };
 type ApiRequest = {
   path: string;
   reconcilePullRequest?: number | undefined;
+  repositoryDiscovery?: boolean | undefined;
   commitRetryKey?: string | undefined;
   drainSignal?: AbortSignal | undefined;
 } & (
@@ -125,12 +126,21 @@ export function tokenRetryKey(target: GitHubRepository): string {
   return `token:${target.installationId}:${target.repository}`;
 }
 
+export function repositoryRetryKey(target: GitHubRepository): string {
+  return `repo:${target.installationId}:${target.repository}`;
+}
+
 export function belongsToReconciliation(
   key: string,
   target: GitHubRepository,
-  pullRequest: number,
+  pullRequest?: number,
 ): boolean {
-  return key === `pr:${pullRequestRetryKey(target, pullRequest)}` || key === tokenRetryKey(target);
+  return (
+    key === tokenRetryKey(target) ||
+    (pullRequest === undefined
+      ? key === repositoryRetryKey(target)
+      : key === `pr:${pullRequestRetryKey(target, pullRequest)}`)
+  );
 }
 
 export function retireInactiveGitHubRetry(
@@ -163,7 +173,7 @@ export function createGitHubAppClient({
   rateLimits = new Map<RateLimitScope, GitHubRateLimitState>(),
   retryDeadlines = memoryRetryDeadlines(),
   isRetryOwnerActive = () => true,
-  canReadPullRequest = () => true,
+  canReadPullRequestChecks = () => true,
 }: {
   clientId: string;
   privateKey: string;
@@ -172,7 +182,7 @@ export function createGitHubAppClient({
   rateLimits?: GitHubRateLimits;
   retryDeadlines?: GitHubRetryDeadlines;
   isRetryOwnerActive?: (key: string) => boolean;
-  canReadPullRequest?: (target: GitHubRepository, pullRequest: number) => boolean;
+  canReadPullRequestChecks?: (target: GitHubRepository, pullRequest: number) => boolean;
 }) {
   const key = createPrivateKey(privateKey);
   if (key.asymmetricKeyType !== "rsa") throw new Error("GitHub App requires an RSA private key.");
@@ -235,12 +245,24 @@ export function createGitHubAppClient({
 
   async function request(
     target: GitHubRepository,
-    { path, method, body, reconcilePullRequest, commitRetryKey, drainSignal }: ApiRequest,
+    {
+      path,
+      method,
+      body,
+      reconcilePullRequest,
+      repositoryDiscovery,
+      commitRetryKey,
+      drainSignal,
+    }: ApiRequest,
     credential: string,
   ): Promise<Response> {
     checkGitHubDrain(drainSignal);
     checkAuthentication(target);
-    if (reconcilePullRequest !== undefined && !canReadPullRequest(target, reconcilePullRequest))
+    if (
+      reconcilePullRequest !== undefined &&
+      (commitRetryKey || path === "/graphql") &&
+      !canReadPullRequestChecks(target, reconcilePullRequest)
+    )
       throw new Error("Pull request reconciliation was stopped.");
     const scope = `installation:${target.installationId}` as const;
     const pullRequestKey =
@@ -252,8 +274,10 @@ export function createGitHubAppClient({
       ? tokenRetryKey(target)
       : pullRequestKey !== undefined
         ? `pr:${pullRequestKey}`
-        : `${target.installationId}:GET:${path}`;
-    const deadlineKey = tokenRequest ? requestKey : pullRequestKey;
+        : repositoryDiscovery
+          ? repositoryRetryKey(target)
+          : `${target.installationId}:GET:${path}`;
+    const deadlineKey = tokenRequest || repositoryDiscovery ? requestKey : pullRequestKey;
     const startedAt = now();
     const limit = limitsFor(scope);
     const paused = limit.throttledAttempts >= maxSecondaryAttempts;
@@ -286,11 +310,15 @@ export function createGitHubAppClient({
 
     let responseError: GitHubRateLimitError | GitHubTransientError | undefined;
     if (response.status === 403 || response.status === 429) {
-      const retryDelay = headerMilliseconds(response.headers.get("retry-after"));
-      const secondaryLimited =
-        (!primaryLimited && (response.status === 429 || retryDelay !== undefined)) ||
-        (await reportsSecondaryLimit(response));
+      const retryAfter = response.headers.get("retry-after");
       const observedAt = now();
+      const retryAt = retryAfterDeadline(retryAfter, observedAt);
+      const secondaryLimited =
+        (!primaryLimited &&
+          (response.status === 429 ||
+            retryAt !== undefined ||
+            headerMilliseconds(retryAfter) !== undefined)) ||
+        (await reportsSecondaryLimit(response));
       if (secondaryLimited) {
         retireInactiveGitHubRetry(rateLimits, isRetryOwnerActive);
         const previous = rateLimits.get("secondary");
@@ -301,9 +329,9 @@ export function createGitHubAppClient({
         const countAttempt =
           ownerActive && !alreadyCounted && previousAttempts < maxSecondaryAttempts;
         const throttledAttempts = previousAttempts + (countAttempt ? 1 : 0);
-        // A late throttle from a stopped workflow still sets a cooldown without advancing the streak.
+        // A late throttle from an inactive workflow still sets a cooldown without advancing the streak.
         const delay = Math.max(
-          retryDelay ?? 0,
+          (retryAt ?? observedAt) - observedAt,
           fallbackRetryDelay * 2 ** (ownerActive ? Math.max(throttledAttempts - 1, 0) : 0),
         );
         rateLimits.set("secondary", {
@@ -317,7 +345,7 @@ export function createGitHubAppClient({
           scope,
           Math.max(
             reset !== undefined && reset > observedAt ? reset : observedAt + fallbackRetryDelay,
-            observedAt + (retryDelay ?? 0),
+            retryAt ?? observedAt,
           ),
         );
       }
@@ -356,7 +384,13 @@ export function createGitHubAppClient({
     }
     if (responseError) throw responseError;
     // Reads in a reconciliation only clear the count when the entire reconciliation succeeds.
-    if (response.ok && limit.throttledAttempts > 0 && reconcilePullRequest === undefined)
+    if (
+      response.ok &&
+      limit.throttledAttempts > 0 &&
+      reconcilePullRequest === undefined &&
+      !repositoryDiscovery &&
+      !tokenRequest
+    )
       clearSecondaryAttempts(startedAt, (key) => key === requestKey);
     return response;
   }
@@ -411,7 +445,7 @@ export function createGitHubAppClient({
   }
 
   return {
-    completeReconciliation(target: GitHubRepository, pullRequest: number): void {
+    completeReconciliation(target: GitHubRepository, pullRequest?: number): void {
       clearSecondaryAttempts(now(), (key) => belongsToReconciliation(key, target, pullRequest));
     },
 
@@ -502,11 +536,21 @@ export function createGitHubAppClient({
       const commitRetryKey = suffix.startsWith("/commits/")
         ? `commit:${target.installationId}:${path.split("?", 1)[0]}`
         : undefined;
-      const read = { path, reconcilePullRequest, commitRetryKey, drainSignal };
+      const repositoryDiscovery = suffix.startsWith("/pulls?");
+      const read = { path, reconcilePullRequest, repositoryDiscovery, commitRetryKey, drainSignal };
       return queueRead(target.installationId, async () => {
         checkGitHubDrain(drainSignal);
         checkAuthentication(target);
-        checkRetryDeadline(prRetryKey, commitRetryKey);
+        if (
+          reconcilePullRequest !== undefined &&
+          commitRetryKey &&
+          !canReadPullRequestChecks(target, reconcilePullRequest)
+        )
+          throw new Error("Pull request reconciliation was stopped.");
+        checkRetryDeadline(
+          repositoryDiscovery ? repositoryRetryKey(target) : prRetryKey,
+          commitRetryKey,
+        );
         let token = await tokenFor(target, cacheKey, reconcilePullRequest, drainSignal);
         let response = await request(target, read, token.value);
         if (response.status === 401) {

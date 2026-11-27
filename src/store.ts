@@ -3,8 +3,7 @@ import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { agentSchema, createAgentStore } from "./agent-store.ts";
-import type { GitHubRateLimits, GitHubRateLimitState } from "./github-app.ts";
-import type { PullRequestTarget } from "./github-api.ts";
+import type { GitHubRateLimits, GitHubRateLimitState, GitHubRepository } from "./github-app.ts";
 import { createReviewStore, reviewSchema } from "./review-store.ts";
 import {
   transitionWorkflow,
@@ -12,10 +11,6 @@ import {
   type Workflow,
   type WorkflowCommand,
 } from "./workflow.ts";
-
-export type DeliveryStatus = "pending" | "processing" | "processed" | "failed";
-type InboxDelivery = { deliveryId: string; payload: unknown; workflowId: string | null };
-type DeliveryRow = { delivery_id: string; payload: string; workflow_id: string | null };
 
 export type GitHubObservationWriter = {
   transition(id: string, command: WorkflowCommand): Workflow;
@@ -26,11 +21,11 @@ type WorkerRecord = {
   pid: number;
   startedAt: string;
   stoppedAt: string | null;
-  pollIntervalMs: number;
-  targets: PullRequestTarget[];
-  lastPollStartedAt: string | null;
-  lastPollFinishedAt: string | null;
-  lastPollSucceeded: boolean | null;
+  reconcileIntervalMs: number;
+  repositories: GitHubRepository[];
+  lastPassStartedAt: string | null;
+  lastPassFinishedAt: string | null;
+  lastPassSucceeded: boolean | null;
 };
 
 export function localProcessAlive(pid: number | null): boolean {
@@ -47,7 +42,7 @@ export function localProcessAlive(pid: number | null): boolean {
 }
 
 const applicationId = 0x53575944; // SWYD
-const schemaVersion = 18;
+const schemaVersion = 19;
 const unsupportedDatabase =
   "Unsupported Switchyard database identity or schema version. Use a fresh SWITCHYARD_DB_PATH for this implementation.";
 
@@ -61,9 +56,9 @@ function databaseIdentity(db: DatabaseSync) {
 
 const schema = `
   CREATE TABLE workflows (
-    id TEXT PRIMARY KEY, repository TEXT NOT NULL, pull_request INTEGER NOT NULL,
+    id TEXT PRIMARY KEY, repository TEXT NOT NULL COLLATE NOCASE, pull_request INTEGER NOT NULL,
     state TEXT NOT NULL, head_sha TEXT NOT NULL, required_checks TEXT,
-    checks TEXT NOT NULL DEFAULT '[]', closed_by_github INTEGER NOT NULL DEFAULT 0,
+    checks TEXT NOT NULL DEFAULT '[]', github_status TEXT,
     escalation_reason TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
     UNIQUE(repository, pull_request)
   );
@@ -72,13 +67,6 @@ const schema = `
     from_state TEXT NOT NULL, to_state TEXT NOT NULL, reason TEXT NOT NULL,
     head_sha TEXT NOT NULL, created_at TEXT NOT NULL
   );
-  CREATE TABLE deliveries (
-    delivery_id TEXT PRIMARY KEY, workflow_id TEXT REFERENCES workflows(id),
-    payload TEXT NOT NULL, status TEXT NOT NULL, received_at TEXT NOT NULL,
-    processed_at TEXT, error TEXT, attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER
-  );
-  CREATE INDEX deliveries_pending ON deliveries(status, received_at);
-  CREATE INDEX deliveries_retry ON deliveries(status, retry_at);
   CREATE TABLE check_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id TEXT NOT NULL REFERENCES workflows(id),
     name TEXT NOT NULL, sha TEXT NOT NULL, outcome TEXT NOT NULL, captured_at TEXT NOT NULL
@@ -93,7 +81,7 @@ const schema = `
     repository TEXT NOT NULL COLLATE NOCASE, pull_request INTEGER NOT NULL, generation INTEGER NOT NULL,
     PRIMARY KEY (repository, pull_request)
   );
-  CREATE TABLE unattended_worker (slot INTEGER PRIMARY KEY CHECK(slot=1), record TEXT NOT NULL);
+  CREATE TABLE controller_worker (slot INTEGER PRIMARY KEY CHECK(slot=1), record TEXT NOT NULL);
   ${reviewSchema}
   PRAGMA application_id = ${applicationId};
   PRAGMA user_version = ${schemaVersion};
@@ -120,27 +108,27 @@ export class WorkflowStore {
   }
 
   workerRecord(): WorkerRecord | null {
-    const row = this.#db.prepare("SELECT record FROM unattended_worker WHERE slot=1").get();
+    const row = this.#db.prepare("SELECT record FROM controller_worker WHERE slot=1").get();
     return row ? (JSON.parse(String(row.record)) as WorkerRecord) : null;
   }
 
-  claimWorker(targets: PullRequestTarget[], pollIntervalMs: number, startedAt: string) {
+  claimWorker(repositories: GitHubRepository[], reconcileIntervalMs: number, startedAt: string) {
     return this.#transaction(() => {
       const previous = this.workerRecord();
       if (previous && !previous.stoppedAt && localProcessAlive(previous.pid)) return null;
       const record: WorkerRecord = {
         id: randomUUID(),
         pid: process.pid,
-        targets,
-        pollIntervalMs,
+        repositories,
+        reconcileIntervalMs,
         startedAt,
         stoppedAt: null,
-        lastPollStartedAt: null,
-        lastPollFinishedAt: null,
-        lastPollSucceeded: null,
+        lastPassStartedAt: null,
+        lastPassFinishedAt: null,
+        lastPassSucceeded: null,
       };
       this.#db
-        .prepare("INSERT OR REPLACE INTO unattended_worker VALUES (1, ?)")
+        .prepare("INSERT OR REPLACE INTO controller_worker VALUES (1, ?)")
         .run(JSON.stringify(record));
       return { record, interruptedRun: previous && !previous.stoppedAt ? previous.id : null };
     });
@@ -151,16 +139,16 @@ export class WorkflowStore {
     updates: Partial<
       Pick<
         WorkerRecord,
-        "stoppedAt" | "lastPollStartedAt" | "lastPollFinishedAt" | "lastPollSucceeded"
+        "stoppedAt" | "lastPassStartedAt" | "lastPassFinishedAt" | "lastPassSucceeded"
       >
     >,
   ): void {
     const result = this.#db
       .prepare(
-        "UPDATE unattended_worker SET record=json_patch(record, ?) WHERE slot=1 AND json_extract(record, '$.id')=?",
+        "UPDATE controller_worker SET record=json_patch(record, ?) WHERE slot=1 AND json_extract(record, '$.id')=?",
       )
       .run(JSON.stringify(updates), id);
-    if (result.changes !== 1) throw new Error("The unattended worker lost its SQLite claim.");
+    if (result.changes !== 1) throw new Error("The reconciliation worker lost its SQLite claim.");
   }
 
   githubRateLimits(): GitHubRateLimits {
@@ -196,6 +184,8 @@ export class WorkflowStore {
       extend: (keys: readonly string[], retryAt: number) =>
         upsert.run(retryAt, JSON.stringify(keys)),
       delete: (key: string) => remove.run(key),
+      prune: (now: number) =>
+        this.#db.prepare("DELETE FROM reconciliation_retries WHERE retry_at <= ?").run(now),
     };
   }
 
@@ -203,7 +193,7 @@ export class WorkflowStore {
     const now = new Date().toISOString();
     this.#db
       .prepare(
-        `INSERT INTO workflows (id, repository, pull_request, state, head_sha, required_checks, checks, escalation_reason, closed_by_github, created_at, updated_at)
+        `INSERT INTO workflows (id, repository, pull_request, state, head_sha, required_checks, checks, escalation_reason, github_status, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
@@ -215,7 +205,7 @@ export class WorkflowStore {
         JSON.stringify(workflow.requiredChecks),
         JSON.stringify(workflow.checks),
         workflow.escalationReason,
-        workflow.closedByGitHub ? 1 : 0,
+        workflow.githubStatus ?? null,
         now,
         now,
       );
@@ -234,6 +224,13 @@ export class WorkflowStore {
       )
       .get(repository, pullRequest);
     return row ? decodeWorkflow(row) : null;
+  }
+
+  listWorkflows(repository: string): Workflow[] {
+    return this.#db
+      .prepare("SELECT * FROM workflows WHERE repository = ? ORDER BY pull_request")
+      .all(repository)
+      .map(decodeWorkflow);
   }
 
   transition(id: string, command: WorkflowCommand): Workflow {
@@ -286,7 +283,7 @@ export class WorkflowStore {
     const now = new Date().toISOString();
     this.#db
       .prepare(
-        `UPDATE workflows SET state=?, head_sha=?, required_checks=?, checks=?, escalation_reason=?, closed_by_github=?, updated_at=? WHERE id=?`,
+        `UPDATE workflows SET state=?, head_sha=?, required_checks=?, checks=?, escalation_reason=?, github_status=?, updated_at=? WHERE id=?`,
       )
       .run(
         w.state,
@@ -294,7 +291,7 @@ export class WorkflowStore {
         JSON.stringify(w.requiredChecks),
         JSON.stringify(w.checks),
         w.escalationReason,
-        w.closedByGitHub ? 1 : 0,
+        w.githubStatus ?? null,
         now,
         id,
       );
@@ -323,124 +320,6 @@ export class WorkflowStore {
       if (this.#db.isTransaction) this.#db.exec("ROLLBACK");
       throw error;
     }
-  }
-
-  receiveDelivery(deliveryId: string, payload: unknown, workflowId: string | null = null): boolean {
-    const result = this.#db
-      .prepare(
-        "INSERT OR IGNORE INTO deliveries (delivery_id, workflow_id, payload, status, received_at) VALUES (?, ?, ?, 'pending', ?)",
-      )
-      .run(deliveryId, workflowId, JSON.stringify(payload), new Date().toISOString());
-    return result.changes === 1;
-  }
-
-  pendingDeliveries(): InboxDelivery[] {
-    return (
-      this.#db
-        .prepare(
-          "SELECT delivery_id, payload, workflow_id FROM deliveries WHERE status IN ('pending','processing','failed') ORDER BY received_at",
-        )
-        .all() as DeliveryRow[]
-    ).map(decodeDelivery);
-  }
-
-  dueDeliveryIds(now: number, limit: number): string[] {
-    return this.dueDeliveries(now, limit).map((row) => row.deliveryId);
-  }
-
-  dueDeliveries(
-    now: number,
-    limit: number,
-    eligible?: (delivery: InboxDelivery) => boolean,
-  ): InboxDelivery[] {
-    if (limit === 0) return [];
-    const rows = this.#db
-      .prepare(
-        `SELECT delivery_id, payload, workflow_id FROM deliveries
-         WHERE status = 'pending' OR (status = 'failed' AND (retry_at IS NULL OR retry_at <= ?))
-         ORDER BY COALESCE(retry_at, unixepoch(received_at) * 1000), rowid LIMIT ?`,
-      )
-      .iterate(now, eligible ? -1 : limit) as Iterable<DeliveryRow>;
-    const selected: InboxDelivery[] = [];
-    for (const row of rows) {
-      const delivery = decodeDelivery(row);
-      if (eligible && !eligible(delivery)) continue;
-      selected.push(delivery);
-      if (selected.length === limit) break;
-    }
-    return selected;
-  }
-
-  deliveryStatus(deliveryId: string): {
-    status: DeliveryStatus;
-    attempts: number;
-    error: string | null;
-    retryAt: number | null;
-  } | null {
-    const row = this.#db
-      .prepare(
-        "SELECT status, attempts, error, retry_at AS retryAt FROM deliveries WHERE delivery_id = ?",
-      )
-      .get(deliveryId);
-    return (row as ReturnType<WorkflowStore["deliveryStatus"]>) ?? null;
-  }
-
-  async processDelivery(
-    deliveryId: string,
-    processor: (payload: unknown, workflowId: string | null) => void | Promise<void>,
-    retryAt?: () => number,
-  ): Promise<boolean> {
-    const row = this.#db
-      .prepare(
-        "SELECT payload, workflow_id FROM deliveries WHERE delivery_id=? AND status IN ('pending','failed')",
-      )
-      .get(deliveryId) as { payload: string; workflow_id: string | null } | undefined;
-    if (!row || !this.claimDelivery(deliveryId)) return false;
-    try {
-      await processor(JSON.parse(row.payload) as unknown, row.workflow_id);
-      this.completeDelivery(deliveryId);
-      return true;
-    } catch (error) {
-      this.failDelivery(deliveryId, String(error), retryAt?.() ?? null);
-      throw error;
-    }
-  }
-
-  claimDelivery(deliveryId: string): boolean {
-    return (
-      this.#db
-        .prepare(
-          "UPDATE deliveries SET status='processing', attempts=attempts+1 WHERE delivery_id=? AND status IN ('pending','failed')",
-        )
-        .run(deliveryId).changes === 1
-    );
-  }
-
-  completeDelivery(deliveryId: string): void {
-    const changed = this.#db
-      .prepare(
-        "UPDATE deliveries SET status='processed', processed_at=?, error=NULL, retry_at=NULL WHERE delivery_id=? AND status='processing'",
-      )
-      .run(new Date().toISOString(), deliveryId);
-    if (changed.changes !== 1) throw new Error(`Delivery ${deliveryId} is not processing.`);
-  }
-
-  failDelivery(deliveryId: string, error: string, retryAt: number | null = null): void {
-    const changed = this.#db
-      .prepare(
-        "UPDATE deliveries SET status='failed', error=?, retry_at=? WHERE delivery_id=? AND status='processing'",
-      )
-      .run(error, retryAt, deliveryId);
-    if (changed.changes !== 1) throw new Error(`Delivery ${deliveryId} is not processing.`);
-  }
-
-  recover(): { deliveries: number; unknownExecutions: number } {
-    const unknownExecutions = this.agentExecutions().recover();
-    const deliveries = Number(
-      this.#db.prepare("UPDATE deliveries SET status='pending' WHERE status='processing'").run()
-        .changes,
-    );
-    return { deliveries, unknownExecutions };
   }
 
   transitions(id: string): Array<{ from: string; to: string; reason: string; headSha: string }> {
@@ -484,14 +363,6 @@ export class WorkflowStore {
   }
 }
 
-function decodeDelivery(row: DeliveryRow): InboxDelivery {
-  return {
-    deliveryId: row.delivery_id,
-    payload: JSON.parse(row.payload) as unknown,
-    workflowId: row.workflow_id,
-  };
-}
-
 function decodeWorkflow(row: Record<string, unknown>): Workflow {
   return {
     id: String(row.id),
@@ -502,6 +373,8 @@ function decodeWorkflow(row: Record<string, unknown>): Workflow {
       row.required_checks === null ? null : (JSON.parse(String(row.required_checks)) as string[]),
     checks: JSON.parse(String(row.checks)) as CheckEvidence[],
     escalationReason: row.escalation_reason === null ? null : String(row.escalation_reason),
-    ...(row.closed_by_github === 1 ? { closedByGitHub: true } : {}),
+    ...(row.github_status === null
+      ? {}
+      : { githubStatus: row.github_status as NonNullable<Workflow["githubStatus"]> }),
   };
 }
