@@ -144,6 +144,7 @@ export function createRexExecution(
     }
 
     let result;
+    let finalObserved = false;
     let state: "valid" | "unavailable" | "conflicting" = observed.state;
     if (observed.state === "valid") {
       const { evidence, digest } = observed;
@@ -153,11 +154,14 @@ export function createRexExecution(
         ...(evidence.result ? { outcome: evidence.result, digest } : {}),
       });
       if (!accepted) state = "conflicting";
-      else if (evidence.result?.outcome === "completed") result = evidence.result;
+      else if (evidence.result) {
+        finalObserved = true;
+        if (evidence.result.outcome === "completed") result = evidence.result;
+      }
     }
 
     if (state === "conflicting") hold(id, "Remote execution evidence conflicts with the claim.");
-    else if (process.state !== "running" && !result)
+    else if (process.state !== "running" && !finalObserved)
       hold(
         id,
         process.state === "exited"
@@ -166,12 +170,12 @@ export function createRexExecution(
       );
 
     const saved = attempt(id);
-    // A concurrent observer can commit completion while this read holds an interim snapshot.
+    // A concurrent observer can commit final evidence while this read holds an interim snapshot.
     if (
       reread &&
-      saved.execution.status === "completed" &&
-      !result &&
-      execution.status !== "completed"
+      !finalObserved &&
+      !execution.remote!.resultDigest &&
+      saved.execution.remote!.resultDigest
     )
       return inspect(id, false);
     return {

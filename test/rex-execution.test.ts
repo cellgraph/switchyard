@@ -332,16 +332,23 @@ it("records local staging failure as known non-execution before contacting Rex",
 });
 
 it.each([
-  ["dispatch", "available"],
-  ["dispatch", "unavailable"],
-  ["inspect", "available"],
+  ["dispatch", "available", "completed"],
+  ["dispatch", "unavailable", "completed"],
+  ["inspect", "available", "completed"],
+  ["inspect", "available", "failed"],
 ])(
-  "%s rechecks the final file after concurrent recovery when it is %s",
-  async (operation, availability) => {
+  "%s rechecks the %s final file after concurrent recovery records %s",
+  async (operation, availability, outcome) => {
     const controller = subsystem();
+    const prompt = outcome === "failed" ? "wait then fail" : "wait for release";
+    const evidence = {
+      execution: { status: outcome },
+      observation: { evidence: "valid" },
+      ...(outcome === "completed" ? { result: { structuredOutput: { ok: true } } } : {}),
+    };
     if (operation === "inspect") {
       loseAck = true;
-      await controller.execute(intent("execution", "wait for release"));
+      await controller.execute(intent("execution", prompt));
       await waiting("execution");
       loseAck = hideEvidence = false;
       expect(await controller.inspect("execution")).toMatchObject({
@@ -357,7 +364,7 @@ it.each([
     const observing =
       operation === "inspect"
         ? controller.inspect("execution")
-        : controller.execute(intent("execution", "wait for release"));
+        : controller.execute(intent("execution", prompt));
     const checked = observing.then(
       (value) => ({ value }),
       (error: unknown) => ({ error }),
@@ -367,21 +374,13 @@ it.each([
       const held = await waiting("execution");
       await writeFile(join(statePath(held), "release"), "");
       await [...runs.values()][0]!.exited;
-      expect(await controller.inspect(held.id)).toMatchObject({
-        execution: { status: "completed" },
-        result: { structuredOutput: { ok: true } },
-      });
+      expect(await controller.inspect(held.id)).toMatchObject(evidence);
       hideEvidence = availability === "unavailable";
     } finally {
       resume.resolve();
     }
     if (availability === "available") {
-      expect(await checked).toMatchObject({
-        value: {
-          execution: { status: "completed" },
-          result: { structuredOutput: { ok: true } },
-        },
-      });
+      expect(await checked).toMatchObject({ value: evidence });
     } else {
       expect(await checked).toEqual({
         error: new Error(
