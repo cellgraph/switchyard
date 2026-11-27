@@ -1,6 +1,6 @@
 # Switchyard architecture
 
-[ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture. [Plan 003](plans/003-architectural-simplification.md) sequences the replacement. The operating guides describe Phase B1 and the standalone execution verified in Phase A3.
+[ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture. [Plan 003](plans/003-architectural-simplification.md) sequences the replacement. Phase B2 implements repository discovery and shared reconciliation. Standalone native execution was verified in Phase A3.
 
 ## Accepted direction
 
@@ -14,14 +14,28 @@ A persistent TypeScript controller on a VM uses SQLite for workflow state, execu
 
 ## Current implementation
 
-| Area                      | Available behavior                                                                                                                                                                                                                                                                                                         |
-| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| GitHub observation        | A read-only App observes PR lifecycle and exact-head checks for explicitly configured targets. Signed webhooks use the SQLite inbox. Startup, periodic sweeps and manual refresh remain available. The unattended worker polls only. See [GitHub App setup](github-app.md) and [unattended polling](unattended.md).        |
-| Workflow state            | A final PR read confirms the head before check evidence is applied. Observation generations guard against superseded writes, including overlapping reads of the same head. Closure clears current check evidence. Operator stops and escalations survive reconciliation and reopen. See the [state model](state-model.md). |
-| Review evidence           | SQLite can store exact-head review completion and finding metadata with native GitHub references. The controller no longer imports Codex summaries or publishes comments. The B1 workflow stays in observation pending review corroboration and handoff policy. See the [review evidence guide](reviews.md).               |
-| Explicit native execution | The Codex SDK and Claude Code CLI start or continue sessions from a configured local working directory and accept optional response schemas. Assignments run independently of PR observation. See [local execution](agent-sessions.md).                                                                                    |
+| Area                      | Available behavior                                                                                                                                                                                  |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GitHub observation        | The read-only App lists open PRs in explicitly enabled repositories. Individual PR reads determine lifecycle and eligibility. Startup, webhook, periodic and operator requests use the same worker. |
+| Workflow state            | SQLite retains workflow IDs, history and exact-head checks. Durable generations guard overlapping observations. A final PR read confirms eligibility and head before evidence is applied.           |
+| Operator visibility       | Status shows process state, pass results, PR heads, GitHub lifecycle and durable holds. A hold prevents active coordination while lifecycle observation can continue.                               |
+| Review evidence           | SQLite records exact-head review and finding metadata with GitHub references. Phase D adds corroboration and handoff policy.                                                                        |
+| Explicit native execution | The Codex SDK and Claude Code CLI start or continue standalone sessions from a configured local directory.                                                                                          |
 
-Phase B1 removes obsolete review integration before Phase B2 changes how PRs are discovered and reconciled. B2 will add eligible PR discovery for explicitly enabled repositories, consolidate the reconciliation entry points and replace delivery claims, retries and replay with transient signals.
+```mermaid
+flowchart LR
+    Start[Startup] --> Observe[Reconciliation pass]
+    Timer[Periodic sweep] --> Observe
+    Operator[Operator sweep] --> Observe
+    Webhook[Authenticated webhook] --> Hints[Coalesced repository and PR hints]
+    Hints --> Observe
+    Observe --> Discovery[Open PR discovery]
+    Discovery --> Detail[Individual PR and exact-head CI reads]
+    Observe --> Detail
+    Detail --> Apply[Guarded SQLite workflow update]
+```
+
+An open listing supplies candidates. A full sweep also reads tracked PRs individually, so an absent entry does not establish closure. A PR-specific hint can go straight to the individual read. A repository hint requests discovery and tracked PR observation. Signals arriving during an active pass can request another pass. Startup and periodic sweeps recover lost signals. The SQLite delivery inbox, claims and replay machinery were removed. [GitHub App setup](github-app.md) · [Operating guide](unattended.md) · [Workflow state](state-model.md)
 
 ### Local execution and persistence
 
@@ -31,10 +45,10 @@ Logical agent identity, native session identity, execution identity and external
 
 Switchyard commits an execution's intent and claim in one SQLite transaction before invoking an adapter, and commits its terminal status before returning the result. The execution record provides durable deduplication. A new attempt for the same assignment requires known non-execution of earlier attempts. A running or uncertain execution prevents concurrent use of its session. A lost owner becomes uncertain. The runtime retains the conversation, and response content returns to the requesting caller. The [local CLI guide](agent-sessions.md) documents inspection and recovery.
 
-A2 replaced the affected persistence alongside the native adapters because the earlier persistence encoded their worktree, runtime and authorization contracts. The [HTTP worker](distributed-workers.md) depended on these contracts and has been retired. The B1 SQLite baseline retains native sessions and attempts alongside workflow history, the GitHub inbox and exact-head CI evidence.
+A2 replaced the affected persistence alongside the native adapters because the earlier persistence encoded their worktree, runtime and authorization contracts. The [HTTP worker](distributed-workers.md) depended on these contracts and has been retired. The B2 SQLite baseline retains native sessions and attempts alongside workflow history, observation generations and exact-head evidence.
 
 [Phase A3 verification](native-execution-verification.md) demonstrated both providers through the standalone CLI. The pinned Codex SDK can terminate its host on an early CLI exit. Keep it in the standalone process for local use. The [controller integration gate](plans/003-architectural-simplification.md#phase-a--remove-the-old-fix-pipeline-and-establish-native-execution) applies before long-lived dispatch. Phase C investigates Rex before choosing remote placement and transport. Phase D implements autonomous role dispatch, execution limits, the operator CLI and deployment cutover.
 
 ### Review evidence
 
-A review row associates a workflow and exact commit with a native GitHub review ID and completion metadata. Finding rows reference native review comments and can record an accept, reject, defer or escalate disposition, a reference to the published reasoning, an issue reference for deferral and a claimed resolving SHA for an accepted finding. Substantive content lives on GitHub. B1 has no path that corroborates a review result or advances a PR to handoff. [Review evidence and inspection](reviews.md)
+A review row associates a workflow and exact commit with a native GitHub review ID and completion metadata. Finding rows reference native review comments and can record an accept, reject, defer or escalate disposition, a reference to the published reasoning, an issue reference for deferral and a claimed resolving SHA for an accepted finding. Substantive content lives on GitHub. Phase D will corroborate review results and establish handoff eligibility. [Review evidence and inspection](reviews.md)

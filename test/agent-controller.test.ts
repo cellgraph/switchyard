@@ -170,8 +170,8 @@ it("recovers a dead owner once and holds its assignment and native session witho
   expect(store.agentExecutions().get("interrupted")?.status).toBe("running");
   store.close();
   store = new WorkflowStore(path);
-  expect(store.recover()).toEqual({ deliveries: 0, unknownExecutions: 1 });
-  expect(store.recover()).toEqual({ deliveries: 0, unknownExecutions: 0 });
+  expect(store.agentExecutions().recover()).toBe(1);
+  expect(store.agentExecutions().recover()).toBe(0);
   const adapter = vi.fn();
   const execute = createAgentController(store.agentExecutions(), adapter).execute;
   const run = await execute({ ...assignment, id: "interrupted", assignmentId: "interrupted" });

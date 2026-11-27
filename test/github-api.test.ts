@@ -10,10 +10,11 @@ import {
   createGitHubAppClient,
   GitHubTransientError,
   GitHubAuthenticationError,
+  repositoryRetryKey,
   resumeGitHubAfterSecondaryLimit,
   tokenRetryKey,
 } from "../src/github-app.ts";
-import { canReconcilePullRequest, createReconciler } from "../src/reconcile.ts";
+import { canReadPullRequestChecks, createReconciler } from "../src/reconcile.ts";
 import { WorkflowStore } from "../src/store.ts";
 
 const { privateKey, publicKey } = generateKeyPairSync("rsa", {
@@ -29,7 +30,347 @@ function requestUrl(input: Parameters<typeof fetch>[0]): URL {
   return new URL(input instanceof Request ? input.url : input);
 }
 
+function targetedController({
+  targets,
+  ...options
+}: Omit<Parameters<typeof createController>[0], "repositories" | "github"> & {
+  targets: (typeof target)[];
+}) {
+  const repositories = [
+    ...new Map(
+      targets.map(({ repository, installationId }) => [repository, { repository, installationId }]),
+    ).values(),
+  ];
+  const controller = createController({
+    ...options,
+    repositories,
+    github: {
+      listOpenPullRequests: async () => {
+        throw new Error("Expected a PR-specific reconciliation.");
+      },
+      completeReconciliation: () => undefined,
+    },
+  });
+  return {
+    runPass() {
+      for (const target of targets) controller.notify(target);
+      return controller.runPass();
+    },
+  };
+}
+
+function prFixture(
+  input: Parameters<typeof fetch>[0],
+  fields: { number: number; state: string; head: { sha: string } },
+  init?: ResponseInit,
+) {
+  const [, , owner, repo] = requestUrl(input).pathname.split("/");
+  const repository = { full_name: `${owner}/${repo}` };
+  return Response.json(
+    {
+      ...fields,
+      draft: false,
+      merged: false,
+      base: { repo: repository },
+      head: { ...fields.head, repo: repository },
+    },
+    init,
+  );
+}
+
+function seedWorkflow(store: WorkflowStore, target: { repository: string; pullRequest: number }) {
+  store.createWorkflow({
+    id: `${target.repository}#${target.pullRequest}`,
+    identity: { repository: target.repository, pullRequest: target.pullRequest },
+    state: "awaiting_review",
+    headSha: sha,
+    requiredChecks: null,
+    checks: [],
+    escalationReason: null,
+  });
+}
+
 describe("GitHub App and REST adapter", () => {
+  it("uses every discovery page and enrolls human and bot PRs from authoritative detail reads", async () => {
+    const sources = ["alice", "dependabot[bot]", "independent-agent[bot]"];
+    const next = {
+      headers: {
+        link: '<https://api.github.com/repos/owner/repo/pulls?state=open&page=2>; rel="next"',
+      },
+    };
+    const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+      if (options?.method === "POST")
+        return Response.json({ token: "fixture", expires_at: "2099-01-01T00:00:00Z" });
+      const { pathname, searchParams } = requestUrl(input);
+      if (pathname.endsWith("/pulls")) {
+        expect(searchParams.get("state")).toBe("open");
+        expect(searchParams.get("per_page")).toBe("100");
+        const candidate = (number: number) => ({
+          number,
+          user: { login: sources[number - 7] },
+          draft: true,
+          head: { repo: { full_name: "stale/fork" } },
+        });
+        return searchParams.get("page") === "1"
+          ? Response.json([candidate(7), candidate(8)], next)
+          : Response.json([candidate(8), candidate(9)]);
+      }
+      const match = pathname.match(/\/pulls\/(\d+)$/);
+      if (match) {
+        const number = Number(match[1]);
+        const repo = { full_name: "OWNER/REPO" };
+        return Response.json({
+          number,
+          state: "open",
+          draft: false,
+          merged: false,
+          user: { login: sources[number - 7] },
+          base: { repo },
+          head: { sha, repo },
+        });
+      }
+      if (pathname.endsWith("/check-runs")) return Response.json({ check_runs: [] });
+      if (pathname.endsWith("/status")) return Response.json({ sha, statuses: [] });
+      throw new Error(`Unexpected fixture endpoint ${pathname}`);
+    });
+    const store = new WorkflowStore();
+    try {
+      const github = createGitHubReader(
+        createGitHubAppClient({ clientId: "fixture", privateKey, fetcher }),
+      );
+      const controller = createController({
+        store,
+        repositories: [target],
+        github,
+        reconcile: createReconciler(store, github),
+        reportError: vi.fn(),
+      });
+      controller.scheduleSweep();
+      expect(await controller.runPass()).toBe(true);
+      expect(store.listWorkflows(target.repository).map(({ id }) => id)).toEqual([
+        "owner/repo#7",
+        "owner/repo#8",
+        "owner/repo#9",
+      ]);
+      expect(
+        fetcher.mock.calls.filter(([input]) => requestUrl(input).pathname.endsWith("/pulls/8")),
+      ).toHaveLength(2);
+    } finally {
+      store.close();
+    }
+  });
+
+  it.each(["invalid page", "repository Retry-After", "installation quota"] as const)(
+    "isolates incomplete discovery caused by %s and recovers on a later sweep",
+    async (failure) => {
+      const store = new WorkflowStore();
+      const other = { repository: "owner/other", installationId: 84, pullRequest: 10 };
+      let now = Date.UTC(2026, 0, 1);
+      const retryAt = now + 120_000;
+      const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+        if (options?.method === "POST")
+          return Response.json({ token: "fixture", expires_at: "2099-01-01T00:00:00Z" });
+        const { pathname, searchParams } = requestUrl(input);
+        if (pathname.endsWith("/other/pulls")) return Response.json([{ number: 10 }]);
+        if (pathname.endsWith("/repo/pulls")) {
+          if (now >= retryAt) return Response.json([{ number: 8 }]);
+          if (searchParams.get("page") === "1") {
+            const headers = new Headers({
+              link: '<https://api.github.com/repos/owner/repo/pulls?page=2>; rel="next"',
+            });
+            if (failure === "installation quota") {
+              headers.set("x-ratelimit-remaining", "0");
+              headers.set("x-ratelimit-reset", String(retryAt / 1000));
+            }
+            return Response.json([{ number: 8 }], { headers });
+          }
+          if (failure === "repository Retry-After")
+            return new Response(null, { status: 503, headers: { "retry-after": "120" } });
+          return Response.json({ error: "missing page items" });
+        }
+        const number = Number(pathname.match(/\/pulls\/(\d+)$/)?.[1]);
+        if (number)
+          return prFixture(input, {
+            number,
+            state: number === 7 ? "closed" : "open",
+            head: { sha },
+          });
+        if (pathname.endsWith("/check-runs")) return Response.json({ check_runs: [] });
+        if (pathname.endsWith("/status")) return Response.json({ sha, statuses: [] });
+        throw new Error(`Unexpected fixture endpoint ${pathname}`);
+      });
+      try {
+        seedWorkflow(store, target);
+        const rateLimits = store.githubRateLimits();
+        const retryDeadlines = store.reconciliationRetries();
+        const github = createGitHubReader(
+          createGitHubAppClient({
+            clientId: "fixture",
+            privateKey,
+            fetcher,
+            rateLimits,
+            retryDeadlines,
+            now: () => now,
+          }),
+        );
+        const controller = createController({
+          store,
+          repositories: [target, other],
+          github,
+          reconcile: createReconciler(store, github),
+          reportError: vi.fn(),
+          now: () => now,
+        });
+        const sweep = () => {
+          controller.scheduleSweep();
+          return controller.runPass();
+        };
+        expect(await sweep()).toBe(false);
+        expect(store.findWorkflow(target.repository, 8)).toBeNull();
+        expect(store.findWorkflow(other.repository, 10)?.state).toBe("awaiting_review");
+        expect(store.findWorkflow(target.repository, 7)?.state).toBe(
+          failure === "installation quota" ? "awaiting_review" : "stopped",
+        );
+        if (failure !== "invalid page") {
+          expect(
+            retryDeadlines.get(repositoryRetryKey(target)) ??
+              rateLimits.get("installation:42")?.retryAt,
+          ).toBe(retryAt);
+          const countDiscoveryRequests = () =>
+            fetcher.mock.calls.filter(([input]) =>
+              requestUrl(input).pathname.endsWith("/repo/pulls"),
+            ).length;
+          const before = countDiscoveryRequests();
+          now = retryAt - 1;
+          expect(await sweep()).toBe(false);
+          expect(countDiscoveryRequests()).toBe(before);
+        }
+        now = retryAt;
+        expect(await sweep()).toBe(true);
+        expect(store.findWorkflow(target.repository, 7)).toMatchObject({ githubStatus: "closed" });
+        expect(store.findWorkflow(target.repository, 8)).toMatchObject({
+          githubStatus: "eligible",
+        });
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  it("preserves discovery secondary backoff across restart and clears it after complete discovery", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "switchyard-discovery-limit-"));
+    const path = join(dir, "state.sqlite");
+    let store = new WorkflowStore(path);
+    let now = Date.UTC(2026, 0, 1);
+    const firstRetry = now + 120_000;
+    const fetcher = vi.fn<typeof fetch>(async (_input, options) => {
+      if (options?.method === "POST")
+        return Response.json({ token: "fixture", expires_at: "2099-01-01T00:00:00Z" });
+      if (now < firstRetry)
+        return new Response(null, {
+          status: 429,
+          headers: { "retry-after": new Date(firstRetry).toUTCString() },
+        });
+      return Response.json([]);
+    });
+    function sweep() {
+      const github = createGitHubReader(
+        createGitHubAppClient({
+          clientId: "fixture",
+          privateKey,
+          fetcher,
+          rateLimits: store.githubRateLimits(),
+          retryDeadlines: store.reconciliationRetries(),
+          isRetryOwnerActive: createGitHubRetryOwnerCheck(store, [target]),
+          now: () => now,
+        }),
+      );
+      const controller = createController({
+        store,
+        repositories: [target],
+        github,
+        reconcile: createReconciler(store, github),
+        reportError: vi.fn(),
+        now: () => now,
+      });
+      controller.scheduleSweep();
+      return controller.runPass();
+    }
+    try {
+      expect(await sweep()).toBe(false);
+      expect(store.githubRateLimits().get("secondary")).toEqual({
+        retryAt: firstRetry,
+        throttledAttempts: 1,
+        retryRequest: repositoryRetryKey(target),
+      });
+      store.close();
+      store = new WorkflowStore(path);
+      expect(await sweep()).toBe(false);
+      expect(fetcher).toHaveBeenCalledTimes(2);
+      now = firstRetry;
+      expect(await sweep()).toBe(true);
+      expect(store.githubRateLimits().get("secondary")).toEqual({
+        retryAt: 0,
+        throttledAttempts: 0,
+        retryRequest: null,
+      });
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("counts consecutive throttles when a tracked PR is becoming eligible again", async () => {
+    const store = new WorkflowStore();
+    let now = Date.UTC(2026, 0, 1);
+    const start = now;
+    const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+      if (options?.method === "POST")
+        return Response.json({ token: "fixture", expires_at: "2099-01-01T00:00:00Z" });
+      const { pathname } = requestUrl(input);
+      if (pathname.endsWith("/pulls/7"))
+        return prFixture(input, { number: 7, state: "open", head: { sha } });
+      return new Response(null, { status: 429 });
+    });
+    try {
+      seedWorkflow(store, target);
+      store.transition("owner/repo#7", { type: "github_pull_request", sha, status: "draft" });
+      const rateLimits = store.githubRateLimits();
+      const github = createGitHubReader(
+        createGitHubAppClient({
+          clientId: "fixture",
+          privateKey,
+          fetcher,
+          rateLimits,
+          isRetryOwnerActive: createGitHubRetryOwnerCheck(store, [target]),
+          now: () => now,
+        }),
+      );
+      const { runPass } = targetedController({
+        store,
+        targets: [target],
+        reconcile: createReconciler(store, github),
+        reportError: vi.fn(),
+        now: () => now,
+      });
+      expect(await runPass()).toBe(false);
+      expect(rateLimits.get("secondary")?.retryAt).toBe(start + 60_000);
+      now = start + 60_000;
+      expect(await runPass()).toBe(false);
+      expect(rateLimits.get("secondary")).toEqual({
+        throttledAttempts: 2,
+        retryAt: start + 180_000,
+        retryRequest: "pr:42:owner/repo:7",
+      });
+      expect(store.getWorkflow("owner/repo#7")).toMatchObject({
+        state: "stopped",
+        githubStatus: "draft",
+      });
+    } finally {
+      store.close();
+    }
+  });
+
   it("signs RS256 JWTs, scopes tokens and coalesces refreshes", async () => {
     let now = Date.UTC(2026, 0, 1);
     let exchanges = 0;
@@ -277,10 +618,10 @@ describe("GitHub App and REST adapter", () => {
       let store = new WorkflowStore(path);
       let now = Date.UTC(2026, 0, 1);
       const retryAt = now + 120_000;
-      const fetcher = vi.fn<typeof fetch>(async (_input, options) => {
+      const fetcher = vi.fn<typeof fetch>(async (input, options) => {
         if (options?.method === "POST")
           return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
-        if (now >= retryAt) return Response.json({ number: 7, state: "open", head: { sha } });
+        if (now >= retryAt) return prFixture(input, { number: 7, state: "open", head: { sha } });
         return Response.json(
           {
             message:
@@ -306,44 +647,33 @@ describe("GitHub App and REST adapter", () => {
           rateLimits: store.githubRateLimits(),
         });
         const reader = createGitHubReader(client);
-        return createController({
+        return targetedController({
           store,
           targets: [target],
           reconcile: async (target) => {
             await reader.readPullRequest(target);
           },
           reportError: vi.fn(),
-          reconcileIntervalMs: 0,
+
           now: () => now,
         });
       }
 
       try {
-        store.receiveDelivery("fixture-delivery", target);
         expect(await controller().runPass()).toBe(false);
         expect(fetcher).toHaveBeenCalledTimes(2);
-        expect(store.deliveryStatus("fixture-delivery")).toMatchObject({
-          status: "failed",
-          attempts: 1,
-          retryAt,
-        });
 
         store.close();
         store = new WorkflowStore(path);
-        store.recover();
+
         now += 10_000;
         const restarted = controller();
         expect(await restarted.runPass()).toBe(false);
         expect(fetcher).toHaveBeenCalledTimes(2);
-        expect(store.deliveryStatus("fixture-delivery")?.attempts).toBe(1);
 
         now = retryAt;
         expect(await restarted.runPass()).toBe(true);
         expect(fetcher).toHaveBeenCalledTimes(4);
-        expect(store.deliveryStatus("fixture-delivery")).toMatchObject({
-          status: "processed",
-          attempts: 2,
-        });
       } finally {
         store.close();
         rmSync(dir, { recursive: true, force: true });
@@ -352,7 +682,7 @@ describe("GitHub App and REST adapter", () => {
   );
 
   it.each(["primary", "secondary"] as const)(
-    "finishes a startup sweep after %s throttling with periodic polling disabled and an empty inbox",
+    "resumes PR observations independently after %s throttling",
     async (kind) => {
       const store = new WorkflowStore();
       let now = Date.UTC(2026, 0, 1);
@@ -366,9 +696,9 @@ describe("GitHub App and REST adapter", () => {
         if (path.endsWith("/pulls/7") && kind === "secondary" && now < lastReset)
           return new Response(null, { status: 429, headers: { "retry-after": "120" } });
         if (path.endsWith("/pulls/7"))
-          return Response.json({ number: 7, state: "open", head: { sha } });
+          return prFixture(input, { number: 7, state: "open", head: { sha } });
         if (path.endsWith("/pulls/8"))
-          return Response.json({ number: 8, state: "open", head: { sha } });
+          return prFixture(input, { number: 8, state: "open", head: { sha } });
         if (path.endsWith("/check-runs")) return Response.json({ check_runs: [] });
         if (path.endsWith("/status")) return Response.json({ sha, statuses: [] });
         return Response.json([]);
@@ -394,17 +724,17 @@ describe("GitHub App and REST adapter", () => {
           rateLimits,
           now: () => now,
         });
-        const { runPass } = createController({
+        const { runPass } = targetedController({
           store,
           targets: [target, other],
           reconcile: createReconciler(store, createGitHubReader(client)),
           reportError: vi.fn(),
-          reconcileIntervalMs: 0,
+
           now: () => now,
         });
         expect(await runPass()).toBe(false);
         expect(fetcher).toHaveBeenCalledTimes(kind === "primary" ? 0 : 2);
-        expect(store.pendingDeliveries()).toEqual([]);
+
         now = firstReset;
         await runPass();
         expect(store.findWorkflow(other.repository, other.pullRequest)).toBeNull();
@@ -417,11 +747,7 @@ describe("GitHub App and REST adapter", () => {
         expect(store.findWorkflow(other.repository, other.pullRequest)?.headSha).toBe(sha);
         expect(
           fetcher.mock.calls.filter(([input]) => requestUrl(input).pathname.endsWith("/pulls/7")),
-        ).toHaveLength(kind === "primary" ? 2 : 3);
-        const requests = fetcher.mock.calls.length;
-        now += 120_000;
-        expect(await runPass()).toBe(true);
-        expect(fetcher).toHaveBeenCalledTimes(requests);
+        ).toHaveLength(kind === "primary" ? 4 : 3);
       } finally {
         store.close();
       }
@@ -442,13 +768,12 @@ describe("GitHub App and REST adapter", () => {
           throttledAttempts: state === "pause" ? 5 : 1,
           retryRequest: "pr:42:owner/repo:7",
         });
-        const { runPass } = createController({
+        const { runPass } = targetedController({
           store,
           targets: [target],
           reconcile,
           reportError,
-          reconcileIntervalMs: 0,
-          reportDeferred: true,
+
           now: () => now,
         });
         expect(await runPass()).toBe(false);
@@ -464,7 +789,7 @@ describe("GitHub App and REST adapter", () => {
     },
   );
 
-  it("retries a changed startup head after a cooldown with polling disabled and an empty inbox", async () => {
+  it("observes a changed head on a later hint after the cooldown", async () => {
     const store = new WorkflowStore();
     let now = Date.UTC(2026, 0, 1);
     const resetAt = now + 120_000;
@@ -474,7 +799,7 @@ describe("GitHub App and REST adapter", () => {
         return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
       const path = requestUrl(input).pathname;
       if (path.endsWith("/pulls/7"))
-        return Response.json({
+        return prFixture(input, {
           number: 7,
           state: "open",
           head: { sha: ++prReads === 1 ? sha : otherSha },
@@ -508,22 +833,19 @@ describe("GitHub App and REST adapter", () => {
         rateLimits,
         now: () => now,
       });
-      const { runPass } = createController({
+      const { runPass } = targetedController({
         store,
         targets: [target],
         reconcile: createReconciler(store, createGitHubReader(client)),
         reportError: vi.fn(),
-        reconcileIntervalMs: 0,
+
         now: () => now,
       });
       expect(await runPass()).toBe(false);
       expect(fetcher).not.toHaveBeenCalled();
       now = resetAt;
       expect(await runPass()).toBe(false);
-      expect(store.findWorkflow(target.repository, target.pullRequest)).toMatchObject({
-        headSha: otherSha,
-        checks: [],
-      });
+      expect(store.findWorkflow(target.repository, target.pullRequest)).toBeNull();
       expect(prReads).toBe(2);
 
       now += 29_999;
@@ -535,10 +857,6 @@ describe("GitHub App and REST adapter", () => {
         headSha: otherSha,
         checks: [{ name: "build", sha: otherSha, outcome: "passed" }],
       });
-      expect(prReads).toBe(4);
-      expect(store.pendingDeliveries()).toEqual([]);
-      now += 60_000;
-      await runPass();
       expect(prReads).toBe(4);
     } finally {
       store.close();
@@ -607,7 +925,7 @@ describe("GitHub App and REST adapter", () => {
   });
 
   it.each(["503", "network failure", "body failure", "evidence retry deadline", "404"] as const)(
-    "handles a startup %s after a persisted cooldown with polling disabled and no deliveries",
+    "handles a %s after a persisted cooldown",
     async (failure) => {
       const store = new WorkflowStore();
       let now = Date.UTC(2026, 0, 1);
@@ -631,7 +949,7 @@ describe("GitHub App and REST adapter", () => {
                 }),
               );
           }
-          return Response.json({ number: 7, state: "open", head: { sha } });
+          return prFixture(input, { number: 7, state: "open", head: { sha } });
         }
         if (path.endsWith("/check-runs")) {
           if (failure === "evidence retry deadline" && now === resetAt)
@@ -674,12 +992,12 @@ describe("GitHub App and REST adapter", () => {
           rateLimits,
           now: () => now,
         });
-        const { runPass } = createController({
+        const { runPass } = targetedController({
           store,
           targets: [target],
           reconcile: createReconciler(store, createGitHubReader(client)),
           reportError: vi.fn(),
-          reconcileIntervalMs: 0,
+
           now: () => now,
         });
         expect(await runPass()).toBe(false);
@@ -688,21 +1006,19 @@ describe("GitHub App and REST adapter", () => {
         expect(await runPass()).toBe(false);
         const requests = fetcher.mock.calls.length;
         expect(requests).toBeGreaterThan(0);
-        now = retryAt - 1;
-        await runPass();
-        expect(fetcher).toHaveBeenCalledTimes(requests);
+        if (failure === "404")
+          expect(store.findWorkflow(target.repository, target.pullRequest)).toBeNull();
+        else {
+          now = retryAt - 1;
+          await runPass();
+          expect(fetcher).toHaveBeenCalledTimes(requests);
+        }
         now = retryAt;
         expect(await runPass()).toBe(true);
-        if (failure === "404") {
-          expect(fetcher).toHaveBeenCalledTimes(requests);
-          expect(store.findWorkflow(target.repository, target.pullRequest)).toBeNull();
-        } else {
-          expect(store.findWorkflow(target.repository, target.pullRequest)).toMatchObject({
-            headSha: sha,
-            checks: [{ name: "build", sha, outcome: "passed" }],
-          });
-        }
-        expect(store.pendingDeliveries()).toEqual([]);
+        expect(store.findWorkflow(target.repository, target.pullRequest)).toMatchObject({
+          headSha: sha,
+          checks: [{ name: "build", sha, outcome: "passed" }],
+        });
       } finally {
         store.close();
       }
@@ -762,8 +1078,20 @@ describe("GitHub App and REST adapter", () => {
       const reader = {
         readPullRequest: vi
           .fn<GitHubReader["readPullRequest"]>()
-          .mockResolvedValue({ state: "open", headSha: sha })
-          .mockResolvedValueOnce({ state: "open", headSha: sha })
+          .mockResolvedValue({
+            state: "open",
+            headSha: sha,
+            draft: false,
+            merged: false,
+            headRepository: target.repository,
+          })
+          .mockResolvedValueOnce({
+            state: "open",
+            headSha: sha,
+            draft: false,
+            merged: false,
+            headRepository: target.repository,
+          })
           .mockRejectedValueOnce(finalError),
         readChecks: vi
           .fn<GitHubReader["readChecks"]>()
@@ -772,12 +1100,12 @@ describe("GitHub App and REST adapter", () => {
         completeReconciliation: vi.fn(),
       };
       try {
-        const { runPass } = createController({
+        const { runPass } = targetedController({
           store,
           targets: [target],
           reconcile: createReconciler(store, reader),
           reportError: vi.fn(),
-          reconcileIntervalMs: 0,
+
           now: () => now,
         });
         expect(await runPass()).toBe(false);
@@ -801,7 +1129,7 @@ describe("GitHub App and REST adapter", () => {
   );
 
   it.each(["startup", "periodic"] as const)(
-    "honors a deadline from a %s sweep across deliveries and subsequent sweeps",
+    "honors a deadline from a %s sweep across subsequent signals",
     async (trigger) => {
       const dir = mkdtempSync(join(tmpdir(), "switchyard-retry-trigger-"));
       const dbPath = join(dir, "state.sqlite");
@@ -814,9 +1142,9 @@ describe("GitHub App and REST adapter", () => {
           return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
         const path = requestUrl(input).pathname;
         if (path.endsWith("/pulls/7"))
-          return Response.json({ number: 7, state: "open", head: { sha } });
+          return prFixture(input, { number: 7, state: "open", head: { sha } });
         if (path.endsWith("/pulls/8"))
-          return Response.json({ number: 8, state: "open", head: { sha } });
+          return prFixture(input, { number: 8, state: "open", head: { sha } });
         if (path.endsWith("/check-runs")) {
           if (unavailable && path.startsWith("/repos/owner/repo/"))
             return new Response(null, { status: 503, headers: { "retry-after": "120" } });
@@ -838,12 +1166,12 @@ describe("GitHub App and REST adapter", () => {
           rateLimits: store.githubRateLimits(),
           retryDeadlines: store.reconciliationRetries(),
         });
-        return createController({
+        return targetedController({
           store,
           targets: [target, other],
           reconcile: createReconciler(store, createGitHubReader(client)),
           reportError: vi.fn(),
-          reconcileIntervalMs: trigger === "startup" ? 0 : 60_000,
+
           now: () => now,
         });
       }
@@ -865,18 +1193,10 @@ describe("GitHub App and REST adapter", () => {
         expect(readsForTarget()).toBe(reads);
         expect(store.reconciliationRetries().get("42:owner/repo:7")).toBe(retryAt);
         unavailable = false;
-        store.receiveDelivery("deferred-delivery", target);
-        store.receiveDelivery("another-pr-delivery", other);
+
         now += 1_000;
         expect(await runPass()).toBe(false);
-        expect(store.deliveryStatus("deferred-delivery")).toMatchObject({
-          status: "pending",
-          attempts: 0,
-        });
-        expect(store.deliveryStatus("another-pr-delivery")).toMatchObject({
-          status: "processed",
-          attempts: 1,
-        });
+
         expect(readsForTarget()).toBe(reads);
 
         if (trigger === "startup") {
@@ -887,15 +1207,11 @@ describe("GitHub App and REST adapter", () => {
         now = retryAt - 60_000;
         expect(await runPass()).toBe(false);
         expect(readsForTarget()).toBe(reads);
-        expect(store.deliveryStatus("deferred-delivery")?.attempts).toBe(0);
 
         now = retryAt;
         expect(await runPass()).toBe(true);
         expect(readsForTarget()).toBe(reads + 4);
-        expect(store.deliveryStatus("deferred-delivery")).toMatchObject({
-          status: "processed",
-          attempts: 1,
-        });
+
         expect(store.findWorkflow(target.repository, target.pullRequest)?.checks).toEqual([
           { name: "build", sha, outcome: "passed" },
         ]);
@@ -926,7 +1242,7 @@ describe("GitHub App and REST adapter", () => {
       }
       const path = requestUrl(input).pathname;
       reads.push(path);
-      return Response.json({
+      return prFixture(input, {
         number: Number(path.split("/").at(-1)),
         state: "closed",
         head: { sha },
@@ -943,12 +1259,12 @@ describe("GitHub App and REST adapter", () => {
       });
     }
     function controller() {
-      return createController({
+      return targetedController({
         store,
         targets: [target, sibling, other],
         reconcile: createReconciler(store, createGitHubReader(client())),
         reportError: vi.fn(),
-        reconcileIntervalMs: 0,
+
         now: () => now,
       });
     }
@@ -960,7 +1276,7 @@ describe("GitHub App and REST adapter", () => {
 
       store.close();
       store = new WorkflowStore(dbPath);
-      store.receiveDelivery("sibling-delivery", sibling);
+
       now = retryAt - 1;
       await expect(createGitHubReader(client()).readPullRequest(sibling)).rejects.toMatchObject({
         retryAt,
@@ -969,26 +1285,22 @@ describe("GitHub App and REST adapter", () => {
       const { runPass } = controller();
       expect(await runPass()).toBe(false);
       expect(exchanges).toEqual(["repo", "another", "another"]);
-      expect(store.deliveryStatus("sibling-delivery")).toMatchObject({
-        status: "pending",
-        attempts: 0,
-      });
 
       now = retryAt;
       expect(await runPass()).toBe(true);
       expect(exchanges).toEqual(["repo", "another", "another", "repo"]);
-      expect(reads.slice(-2)).toEqual(["/repos/owner/repo/pulls/8", "/repos/owner/repo/pulls/7"]);
-      expect(store.deliveryStatus("sibling-delivery")).toMatchObject({
-        status: "processed",
-        attempts: 1,
-      });
+      expect(reads.slice(-3)).toEqual([
+        "/repos/owner/repo/pulls/7",
+        "/repos/owner/repo/pulls/8",
+        "/repos/owner/another/pulls/9",
+      ]);
     } finally {
       store.close();
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("blocks queued reads and close and reopen deliveries during a PR Retry-After", async () => {
+  it("blocks queued reads and close and reopen notifications during a PR Retry-After", async () => {
     const store = new WorkflowStore();
     let now = Date.UTC(2026, 0, 1);
     const retryAt = now + 120_000;
@@ -999,9 +1311,9 @@ describe("GitHub App and REST adapter", () => {
         return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
       const path = requestUrl(input).pathname;
       if (path.endsWith("/pulls/8"))
-        return Response.json({ number: 8, state: "closed", head: { sha } });
+        return prFixture(input, { number: 8, state: "closed", head: { sha } });
       if (path.endsWith("/pulls/7"))
-        return Response.json({ number: 7, state, head: { sha: headSha } });
+        return prFixture(input, { number: 7, state, head: { sha: headSha } });
       if (path.endsWith("/check-runs")) {
         if (now < retryAt) {
           state = "closed";
@@ -1025,12 +1337,12 @@ describe("GitHub App and REST adapter", () => {
         retryDeadlines: store.reconciliationRetries(),
       });
       const reader = createGitHubReader(client);
-      const { runPass } = createController({
+      const { runPass } = targetedController({
         store,
         targets: [target],
         reconcile: createReconciler(store, reader),
         reportError: vi.fn(),
-        reconcileIntervalMs: 0,
+
         now: () => now,
       });
       expect(await runPass()).toBe(false);
@@ -1044,16 +1356,14 @@ describe("GitHub App and REST adapter", () => {
       });
 
       now += 1_000;
-      store.receiveDelivery("close", target);
+
       expect(await runPass()).toBe(false);
       now += 1_000;
       state = "open";
       headSha = otherSha;
-      store.receiveDelivery("reopen", target);
+
       expect(await runPass()).toBe(false);
       expect(fetcher).toHaveBeenCalledTimes(4);
-      for (const id of ["close", "reopen"])
-        expect(store.deliveryStatus(id)).toMatchObject({ status: "pending", attempts: 0 });
 
       now = retryAt;
       expect(await runPass()).toBe(true);
@@ -1062,8 +1372,7 @@ describe("GitHub App and REST adapter", () => {
         headSha: otherSha,
         checks: [{ name: "build", sha: otherSha, outcome: "passed" }],
       });
-      for (const id of ["close", "reopen"])
-        expect(store.deliveryStatus(id)).toMatchObject({ status: "processed", attempts: 1 });
+
       expect(fetcher).toHaveBeenCalledTimes(8);
     } finally {
       store.close();
@@ -1089,7 +1398,7 @@ describe("GitHub App and REST adapter", () => {
         const { pathname, searchParams } = requestUrl(input);
         const number = Number(pathname.match(/\/pulls\/(\d+)$/)?.[1]);
         if (number)
-          return Response.json({
+          return prFixture(input, {
             number,
             state: "open",
             head: { sha: number === 9 ? otherSha : sha },
@@ -1132,16 +1441,17 @@ describe("GitHub App and REST adapter", () => {
           now: () => now,
           retryDeadlines: store.reconciliationRetries(),
         });
-        return createController({
+        return targetedController({
           store,
           targets,
           reconcile: createReconciler(store, createGitHubReader(client)),
           reportError: vi.fn(),
-          reconcileIntervalMs: 0,
+
           now: () => now,
         });
       }
       try {
+        for (const tracked of [target, sibling]) seedWorkflow(store, tracked);
         expect(await controller([target, sibling, differentHead, differentRepo]).runPass()).toBe(
           false,
         );
@@ -1193,7 +1503,7 @@ describe("GitHub App and REST adapter", () => {
       const url = requestUrl(input);
       expect(url.origin).toBe("https://api.github.com");
       const path = url.pathname.replace("/repos/owner/repo", "");
-      if (path === "/pulls/7") return Response.json({ number: 7, state: "open", head: { sha } });
+      if (path === "/pulls/7") return prFixture(input, { number: 7, state: "open", head: { sha } });
       const page = url.searchParams.get("page");
       expect(url.searchParams.get("per_page")).toBe("100");
       pagesSeen.push(`${path}:${page}`);
@@ -1238,7 +1548,13 @@ describe("GitHub App and REST adapter", () => {
     });
     const client = createGitHubAppClient({ clientId: "fixture-client-id", privateKey, fetcher });
     const api = createGitHubReader(client);
-    expect(await api.readPullRequest(target)).toEqual({ headSha: sha, state: "open" });
+    expect(await api.readPullRequest(target)).toEqual({
+      headSha: sha,
+      state: "open",
+      headRepository: target.repository,
+      draft: false,
+      merged: false,
+    });
     expect(await api.readReviews(target)).toEqual([{ id: 1 }, { id: 2 }]);
     expect(await api.readReviewComments(target)).toEqual([{ id: 3 }]);
     expect(await api.readIssueComments(target)).toEqual([{ id: 4, body: "edited" }]);
@@ -1333,7 +1649,7 @@ describe("GitHub App and REST adapter", () => {
         return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
       const path = requestUrl(input).pathname;
       if (path.endsWith("/pulls/7"))
-        return Response.json({ number: 7, state: "open", head: { sha } });
+        return prFixture(input, { number: 7, state: "open", head: { sha } });
       if (path.endsWith("/check-runs")) return new Response(null, { status: 500 });
       if (path.endsWith("/status")) {
         started.resolve();
@@ -1350,15 +1666,15 @@ describe("GitHub App and REST adapter", () => {
         rateLimits,
         now: () => now,
       });
-      const controller = createController({
+      const controller = targetedController({
         store,
         targets: [target],
         reconcile: createReconciler(store, createGitHubReader(client)),
         reportError: vi.fn(),
-        reconcileIntervalMs: 0,
+
         now: () => now,
       });
-      store.receiveDelivery("fixture-delivery", target);
+
       let settled = false;
       const pass = controller.runPass().finally(() => {
         settled = true;
@@ -1372,10 +1688,6 @@ describe("GitHub App and REST adapter", () => {
         expect(await pass).toBe(false);
       }
       expect(rateLimits.get("secondary")?.retryAt).toBe(retryAt);
-      expect(store.deliveryStatus("fixture-delivery")).toMatchObject({
-        status: "failed",
-        retryAt,
-      });
     } finally {
       store.close();
     }
@@ -1404,22 +1716,18 @@ describe("GitHub App and REST adapter", () => {
         rateLimits,
         now: () => now,
       });
-      const { runPass } = createController({
+      const { runPass } = targetedController({
         store,
         targets: [target],
         reconcile: createReconciler(store, createGitHubReader(client)),
         reportError: vi.fn(),
-        reconcileIntervalMs: 0,
+
         now: () => now,
       });
-      store.receiveDelivery("fixture-delivery", target);
+
       expect(await runPass()).toBe(false);
       expect(rateLimits.get("secondary")?.retryAt).toBe(retryAt);
-      expect(store.deliveryStatus("fixture-delivery")).toMatchObject({
-        status: "failed",
-        retryAt,
-        error: expect.stringContaining("GitHub API rate limit reached (HTTP 429)"),
-      });
+
       expect(fetcher).toHaveBeenCalledTimes(2);
     } finally {
       store.close();
@@ -1437,7 +1745,11 @@ describe("GitHub App and REST adapter", () => {
       const url = requestUrl(input);
       const prNumber = /\/pulls\/(\d+)$/.exec(url.pathname)?.[1];
       if (prNumber)
-        return Response.json({ number: Number(prNumber), state: "open", head: { sha: headSha } });
+        return prFixture(input, {
+          number: Number(prNumber),
+          state: "open",
+          head: { sha: headSha },
+        });
       if (url.pathname.endsWith("/status")) return Response.json({ sha: headSha, statuses: [] });
       if (url.pathname.endsWith("/check-runs"))
         return throttle ? new Response(null, { status: 429 }) : Response.json({ check_runs: [] });
@@ -1479,7 +1791,7 @@ describe("GitHub App and REST adapter", () => {
         return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
       const path = requestUrl(input).pathname;
       if (path.endsWith("/pulls/7"))
-        return Response.json({ number: 7, state: "open", head: { sha } });
+        return prFixture(input, { number: 7, state: "open", head: { sha } });
       if (path.endsWith("/" + resource)) {
         await setImmediate();
         return new Response(null, { status: 429 });
@@ -1523,7 +1835,7 @@ describe("GitHub App and REST adapter", () => {
         return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
       const path = requestUrl(input).pathname;
       if (path.endsWith("/pulls/7"))
-        return Response.json({
+        return prFixture(input, {
           number: 7,
           state: ++prReads === 1 ? "open" : "closed",
           head: { sha },
@@ -1548,11 +1860,12 @@ describe("GitHub App and REST adapter", () => {
         now: () => now,
       });
       const reconcile = createReconciler(store, createGitHubReader(client));
+      seedWorkflow(store, target);
       await reconcile(target);
       expect(prReads).toBe(2);
       expect(store.findWorkflow(target.repository, target.pullRequest)).toMatchObject({
         state: "stopped",
-        closedByGitHub: true,
+        githubStatus: "closed",
       });
       expect(rateLimits.get("secondary")?.throttledAttempts).toBe(0);
       await expect(reconcile({ ...target, pullRequest: 8 })).rejects.toMatchObject({
@@ -1577,7 +1890,7 @@ describe("GitHub App and REST adapter", () => {
       if (path.endsWith("/pulls/8"))
         return throttle
           ? new Response(null, { status: 429 })
-          : Response.json({ number: 8, state: "open", head: { sha } });
+          : prFixture(input, { number: 8, state: "open", head: { sha } });
       if (path.endsWith("/check-runs")) return Response.json({ check_runs: [] });
       if (path.endsWith("/status")) return Response.json({ sha, statuses: [] });
       return Response.json([]);
@@ -1596,12 +1909,12 @@ describe("GitHub App and REST adapter", () => {
         rateLimits,
         now: () => now,
       });
-      const { runPass } = createController({
+      const { runPass } = targetedController({
         store,
         targets: [remaining],
         reconcile: createReconciler(store, createGitHubReader(client)),
         reportError: vi.fn(),
-        reconcileIntervalMs: 60_000,
+
         now: () => now,
       });
       expect(await runPass()).toBe(false);
@@ -1645,9 +1958,9 @@ describe("GitHub App and REST adapter", () => {
           return pending.promise;
         }
         if (path.endsWith("/pulls/7"))
-          return Response.json({ number: 7, state: "open", head: { sha } });
+          return prFixture(input, { number: 7, state: "open", head: { sha } });
         if (path.endsWith("/pulls/8"))
-          return Response.json({ number: 8, state: "open", head: { sha } });
+          return prFixture(input, { number: 8, state: "open", head: { sha } });
         if (path.endsWith("/check-runs")) return Response.json({ check_runs: [] });
         if (path.endsWith("/status")) return Response.json({ sha, statuses: [] });
         return Response.json([]);
@@ -1663,14 +1976,13 @@ describe("GitHub App and REST adapter", () => {
           isRetryOwnerActive,
           now: () => now,
         });
-        const { runPass } = createController({
+        const { runPass } = targetedController({
           store,
           targets,
           reconcile: createReconciler(store, createGitHubReader(client)),
           reportError: vi.fn(),
-          reconcileIntervalMs: 60_000,
+
           now: () => now,
-          isRetryOwnerActive,
         });
         expect(await runPass()).toBe(true);
         now += 60_000;
@@ -1704,6 +2016,7 @@ describe("GitHub App and REST adapter", () => {
           retryRequest: stoppedOwner === "existing" ? "pr:84:other/repo:8" : "pr:42:owner/repo:7",
         });
         if (stoppedOwner === "incoming") {
+          throttle = false;
           now = retryAt;
           expect(await runPass()).toBe(true);
           expect(rateLimits.get("secondary")?.throttledAttempts).toBe(0);
@@ -1715,7 +2028,7 @@ describe("GitHub App and REST adapter", () => {
   );
 
   it.each(["evidence read", "final PR read"] as const)(
-    "finishes a stopped delivery without new requests after an in-flight %s",
+    "avoids new evidence requests after an operator stop after an in-flight %s",
     async (stage) => {
       const store = new WorkflowStore();
       const now = Date.UTC(2026, 0, 1);
@@ -1731,7 +2044,7 @@ describe("GitHub App and REST adapter", () => {
             started.resolve();
             return pending.promise;
           }
-          return Response.json({ number: 7, state: "open", head: { sha } });
+          return prFixture(input, { number: 7, state: "open", head: { sha } });
         }
         if (path.endsWith("/check-runs")) {
           if (stage === "evidence read") {
@@ -1750,18 +2063,19 @@ describe("GitHub App and REST adapter", () => {
           privateKey,
           fetcher,
           now: () => now,
-          canReadPullRequest: (target, pullRequest) =>
-            canReconcilePullRequest(store, target.repository, pullRequest),
+          canReadPullRequestChecks: (target, pullRequest) =>
+            canReadPullRequestChecks(store, target.repository, pullRequest),
         });
-        const { runPass } = createController({
+        const { runPass } = targetedController({
           store,
           targets: [target],
           reconcile: createReconciler(store, createGitHubReader(client)),
           reportError,
-          reconcileIntervalMs: 0,
+
           now: () => now,
         });
-        store.receiveDelivery("fixture-delivery", target);
+
+        seedWorkflow(store, target);
         const pass = runPass();
         let requestsWhenStopped = 0;
         try {
@@ -1782,116 +2096,23 @@ describe("GitHub App and REST adapter", () => {
                     },
                   },
                 )
-              : Response.json({ number: 7, state: "open", head: { sha: otherSha } }),
+              : prFixture("https://api.github.com/repos/owner/repo/pulls/7", {
+                  number: 7,
+                  state: "open",
+                  head: { sha: otherSha },
+                }),
           );
           await pass;
         }
         expect(await pass).toBe(true);
         expect(fetcher).toHaveBeenCalledTimes(requestsWhenStopped);
-        expect(store.deliveryStatus("fixture-delivery")).toMatchObject({
-          status: "processed",
-          attempts: 1,
-        });
+
         expect(store.findWorkflow(target.repository, target.pullRequest)).toMatchObject({
           state: "stopped",
           escalationReason: "Operator stop",
-          headSha: sha,
+          headSha: stage === "final PR read" ? otherSha : sha,
         });
         expect(reportError).not.toHaveBeenCalled();
-      } finally {
-        store.close();
-      }
-    },
-  );
-
-  it.each(["before", "after"] as const)(
-    "leaves GitHub deliveries untouched until an operator resumes %s the cooldown",
-    async (resumeTiming) => {
-      const store = new WorkflowStore();
-      let now = Date.UTC(2026, 0, 1);
-      let limited = true;
-      const retryAt = now + 16 * 60_000;
-      const fetcher = vi.fn<typeof fetch>(async (input, options) => {
-        if (options?.method === "POST")
-          return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
-        if (limited) return new Response(null, { status: 429 });
-        const path = requestUrl(input).pathname;
-        if (path.endsWith("/pulls/7"))
-          return Response.json({ number: 7, state: "open", head: { sha } });
-        if (path.endsWith("/check-runs")) return Response.json({ check_runs: [] });
-        if (path.endsWith("/status")) return Response.json({ sha, statuses: [] });
-        return Response.json([]);
-      });
-      try {
-        const rateLimits = store.githubRateLimits();
-        rateLimits.set("secondary", {
-          retryAt: now,
-          throttledAttempts: 4,
-          retryRequest: "pr:42:owner/repo:7",
-        });
-        const client = createGitHubAppClient({
-          clientId: "fixture-client-id",
-          privateKey,
-          fetcher,
-          rateLimits,
-          now: () => now,
-        });
-        const reportError = vi.fn();
-        const { runPass } = createController({
-          store,
-          targets: [target],
-          reconcile: createReconciler(store, createGitHubReader(client)),
-          reportError,
-          reconcileIntervalMs: 60_000,
-          now: () => now,
-        });
-        store.receiveDelivery("trigger-delivery", target);
-        for (let index = 0; index < 26; index += 1)
-          store.receiveDelivery(`queued-${index}`, target);
-        expect(await runPass()).toBe(false);
-        expect(rateLimits.get("secondary")?.throttledAttempts).toBe(5);
-        const failed = store.deliveryStatus("trigger-delivery");
-        expect(failed).toMatchObject({ status: "failed", attempts: 1, retryAt });
-        store.receiveDelivery("ignored-delivery", { githubWebhookVersion: 1, hint: null });
-
-        if (resumeTiming === "after") now = retryAt;
-        for (let index = 0; index < 3; index += 1) {
-          now += 30_000;
-          expect(await runPass()).toBe(false);
-          expect(store.deliveryStatus("trigger-delivery")).toEqual(failed);
-          expect(store.deliveryStatus("queued-0")).toMatchObject({
-            status: "pending",
-            attempts: 0,
-          });
-        }
-        expect(store.deliveryStatus("ignored-delivery")).toMatchObject({
-          status: "processed",
-          attempts: 1,
-        });
-        expect(fetcher).toHaveBeenCalledTimes(2);
-        expect(reportError).toHaveBeenCalledTimes(1);
-
-        expect(resumeGitHubAfterSecondaryLimit(rateLimits)).toBe(true);
-        limited = false;
-        if (resumeTiming === "before") {
-          expect(await runPass()).toBe(false);
-          expect(fetcher).toHaveBeenCalledTimes(2);
-          expect(store.deliveryStatus("queued-0")).toMatchObject({
-            status: "pending",
-            attempts: 0,
-          });
-          now = retryAt;
-        }
-        expect(await runPass()).toBe(true);
-        expect(await runPass()).toBe(true);
-        expect(store.deliveryStatus("trigger-delivery")).toMatchObject({
-          status: "processed",
-          attempts: 2,
-        });
-        expect(store.deliveryStatus("queued-25")).toMatchObject({
-          status: "processed",
-          attempts: 1,
-        });
       } finally {
         store.close();
       }
@@ -1907,7 +2128,8 @@ describe("GitHub App and REST adapter", () => {
         return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
       const path = requestUrl(input).pathname;
       if (path.endsWith("/pulls/7"))
-        return Response.json(
+        return prFixture(
+          input,
           { number: 7, state: "open", head: { sha } },
           {
             headers: { "x-ratelimit-remaining": "1", "x-ratelimit-reset": String(retryAt / 1000) },
@@ -1958,12 +2180,11 @@ describe("GitHub App and REST adapter", () => {
         const rateLimits = store.githubRateLimits();
         const state = { retryAt: 100_000, throttledAttempts, retryRequest };
         rateLimits.set("secondary", state);
-        const { runPass } = createController({
+        const { runPass } = targetedController({
           store,
           targets: [target],
           reconcile: vi.fn(),
           reportError: vi.fn(),
-          reconcileIntervalMs: 0,
         });
         await runPass();
         expect(rateLimits.get("secondary")).toEqual(state);

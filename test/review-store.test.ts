@@ -64,7 +64,7 @@ describe("fresh database and durable review references", () => {
   it("sets both identity and version for a fresh database", () => {
     using raw = new DatabaseSync(path, { readOnly: true });
     expect(raw.prepare("PRAGMA application_id").get()?.application_id).toBe(0x53575944);
-    expect(raw.prepare("PRAGMA user_version").get()?.user_version).toBe(18);
+    expect(raw.prepare("PRAGMA user_version").get()?.user_version).toBe(19);
     const tables = raw
       .prepare("SELECT name FROM sqlite_schema WHERE type='table'")
       .all()
@@ -73,17 +73,22 @@ describe("fresh database and durable review references", () => {
       expect.arrayContaining([
         "workflows",
         "transitions",
-        "deliveries",
         "agent_sessions",
         "agent_executions",
         "check_snapshots",
         "review_runs",
         "review_findings",
         "github_rate_limits",
+        "github_observation_generations",
+        "reconciliation_retries",
+        "controller_worker",
       ]),
     );
     for (const obsolete of ["review_snapshots", "review_publications", "finding_actions"])
       expect(tables).not.toContain(obsolete);
+    expect(raw.prepare("SELECT name FROM sqlite_schema WHERE name LIKE 'deliver%'").all()).toEqual(
+      [],
+    );
     expect(
       raw
         .prepare("PRAGMA table_info(workflows)")
@@ -99,12 +104,12 @@ describe("fresh database and durable review references", () => {
     ],
     [
       "same version with a foreign application ID",
-      "PRAGMA application_id = 42; PRAGMA user_version = 18; CREATE TABLE data (value TEXT);",
+      "PRAGMA application_id = 42; PRAGMA user_version = 19; CREATE TABLE data (value TEXT);",
     ],
     ["foreign application ID on an empty schema", "PRAGMA application_id = 42;"],
     [
       "Switchyard identity with an unsupported version",
-      "PRAGMA application_id = 0x53575944; PRAGMA user_version = 17;",
+      "PRAGMA application_id = 0x53575944; PRAGMA user_version = 18;",
     ],
   ])("rejects %s without modifying the database", (_scenario, setup) => {
     const foreignPath = join(directory, "foreign.sqlite");
@@ -127,7 +132,7 @@ describe("fresh database and durable review references", () => {
       `
         import { DatabaseSync } from "node:sqlite";
         const db = new DatabaseSync(process.argv[1]);
-        db.exec("PRAGMA user_version = 18; PRAGMA application_id = 42; CREATE TABLE data (value TEXT)");
+        db.exec("PRAGMA user_version = 19; PRAGMA application_id = 42; CREATE TABLE data (value TEXT)");
         db.exec("PRAGMA journal_mode = WAL; INSERT INTO data VALUES ('saved')");
         process.kill(process.pid, "SIGKILL");
       `,
@@ -289,8 +294,8 @@ describe("fresh database and durable review references", () => {
       findingCommentIds: [],
       headSha: nextHead,
     });
-    store.transition(workflowId, { type: "github_pull_request", sha: nextHead, state: "closed" });
-    store.transition(workflowId, { type: "github_pull_request", sha: head, state: "open" });
+    store.transition(workflowId, { type: "github_pull_request", sha: nextHead, status: "closed" });
+    store.transition(workflowId, { type: "github_pull_request", sha: head, status: "eligible" });
     passCI(head);
     expect(store.getWorkflow(workflowId)?.state).toBe("awaiting_review");
     expect(reviews.list(workflowId, head)).toMatchObject([{ id: review.id, outcome: "clean" }]);

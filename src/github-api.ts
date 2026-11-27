@@ -4,20 +4,21 @@ import {
   type GitHubAppClient,
   type GitHubRepository,
 } from "./github-app.ts";
-import { commitSha, object, repositoryName } from "./github-data.ts";
+import { commitSha, object, positiveInteger, repositoryName } from "./github-data.ts";
 import type { CheckEvidence, CheckOutcome } from "./workflow.ts";
 
 export type PullRequestTarget = GitHubRepository & { pullRequest: number };
 export type PullRequestState = {
   headSha: string;
   state: "open" | "closed";
-  headRef?: string;
-  headRepository?: string;
-  headDefaultBranch?: string;
+  draft: boolean;
+  merged: boolean;
+  headRepository: string | null;
 };
 
 export interface GitHubReader {
-  completeReconciliation(target: PullRequestTarget): void;
+  completeReconciliation(target: GitHubRepository, pullRequest?: number): void;
+  listOpenPullRequests(target: GitHubRepository, signal?: AbortSignal): Promise<number[]>;
   readPullRequest(target: PullRequestTarget, signal?: AbortSignal): Promise<PullRequestState>;
   readChecks(
     target: PullRequestTarget,
@@ -30,10 +31,11 @@ export function createGitHubReader(
   client: Pick<GitHubAppClient, "get" | "completeReconciliation">,
 ) {
   async function list(
-    target: PullRequestTarget,
+    target: GitHubRepository,
     path: string,
     signal?: AbortSignal,
     select: (data: unknown) => unknown = (data) => data,
+    pullRequest?: number,
   ): Promise<unknown[]> {
     const results: unknown[] = [];
     const separator = path.includes("?") ? "&" : "?";
@@ -42,7 +44,7 @@ export function createGitHubReader(
       const { data, hasNext } = await client.get(
         target,
         `${path}${separator}per_page=100&page=${page}`,
-        target.pullRequest,
+        pullRequest,
         signal,
       );
       const items = select(data);
@@ -54,14 +56,24 @@ export function createGitHubReader(
   }
 
   return {
+    async listOpenPullRequests(target: GitHubRepository, signal?: AbortSignal) {
+      const items = await list(target, "/pulls?state=open&sort=created&direction=asc", signal);
+      const numbers = items.map((item) => {
+        const number = object(item)?.number;
+        if (!positiveInteger(number))
+          throw new Error("GitHub returned an invalid open pull request number.");
+        return number;
+      });
+      return [...new Set(numbers)];
+    },
     readReviews: (target: PullRequestTarget, signal?: AbortSignal) =>
-      list(target, `/pulls/${target.pullRequest}/reviews`, signal),
+      list(target, `/pulls/${target.pullRequest}/reviews`, signal, undefined, target.pullRequest),
     readReviewComments: (target: PullRequestTarget, signal?: AbortSignal) =>
-      list(target, `/pulls/${target.pullRequest}/comments`, signal),
+      list(target, `/pulls/${target.pullRequest}/comments`, signal, undefined, target.pullRequest),
     readIssueComments: (target: PullRequestTarget, signal?: AbortSignal) =>
-      list(target, `/issues/${target.pullRequest}/comments`, signal),
-    completeReconciliation(target: PullRequestTarget) {
-      client.completeReconciliation(target, target.pullRequest);
+      list(target, `/issues/${target.pullRequest}/comments`, signal, undefined, target.pullRequest),
+    completeReconciliation(target: GitHubRepository, pullRequest?: number) {
+      client.completeReconciliation(target, pullRequest);
     },
 
     async readPullRequest(
@@ -78,22 +90,25 @@ export function createGitHubReader(
       const head = object(pullRequest?.head);
       const headSha = commitSha(head?.sha);
       const state = pullRequest?.state;
+      const headRepository = repositoryName(object(head?.repo)?.full_name);
+      const baseRepository = repositoryName(object(object(pullRequest?.base)?.repo)?.full_name);
       if (
         pullRequest?.number !== target.pullRequest ||
         !headSha ||
-        (state !== "open" && state !== "closed")
+        (state !== "open" && state !== "closed") ||
+        typeof pullRequest.draft !== "boolean" ||
+        typeof pullRequest.merged !== "boolean" ||
+        (state === "open" && pullRequest.merged) ||
+        (!headRepository && head?.repo !== null) ||
+        baseRepository !== target.repository
       )
         throw new Error("GitHub returned an invalid pull request response.");
-      const repository = object(head?.repo);
-      const headRepository = repositoryName(repository?.full_name);
       return {
         headSha,
         state,
-        ...(typeof head?.ref === "string" ? { headRef: head.ref } : {}),
-        ...(headRepository ? { headRepository } : {}),
-        ...(typeof repository?.default_branch === "string"
-          ? { headDefaultBranch: repository.default_branch }
-          : {}),
+        draft: pullRequest.draft,
+        merged: pullRequest.merged,
+        headRepository: headRepository ?? null,
       };
     },
 
@@ -104,13 +119,20 @@ export function createGitHubReader(
           `/commits/${headSha}/check-runs?filter=latest`,
           signal,
           (data) => object(data)?.check_runs,
+          target.pullRequest,
         ),
-        list(target, `/commits/${headSha}/status`, signal, (data) => {
-          const combined = object(data);
-          if (commitSha(combined?.sha) !== headSha)
-            throw new Error("GitHub returned commit statuses for a different SHA.");
-          return combined?.statuses;
-        }),
+        list(
+          target,
+          `/commits/${headSha}/status`,
+          signal,
+          (data) => {
+            const combined = object(data);
+            if (commitSha(combined?.sha) !== headSha)
+              throw new Error("GitHub returned commit statuses for a different SHA.");
+            return combined?.statuses;
+          },
+          target.pullRequest,
+        ),
       );
 
       const checks = new Map<string, CheckEvidence>();
