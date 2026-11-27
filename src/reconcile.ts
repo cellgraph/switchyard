@@ -41,7 +41,11 @@ export function createReconciler(
   github: Pick<GitHubReader, "readPullRequest" | "readChecks" | "completeReconciliation">,
   requiredChecks: (target: PullRequestTarget) => string[] | null = () => null,
 ) {
-  return async (target: PullRequestTarget, signal?: AbortSignal): Promise<void> => {
+  return async (
+    target: PullRequestTarget,
+    signal?: AbortSignal,
+    complete = true,
+  ): Promise<void> => {
     checkGitHubDrain(signal);
     const { repository, pullRequest } = target;
     const findWorkflow = () => store.findWorkflow(repository, pullRequest);
@@ -116,7 +120,7 @@ export function createReconciler(
       });
       checkGitHubDrain(signal);
       if (!active) {
-        github.completeReconciliation(target, pullRequest);
+        if (complete) github.completeReconciliation(target, pullRequest);
         return;
       }
 
@@ -159,7 +163,7 @@ export function createReconciler(
       if (retry) throw retry;
       if (activeAtEnd && headChanged) throw new PullRequestHeadChangedError();
       if (activeAtEnd && !checks) throw checkError;
-      github.completeReconciliation(target, pullRequest);
+      if (complete) github.completeReconciliation(target, pullRequest);
     } catch (error) {
       if (error instanceof SupersededObservationError) throw error;
       checkGitHubDrain(signal);

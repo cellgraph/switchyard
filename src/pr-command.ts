@@ -9,6 +9,7 @@ const usage = `Usage:
   workflow initiate OWNER/REPO#NUMBER CONFIG.json
   workflow direction OWNER/REPO#NUMBER "direction"
   workflow direction OWNER/REPO#NUMBER --abandon EXECUTION_ID "reason"
+  workflow direction OWNER/REPO#NUMBER --replace-evidence EXECUTION_ID "direction"
   workflow grant OWNER/REPO#NUMBER REVIEWS REVISIONS "reason"
   workflow resume OWNER/REPO#NUMBER "reason"
   workflow stop OWNER/REPO#NUMBER "reason"`;
@@ -80,8 +81,12 @@ export function runPrCommand(args: string[], dbPath: string): boolean {
         break;
       }
       case "direction":
-        if (details[0] === "--abandon" && details.length === 3) {
-          pr.operate(id, { kind: "abandon", executionId: details[1]!, reason: details[2]! });
+        if (
+          details.length === 3 &&
+          (details[0] === "--abandon" || details[0] === "--replace-evidence")
+        ) {
+          const kind = details[0] === "--abandon" ? "abandon" : "replace_evidence";
+          pr.operate(id, { kind, executionId: details[1]!, reason: details[2]! });
         } else {
           if (details.length !== 1) throw new Error(usage);
           pr.operate(id, { kind: "direction", reason: details[0]! });

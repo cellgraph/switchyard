@@ -6,6 +6,7 @@ import type { createAgentController } from "../src/agent-controller.ts";
 import type { AgentResult } from "../src/agent.ts";
 import type { PrWorkflowConfig } from "../src/config.ts";
 import { createController } from "../src/controller.ts";
+import { GitHubRateLimitError } from "../src/github-app.ts";
 import type { PullRequestState } from "../src/github-api.ts";
 import { findingUrl, prRoles, type Disposition, type PrRole } from "../src/pr-assignments.ts";
 import { runPrCommand } from "../src/pr-command.ts";
@@ -62,9 +63,13 @@ function fixture() {
   let check: CheckOutcome = "passed";
   let dependentCheck: CheckOutcome | null = null;
   let nextId = 1;
+  let retainedCommit = true;
+  let throttlePublications = false;
+  let conflictingRex = false;
   let clock = Date.now() + 180_000;
   const calls: Array<Parameters<Execute>[0]> = [];
   const recoveries: string[] = [];
+  const completions: number[] = [];
   const reviews: Record<string, unknown>[] = [];
   const comments: Record<string, unknown>[] = [];
   const issues = new Map<number, unknown>();
@@ -85,7 +90,9 @@ function fixture() {
   let latestFinding = 0;
 
   const github = {
-    completeReconciliation() {},
+    completeReconciliation(_: unknown, pullRequest?: number) {
+      if (pullRequest !== undefined) completions.push(pullRequest);
+    },
     async listOpenPullRequests() {
       return discovery;
     },
@@ -99,6 +106,7 @@ function fixture() {
       ];
     },
     async readReviews() {
+      if (throttlePublications) throw new GitHubRateLimitError(clock + 60000);
       return reviews;
     },
     async readReviewComments() {
@@ -109,6 +117,13 @@ function fixture() {
     },
     async readCommit(_: unknown, sha: string) {
       return commits.get(sha);
+    },
+    async readComparison(_: unknown, base: string) {
+      return {
+        status: retainedCommit ? "ahead" : "diverged",
+        base_commit: { sha: base },
+        merge_base_commit: { sha: retainedCommit ? base : heads[0] },
+      };
     },
   };
 
@@ -246,8 +261,8 @@ function fixture() {
           execution,
           session: agent.session(execution.sessionId)!,
           observation: {
-            process: { state: "unavailable" },
-            evidence: result ? "valid" : "unavailable",
+            process: conflictingRex ? { state: "running" } : { state: "unavailable" },
+            evidence: conflictingRex ? "conflicting" : result ? "valid" : "unavailable",
           },
           ...(result ? { result } : {}),
         };
@@ -301,6 +316,19 @@ function fixture() {
     commits,
     calls,
     recoveries,
+    completions,
+    set conflictingRex(value: boolean) {
+      conflictingRex = value;
+    },
+    set retainedCommit(value: boolean) {
+      retainedCommit = value;
+    },
+    set throttlePublications(value: boolean) {
+      throttlePublications = value;
+    },
+    observeOnly() {
+      return flows.coordinator(target);
+    },
     target,
     set discovery(value: number[]) {
       discovery = value;
@@ -579,6 +607,89 @@ describe("autonomous PR coordination", () => {
       expect(f.calls).toHaveLength(1);
     },
   );
+
+  it("revokes an existing handoff when the repository switches to observation-only", async () => {
+    const f = fixture();
+    await f.tick();
+    await f.tick();
+    expect(f.workflow?.state).toBe("ready");
+    await f.observeOnly();
+    expect(f.workflow?.state).toBe("awaiting_review");
+  });
+
+  it("keeps the PR's GitHub throttle streak until publication reads succeed", async () => {
+    const f = fixture();
+    f.controller.scheduleSweep();
+    expect(await f.controller.runPass()).toBe(true);
+    expect(f.completions).toHaveLength(1);
+    f.throttlePublications = true;
+    expect(await f.controller.runPass()).toBe(false);
+    expect(f.completions).toHaveLength(1);
+  });
+
+  it.each([true, false])(
+    "verifies a signed revision covered by an external push when retained=%s",
+    async (retained) => {
+      const f = fixture();
+      f.check = "failed";
+      f.unsigned = true;
+      f.retainedCommit = retained;
+      await f.tick();
+      await f.tick();
+      f.move(2);
+      await f.tick();
+      if (retained) {
+        expect(f.workflow?.state).toBe("escalated");
+        expect(f.roles).toEqual(["reviewer", "implementer"]);
+      } else {
+        await f.tick();
+        expect(f.workflow?.state).toBe("ready");
+        expect(f.roles).toEqual(["reviewer", "implementer", "reviewer"]);
+      }
+    },
+  );
+
+  it("surfaces conflicting Rex evidence even if the block is still running", async () => {
+    const f = fixture();
+    f.unavailable = "unknown";
+    await f.tick();
+    f.conflictingRex = true;
+    await f.tick();
+    expect(f.attention?.reason).toMatch(/Rex evidence conflicts/);
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it("requires a new review to account for deleted verified findings after operator replacement", async () => {
+    const f = fixture();
+    f.hasFinding = true;
+    f.decision = "accept";
+    await f.tick();
+    await f.tick();
+    f.check = "pending";
+    await f.tick();
+    const finding = f.findingId;
+    f.comments.length = 0;
+    await f.tick();
+    expect(f.workflow?.state).toBe("escalated");
+    f.store.prWorkflows().operate(id, {
+      kind: "replace_evidence",
+      executionId: f.calls[0]!.id,
+      reason: "The removed finding concerned the validation contract.",
+    });
+    f.store
+      .prWorkflows()
+      .operate(id, { kind: "resume", reason: "Independent verification of the removed finding." });
+    f.check = "passed";
+    f.hasFinding = false;
+    await f.tick();
+    expect(f.assignments.at(-1)?.input).toEqual({
+      role: "reviewer",
+      previousFindingIds: [finding],
+    });
+    await f.tick();
+    expect(f.workflow?.state).toBe("ready");
+    expect(f.assignments[0]).toMatchObject({ proof: expect.any(String), superseded: true });
+  });
 
   it("blocks an unsigned revision even after the GitHub head advanced", async () => {
     const f = fixture();

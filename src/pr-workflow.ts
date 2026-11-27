@@ -14,6 +14,7 @@ import {
 import {
   candidatePublications,
   conflictingReply,
+  includesCommit,
   loadPublications,
   publicationProof,
   type PublicationReader,
@@ -66,13 +67,25 @@ export function createPrCoordinator({
     return true;
   }
 
-  return async (target: PullRequestTarget, config: PrWorkflowConfig, signal?: AbortSignal) => {
+  return async (
+    target: PullRequestTarget,
+    configuration?: PrWorkflowConfig,
+    signal?: AbortSignal,
+  ) => {
     const workflow = store.findWorkflow(target.repository, target.pullRequest);
     if (!isActive(workflow) || workflow.githubStatus !== "eligible") return false;
     checkGitHubDrain(signal);
+    if (!configuration) {
+      if (workflow.state === "ready")
+        store.transition(workflow.id, { type: "readiness", ready: false });
+      return false;
+    }
+    const config = configuration;
     const guard = { workflow, version: pr.version(workflow.id) };
     const assignments = pr.list(workflow.id);
-    const direction = pr.events(workflow.id).findLast((event) => event.kind === "direction");
+    const direction = pr
+      .events(workflow.id)
+      .findLast((event) => event.kind === "direction" || event.kind === "replace_evidence");
     const pending = assignments.findLast((item) => !item.proof && !item.superseded);
     const reference = pullUrl(target);
 
@@ -169,6 +182,14 @@ export function createPrCoordinator({
         const recovered = await inspectExisting(execution.id);
         execution = recovered.execution;
         if ("observation" in recovered) {
+          if (recovered.observation.evidence === "conflicting") {
+            pause(
+              "Rex evidence conflicts with the recorded execution.",
+              "Inspect the original Rex block and result, then resume after resolving the conflict.",
+              [assignmentRef(pending)],
+            );
+            return false;
+          }
           const claim = parseClaim(pending, recovered.result?.structuredOutput);
           if (claim) {
             pr.capture(pending, claim);
@@ -220,8 +241,27 @@ export function createPrCoordinator({
         resolvedFindingIds: number[];
       }> = [];
 
+      const replacedReviews = new Set<string>();
+      const replacementFindings = new Set<number>();
       for (const assignment of assignments) {
-        if (assignment.superseded || !assignment.claim) continue;
+        if (
+          assignment.superseded &&
+          assignment.proof &&
+          assignment.claim &&
+          "reviewId" in assignment.claim
+        ) {
+          replacedReviews.add(assignment.id);
+          for (const id of assignment.claim.findingIds) replacementFindings.add(id);
+        }
+      }
+      for (const assignment of assignments) {
+        if (
+          assignment.superseded ||
+          !assignment.claim ||
+          (assignment.input.role === "adjudicator" &&
+            replacedReviews.has(assignment.input.reviewId))
+        )
+          continue;
         const { claim } = assignment;
         if (
           "reviewId" in claim &&
@@ -234,16 +274,27 @@ export function createPrCoordinator({
         }
         const revision = "publishedHeadSha" in claim;
         if (revision && assignment.proof) continue;
-        if (revision && claim.publishedHeadSha !== workflow.headSha) {
-          if (workflow.headSha !== assignment.headSha) {
-            // Another head is authoritative; any unresolved findings still follow it.
-            pr.supersede(assignment);
-            continue;
-          }
-        }
         let evidence;
         try {
-          if (!revision || claim.publishedHeadSha === workflow.headSha)
+          let retained: boolean | null = true;
+          if (revision) {
+            retained = false;
+            if (workflow.headSha !== assignment.headSha) {
+              retained = await includesCommit(
+                github,
+                target,
+                claim.publishedHeadSha,
+                workflow.headSha,
+                signal,
+              );
+              if (retained === false) {
+                // The current head replaced the claimed commit; findings still follow the current head.
+                pr.supersede(assignment);
+                continue;
+              }
+            }
+          }
+          if (retained)
             evidence = await publicationProof(github, target, snapshot, assignment, signal);
         } catch (error) {
           if (!(error instanceof GitHubResponseError) || error.status !== 404) throw error;
@@ -328,6 +379,7 @@ export function createPrCoordinator({
           .filter(({ assignment }) => assignment.headSha === workflow.headSha)
           .flatMap(({ resolvedFindingIds }) => resolvedFindingIds),
       );
+      const needsReplacement = [...replacementFindings].filter((id) => !resolved.has(id));
       const accepted = [...dispositions.values()]
         .filter(({ item }) => item.decision === "accept" && !resolved.has(item.findingId))
         .map(({ item }) => item.findingId);
@@ -375,9 +427,18 @@ export function createPrCoordinator({
         );
         return false;
       }
-      if (!next && !reviewed) next = { role: "reviewer", previousFindingIds: accepted };
+      if (!next && !reviewed)
+        next = { role: "reviewer", previousFindingIds: [...accepted, ...needsReplacement] };
       if (!next && (accepted.length || failedChecks.length) && !checksPending)
         next = { role: "implementer", findingIds: accepted, failedChecks };
+      if (!next && needsReplacement.length) {
+        pause(
+          "The current review does not account for all findings from replaced evidence.",
+          "Record the missing finding context and request replacement of the incomplete review evidence.",
+          needsReplacement.map((id) => findingUrl(target, id)),
+        );
+        return false;
+      }
       if (!next) {
         if (pending && (!execution || execution.status === "not_started")) pr.supersede(pending);
         if (requiredChecksPass(workflow) && !accepted.length && (await confirmHead()))

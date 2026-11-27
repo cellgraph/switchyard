@@ -69,7 +69,7 @@ export function createController({
   store: WorkflowStore;
   repositories: readonly GitHubRepository[];
   github: Pick<GitHubReader, "listOpenPullRequests" | "completeReconciliation">;
-  reconcile: (target: PullRequestTarget, signal?: AbortSignal) => Promise<void>;
+  reconcile: (target: PullRequestTarget, signal?: AbortSignal, complete?: boolean) => Promise<void>;
   coordinate?: (target: PullRequestTarget, signal?: AbortSignal) => Promise<boolean>;
   reportError: (message: string) => void;
   signal?: AbortSignal;
@@ -170,9 +170,12 @@ export function createController({
         if (
           !(await attempt(target, pullRequest, async () => {
             const selected = { ...target, pullRequest };
-            await reconcile(selected, signal);
+            await reconcile(selected, signal, !coordinate);
             pr.acknowledge(target.repository, pullRequest);
-            if (await coordinate?.(selected, signal)) schedule(target, pullRequest);
+            if (coordinate) {
+              if (await coordinate(selected, signal)) schedule(target, pullRequest);
+              github.completeReconciliation(target, pullRequest);
+            }
           }))
         )
           succeeded = false;

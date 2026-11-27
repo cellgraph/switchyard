@@ -132,10 +132,8 @@ async function main(): Promise<void> {
         github,
         (target) => config.requiredChecks.get(target.repository) ?? null,
       ),
-      async coordinate(target, signal) {
-        const workflow = config.workflows.get(target.repository);
-        return workflow ? coordinator(target, workflow, signal) : false;
-      },
+      coordinate: (target, signal) =>
+        coordinator(target, config.workflows.get(target.repository), signal),
       reportError,
       signal: abort.signal,
     });

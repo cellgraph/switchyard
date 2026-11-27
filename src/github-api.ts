@@ -79,6 +79,15 @@ export function createGitHubReader(
     async readCommit(target: PullRequestTarget, sha: string, signal?: AbortSignal) {
       return (await client.get(target, `/commits/${sha}`, target.pullRequest, signal)).data;
     },
+    async readComparison(
+      target: PullRequestTarget,
+      base: string,
+      head: string,
+      signal?: AbortSignal,
+    ) {
+      return (await client.get(target, `/compare/${base}...${head}`, target.pullRequest, signal))
+        .data;
+    },
     completeReconciliation(target: GitHubRepository, pullRequest?: number) {
       client.completeReconciliation(target, pullRequest);
     },

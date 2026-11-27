@@ -14,6 +14,12 @@ export type PublicationReader = {
   readReviewComments(target: PullRequestTarget, signal?: AbortSignal): Promise<unknown[]>;
   readIssue(target: PullRequestTarget, number: number, signal?: AbortSignal): Promise<unknown>;
   readCommit(target: PullRequestTarget, sha: string, signal?: AbortSignal): Promise<unknown>;
+  readComparison(
+    target: PullRequestTarget,
+    base: string,
+    head: string,
+    signal?: AbortSignal,
+  ): Promise<unknown>;
 };
 
 type PublicationSnapshot = Awaited<ReturnType<typeof loadPublications>>;
@@ -150,6 +156,23 @@ export async function publicationProof(
   )
     return null;
   return { proof: digest([claim.publishedHeadSha, claim.headSha, assignment.producerId]) };
+}
+
+export async function includesCommit(
+  github: PublicationReader,
+  target: PullRequestTarget,
+  base: string,
+  head: string,
+  signal?: AbortSignal,
+): Promise<boolean | null> {
+  if (base === head) return true;
+  const comparison = object(await github.readComparison(target, base, head, signal));
+  const mergeBase = commitSha(object(comparison?.merge_base_commit)?.sha);
+  if (commitSha(object(comparison?.base_commit)?.sha) !== base || !mergeBase) return null;
+  if (comparison?.status === "ahead" && mergeBase === base) return true;
+  if ((comparison?.status === "diverged" || comparison?.status === "behind") && mergeBase !== base)
+    return false;
+  return null;
 }
 
 export function candidatePublications(

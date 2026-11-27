@@ -29,7 +29,7 @@ export const prSchema = `
 export type Attention = { reason: string; action: string; references: string[] };
 type OperatorAction =
   | { kind: "direction" | "resume" | "stop"; reason: string }
-  | { kind: "abandon"; executionId: string; reason: string }
+  | { kind: "abandon" | "replace_evidence"; executionId: string; reason: string }
   | { kind: "grant"; reason: string; reviews: number; revisions: number };
 
 type Guard = { workflow: Workflow; version: number };
@@ -142,26 +142,36 @@ export function createPrStore(
           (action.kind === "grant" && slots.every((value) => value === 0))
         )
           throw new Error("Grant a positive number of review or revision slots.");
-        if (action.kind === "abandon") {
+        const replacing = action.kind === "replace_evidence";
+        if (action.kind === "abandon" || replacing) {
           const eligible = db
             .prepare(
               `
-            SELECT assignment.id FROM pr_assignments AS assignment
+            SELECT assignment.id, assignment.proof, json_extract(assignment.input,'$.role') AS role
+            FROM pr_assignments AS assignment
             JOIN agent_executions AS execution ON execution.id=assignment.execution_id
             WHERE assignment.workflow_id=? AND assignment.execution_id=?
-              AND assignment.proof IS NULL
               AND assignment.superseded=0 AND execution.status IN ('failed','completed')
           `,
             )
             .get(id, action.executionId);
-          if (!isOperatorHeld(workflow) || !eligible)
+          const replaceable = eligible?.proof && eligible.role !== "implementer";
+          if (
+            !isOperatorHeld(workflow) ||
+            !eligible ||
+            (replacing ? !replaceable : eligible.proof !== null)
+          )
             throw new Error(
-              "Abandonment requires a held, terminal execution without corroborated publication evidence.",
+              replacing
+                ? "Replacement requires a held workflow and a corroborated review or adjudication."
+                : "Abandonment requires a held, terminal execution without corroborated publication evidence.",
             );
           db.prepare("UPDATE pr_assignments SET superseded=1 WHERE id=?").run(eligible.id!);
         }
         const reason =
-          action.kind === "abandon" ? `${action.executionId}: ${action.reason}` : action.reason;
+          action.kind === "abandon" || action.kind === "replace_evidence"
+            ? `${action.executionId}: ${action.reason}`
+            : action.reason;
         db.prepare(
           "INSERT INTO pr_operator_events(workflow_id,kind,reason,review_slots,revision_slots,created_at) VALUES (?,?,?,?,?,?)",
         ).run(id, action.kind, reason, ...slots, new Date().toISOString());
