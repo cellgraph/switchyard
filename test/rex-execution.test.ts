@@ -22,6 +22,7 @@ let runs: Map<
   { child: ChildProcess; exited: Promise<void>; stderr: string; label: string }
 >;
 let stageFails: boolean;
+let launchError: Error | undefined;
 let disconnect: boolean;
 let sessionLost: boolean;
 let loseAck: boolean;
@@ -68,6 +69,7 @@ const transport = vi.fn(async (binary: string, args: string[]) => {
     return "";
   }
   if (command === "run") {
+    if (launchError) throw launchError;
     const blockId = "block:" + randomUUID();
     const position = args.indexOf("--");
     const [node, executor, directory] = args.slice(position + 1) as [string, string, string];
@@ -134,6 +136,7 @@ beforeEach(async () => {
   await mkdir(rex.stateDirectory, { mode: 0o700 });
   runs = new Map();
   stageFails = disconnect = sessionLost = loseAck = hideEvidence = false;
+  launchError = undefined;
   targetBlock = undefined;
   pauseRead = undefined;
   pauseProcess = undefined;
@@ -264,6 +267,28 @@ it("requests cancellation if interruption arrives during a failed Rex poll", asy
   expect((await controller.inspect(held.id)).execution.status).toBe("unknown");
 });
 
+it("interrupts a verified block when controller scratch storage is unavailable", async () => {
+  const controller = subsystem();
+  loseAck = true;
+  const launched = await controller.execute(intent("execution", "wait for release"));
+  await waiting("execution");
+  loseAck = hideEvidence = false;
+  const inspected = await controller.inspect(launched.execution.id);
+  expect(inspected.observation.process.state).toBe("running");
+  vi.stubEnv("TMPDIR", join(root, "missing-temp-dir"));
+  try {
+    expect(await controller.cancel(launched.execution.id)).toMatchObject({
+      interruption: "requested",
+      observation: { evidence: "unavailable" },
+    });
+  } finally {
+    vi.unstubAllEnvs();
+  }
+  expect(targetBlock).toBe(inspected.execution.remote?.blockId);
+  await runs.get(targetBlock!)!.exited;
+  expect((await controller.inspect(launched.execution.id)).execution.status).toBe("unknown");
+});
+
 it("holds after connection loss and rejects corrupted or rewritten correlated evidence", async () => {
   const controller = subsystem();
   const initial = await controller.execute(intent());
@@ -328,6 +353,21 @@ it("records local staging failure as known non-execution before contacting Rex",
   } finally {
     vi.unstubAllEnvs();
   }
+  expect((await controller.execute(intent("retry"))).execution.status).toBe("completed");
+});
+
+it("permits retry after an affirmative local launch failure", async () => {
+  const controller = subsystem();
+  launchError = Object.assign(new Error("fixture executable missing"), {
+    code: "ENOENT",
+    syscall: "spawn " + rex.executable,
+  });
+  expect((await controller.execute(intent())).execution).toMatchObject({
+    status: "not_started",
+    reason: "Could not launch the local Rex client.",
+  });
+  expect(runs.size).toBe(0);
+  launchError = undefined;
   expect((await controller.execute(intent("retry"))).execution.status).toBe("completed");
 });
 

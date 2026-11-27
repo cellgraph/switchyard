@@ -109,27 +109,28 @@ export function createRexExecution(
     const { execution, rex, correlation, directory } = attempt(id);
     const blockId = execution.remote!.blockId;
     let process = await processEvidence(rex, blockId);
-    const read = () =>
-      temporary(async (local) => {
-        const path = join(local, "evidence.json");
-        try {
+    async function read() {
+      try {
+        return await temporary(async (local) => {
+          const path = join(local, "evidence.json");
           // Rex can transfer through another session on this endpoint if the original block is gone.
           await command(rex, "cp", ":" + posix.join(directory, "evidence.json"), path);
-        } catch {
-          return { state: "unavailable" } as const;
-        }
-        const raw = await readFile(path);
-        try {
-          const evidence = readEvidence(JSON.parse(raw.toString("utf8")), correlation);
-          return {
-            state: "valid",
-            evidence,
-            digest: createHash("sha256").update(raw).digest("hex"),
-          } as const;
-        } catch {
-          return { state: "conflicting" } as const;
-        }
-      });
+          const raw = await readFile(path);
+          try {
+            const evidence = readEvidence(JSON.parse(raw.toString("utf8")), correlation);
+            return {
+              state: "valid",
+              evidence,
+              digest: createHash("sha256").update(raw).digest("hex"),
+            } as const;
+          } catch {
+            return { state: "conflicting" } as const;
+          }
+        });
+      } catch {
+        return { state: "unavailable" } as const;
+      }
+    }
     let observed = await read();
     if (!blockId && observed.state === "valid") {
       const observedBlock = observed.evidence.blockId;
@@ -279,7 +280,13 @@ export function createRexExecution(
             directory,
           ),
         );
-      } catch {
+      } catch (error) {
+        const { code, syscall } = (error as NodeJS.ErrnoException | null) ?? {};
+        if (
+          syscall === "spawn " + rex.executable &&
+          (code === "ENOENT" || code === "EACCES" || code === "EPERM")
+        )
+          return notStarted("Could not launch the local Rex client.");
         // Failure to receive a usable acknowledgement does not authorize a second launch.
       }
       const blocks = record(ack)?.block_ids;
