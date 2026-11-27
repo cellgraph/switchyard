@@ -208,10 +208,9 @@ export function createRexExecution(
   return {
     inspect,
     cancel,
-    async recover(signal?: AbortSignal) {
+    async recover() {
       const observations = [];
       for (const id of executions.unresolvedRemote()) {
-        if (signal?.aborted) break;
         const { execution, observation } = await inspect(id);
         observations.push({ execution, observation });
       }
@@ -230,28 +229,20 @@ export function createRexExecution(
       };
 
       if (signal?.aborted) return notStarted("Canceled before Rex dispatch.");
-      const staged = await temporary(async (local) => {
-        const source = join(local, correlation.key);
-        await mkdir(source, { mode: 0o700 });
-        await writeFile(
-          join(source, "request.json"),
-          JSON.stringify({
-            ...correlation,
-            context: session.context,
-            prompt,
-            outputSchema,
-          }),
-          { mode: 0o600 },
-        );
-        try {
+      try {
+        await temporary(async (local) => {
+          const source = join(local, correlation.key);
+          await mkdir(source, { mode: 0o700 });
+          await writeFile(
+            join(source, "request.json"),
+            JSON.stringify({ ...correlation, context: session.context, prompt, outputSchema }),
+            { mode: 0o600 },
+          );
           await command(rex, "cp", "-s", rex.session, "-r", source, ":" + rex.stateDirectory + "/");
-          return true;
-        } catch {
-          // No Rex launch is attempted unless request staging succeeds.
-          return false;
-        }
-      });
-      if (!staged) return notStarted("Could not stage the Rex request before dispatch.");
+        });
+      } catch {
+        return notStarted("Could not stage the Rex request before dispatch.");
+      }
       if (signal?.aborted) return notStarted("Canceled before Rex dispatch.");
 
       let ack: unknown;
@@ -283,9 +274,19 @@ export function createRexExecution(
         hold(id, "The Rex launch acknowledgement conflicts with the recorded block.");
 
       for (;;) {
-        if (signal?.aborted) return cancel(id);
-        const inspected = await inspect(id);
+        const stopping = signal?.aborted;
+        const inspected = stopping ? await cancel(id) : await inspect(id);
+        if (inspected.execution.status === "completed" && !inspected.result) {
+          // Another observer may have committed completion after our read of the interim file.
+          const final = await inspect(id);
+          if (!final.result)
+            throw new Error(
+              "The execution completed but its correlated Rex result is unavailable. Inspect the same execution.",
+            );
+          return { ...inspected, ...final };
+        }
         if (
+          stopping ||
           (inspected.execution.status !== "running" &&
             (inspected.execution.status !== "unknown" ||
               inspected.execution.remote?.resultDigest)) ||

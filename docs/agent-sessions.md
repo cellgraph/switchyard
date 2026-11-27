@@ -25,7 +25,7 @@ Use the Switchyard `session.id` with `--session`. Continuation uses the stored p
 
 For inline local execution, omit `--cwd` to use the current directory. Set `--model` to choose a model or `--config-dir` to select a Codex home or [Claude Code configuration directory](claude-code.md). The providers otherwise inherit their ordinary defaults.
 
-The run command prints the execution ID on stderr before dispatch and returns JSON on stdout. It exits successfully on `completed`. A confirmed completion includes the native response and any structured output. Treat that output as potentially sensitive.
+The run command prints the execution ID on stderr before dispatch and returns JSON on stdout. A successful new run returns the native response and any structured output. If SQLite records a Rex completion but the final file cannot be retrieved and verified, the command exits with an error. Inspect the same execution to retrieve its result. Treat native output as potentially sensitive.
 
 ## Rex placement on Linux
 
@@ -81,7 +81,7 @@ npm start --silent -- agent recover
 npm start --silent -- agent cancel EXECUTION_ID
 ```
 
-`status` reads SQLite only. Rex `inspect` checks the recorded attempt's files and block, reconciles available evidence and can return the same confirmed result repeatedly. `recover` does the same for unresolved remote attempts without returning response content. The reconciliation worker also inspects unresolved remote attempts at startup. Each operation observes existing work without dispatching.
+`status` reads SQLite only. Rex `inspect` checks the recorded attempt's files and block, reconciles available evidence and can return the same confirmed result repeatedly. `recover` does the same for unresolved remote attempts without returning response content. Run recovery in a separate CLI invocation after controller restart to keep GitHub polling independent of the Rex connection. Each operation observes existing work without dispatching.
 
 Lost launch acknowledgement can leave a claim held without a block ID. A later inspection can recover it from executor metadata and validate the evidence against the original execution, assignment and session. A missing file, broken connection or process exit supplies no native outcome by itself. If a result later becomes available, recover the same attempt. The assignment remains protected from replacement dispatch while its outcome is uncertain.
 

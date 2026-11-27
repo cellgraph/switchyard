@@ -26,6 +26,7 @@ let disconnect: boolean;
 let loseAck: boolean;
 let hideEvidence: boolean;
 let targetBlock: string | undefined;
+let pauseRead: (() => Promise<void>) | undefined;
 const context = () => ({ provider: "codex" as const, workingDirectory: root });
 const intent = (id = "execution", prompt = "offline fixture") => ({
   id,
@@ -52,6 +53,11 @@ const transport = vi.fn(async (binary: string, args: string[]) => {
     if (source.startsWith(":")) {
       if (hideEvidence) throw new Error("remote evidence unavailable");
       await cp(source.slice(1), destination);
+      if (pauseRead) {
+        const pause = pauseRead;
+        pauseRead = undefined;
+        await pause();
+      }
       return "";
     }
     if (stageFails) throw new Error("failed to stage");
@@ -121,6 +127,7 @@ beforeEach(async () => {
   runs = new Map();
   stageFails = disconnect = loseAck = hideEvidence = false;
   targetBlock = undefined;
+  pauseRead = undefined;
   transport.mockClear();
 });
 
@@ -269,6 +276,68 @@ it("permits explicit retry only after a known prelaunch failure", async () => {
   });
   expect((await controller.execute(intent("retry"))).execution.status).toBe("completed");
 });
+
+it("records local staging failure as known non-execution before contacting Rex", async () => {
+  const controller = subsystem();
+  vi.stubEnv("TMPDIR", join(root, "missing-temp-dir"));
+  try {
+    expect((await controller.execute(intent())).execution).toMatchObject({
+      status: "not_started",
+      reason: "Could not stage the Rex request before dispatch.",
+    });
+    expect(transport).not.toHaveBeenCalled();
+  } finally {
+    vi.unstubAllEnvs();
+  }
+  expect((await controller.execute(intent("retry"))).execution.status).toBe("completed");
+});
+
+it.each(["available", "unavailable"])(
+  "requires the verified result after concurrent recovery when the final file is %s",
+  async (availability) => {
+    const controller = subsystem();
+    const copied = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    pauseRead = async () => {
+      copied.resolve();
+      await resume.promise;
+    };
+    const dispatched = controller.execute(intent("execution", "wait for release"));
+    const checked = dispatched.then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+    try {
+      await copied.promise;
+      const held = await waiting("execution");
+      await writeFile(join(statePath(held), "release"), "");
+      await [...runs.values()][0]!.exited;
+      expect(await controller.inspect(held.id)).toMatchObject({
+        execution: { status: "completed" },
+        result: { structuredOutput: { ok: true } },
+      });
+      hideEvidence = availability === "unavailable";
+    } finally {
+      resume.resolve();
+    }
+    if (availability === "available") {
+      expect(await checked).toMatchObject({
+        value: {
+          execution: { status: "completed" },
+          result: { structuredOutput: { ok: true } },
+        },
+      });
+    } else {
+      expect(await checked).toEqual({
+        error: new Error(
+          "The execution completed but its correlated Rex result is unavailable. Inspect the same execution.",
+        ),
+      });
+      expect(controller.executions.get("execution")?.status).toBe("completed");
+    }
+    expect(runs.size).toBe(1);
+  },
+);
 
 it("contains the pinned SDK child crash with the original durable claim and a single native launch", async () => {
   const stub = join(root, "early-exit-codex");
