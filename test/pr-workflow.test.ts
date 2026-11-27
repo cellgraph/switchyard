@@ -803,6 +803,52 @@ describe("autonomous PR coordination", () => {
     });
   });
 
+  it("does not revive an older deferral after replacing the latest disposition", async () => {
+    const f = fixture();
+    f.hasFinding = true;
+    f.decision = "defer";
+    for (let i = 0; i < 3; i += 1) await f.tick();
+    const finding = f.findingId;
+    const originalIssues = [...f.issues];
+    f.issues.clear();
+    await f.tick();
+    f.store.prWorkflows().operate(id, {
+      kind: "replace_evidence",
+      executionId: f.calls[0]!.id,
+      reason: "Renew the original review evidence.",
+    });
+    f.store.prWorkflows().operate(id, { kind: "resume", reason: "Renew the disposition." });
+    f.decision = "accept";
+    f.check = "pending";
+    f.resolvePrevious = false;
+    f.hasFinding = false;
+    await f.tick();
+    const renewed = f.calls.at(-1)!.id;
+    await f.tick();
+    await f.tick();
+    f.store
+      .prWorkflows()
+      .operate(id, { kind: "stop", reason: "Replace the most recent reasoning." });
+    f.store.prWorkflows().operate(id, {
+      kind: "replace_evidence",
+      executionId: renewed,
+      reason: "Require a fresh disposition.",
+    });
+    for (const [number, issue] of originalIssues) f.issues.set(number, issue);
+    f.store
+      .prWorkflows()
+      .operate(id, { kind: "resume", reason: "Adjudicate without reusing the historical result." });
+    f.decision = "reject";
+    await f.tick();
+    expect(f.assignments.at(-1)?.input).toMatchObject({
+      role: "adjudicator",
+      findingIds: [finding],
+    });
+    f.check = "passed";
+    await f.tick();
+    expect(f.workflow?.state).toBe("ready");
+  });
+
   it("pauses on a conflicting reply to a renewed disposition before dispatching a revision", async () => {
     const f = fixture();
     f.hasFinding = true;

@@ -264,8 +264,8 @@ export function createPrCoordinator({
         { item: Disposition; assignment: PrAssignment }
       >();
       for (const assignment of assignments) {
-        const { claim, proof, superseded } = assignment;
-        if (proof && !superseded && claim && "dispositions" in claim) {
+        const { claim, proof } = assignment;
+        if (proof && claim && "dispositions" in claim) {
           for (const item of claim.dispositions)
             historicalDispositions.set(item.findingId, { item, assignment });
         }
@@ -289,7 +289,12 @@ export function createPrCoordinator({
           !assignment.claim ||
           (assignment.proof &&
             assignment.input.role === "adjudicator" &&
-            replacedReviews.has(assignment.input.reviewId))
+            (replacedReviews.has(assignment.input.reviewId) ||
+              ("dispositions" in assignment.claim &&
+                assignment.claim.dispositions.every(
+                  ({ findingId }) =>
+                    historicalDispositions.get(findingId)?.assignment.id !== assignment.id,
+                ))))
         )
           continue;
         const { claim } = assignment;
@@ -386,7 +391,11 @@ export function createPrCoordinator({
                 prior?.disposition ?? null,
               );
             }
-            dispositions.set(item.findingId, { item, assignment });
+            if (
+              !assignment.proof ||
+              historicalDispositions.get(item.findingId)?.assignment.id === assignment.id
+            )
+              dispositions.set(item.findingId, { item, assignment });
           }
         }
         if (!assignment.proof) pr.corroborate(assignment, evidence.proof);
@@ -404,7 +413,8 @@ export function createPrCoordinator({
         for (const id of findingIds) {
           if (resolved.has(id)) continue;
           const fresh = dispositions.get(id);
-          const prior = fresh ?? historicalDispositions.get(id);
+          const latest = historicalDispositions.get(id);
+          const prior = fresh ?? (latest?.assignment.superseded ? undefined : latest);
           const rootVerified = verifiedOriginalFinding(snapshot, assignment, id);
           if (!rootVerified && prior?.item.decision === "reject") continue;
           if (
