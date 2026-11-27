@@ -131,6 +131,39 @@ function findingProof(
   return digest([root.body, root.path]);
 }
 
+export function conflictingReviews(
+  snapshot: PublicationSnapshot,
+  assignment: PrAssignment,
+  claim: ReviewClaim,
+  supersededReviewIds: ReadonlySet<number>,
+): number[] {
+  if (!reviewPublication(snapshot, assignment, claim)) return [];
+  return snapshot.reviews.flatMap((review) => {
+    if (
+      !positiveInteger(review?.id) ||
+      review.id === claim.reviewId ||
+      supersededReviewIds.has(review.id) ||
+      !authored(review, assignment) ||
+      commitSha(review.commit_id) !== claim.headSha ||
+      !publishedSince(review.submitted_at, assignment.createdAt) ||
+      !["COMMENTED", "APPROVED", "CHANGES_REQUESTED"].includes(String(review.state))
+    )
+      return [];
+    const contrary = claim.outcome === "clean" ? "findings" : "clean";
+    const contraryState = claim.outcome === "clean" ? "CHANGES_REQUESTED" : "APPROVED";
+    const competingClaim = { ...claim, reviewId: review.id };
+    const hasOtherFindings = snapshot.comments.some(
+      (item) =>
+        positiveInteger(item?.id) && findingProof(snapshot, assignment, competingClaim, item.id),
+    );
+    return review.state === contraryState ||
+      lines(review.body)[0] === `Review outcome: ${contrary}` ||
+      hasOtherFindings
+      ? [review.id]
+      : [];
+  });
+}
+
 function savedProof(assignment: PrAssignment) {
   return assignment.proof?.startsWith("{") ? object(JSON.parse(assignment.proof)) : undefined;
 }

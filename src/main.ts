@@ -117,9 +117,15 @@ async function main(): Promise<void> {
     const github = makeReader(store, config.repositories, config.checkApps);
     const executions = store.agentExecutions();
     const rex = createRexExecution(executions);
+    const reconcile = createReconciler(
+      store,
+      github,
+      (target) => config.requiredChecks.get(target.repository) ?? null,
+    );
     const coordinator = createPrCoordinator({
       store,
       github,
+      reconcile,
       execute: createAgentController(executions, undefined, rex).execute,
       inspect: rex.inspect,
     });
@@ -127,11 +133,7 @@ async function main(): Promise<void> {
       store,
       repositories: config.repositories,
       github,
-      reconcile: createReconciler(
-        store,
-        github,
-        (target) => config.requiredChecks.get(target.repository) ?? null,
-      ),
+      reconcile,
       coordinate: (target, signal) =>
         coordinator(target, config.workflows.get(target.repository), signal),
       reportError,

@@ -17,6 +17,7 @@ import type { CheckOutcome } from "../src/workflow.ts";
 
 const target = { repository: "cellgraph/fixture", installationId: 42, pullRequest: 5 };
 const id = "cellgraph/fixture#5";
+const blockId = "block:22222222-2222-2222-2222-222222222222";
 const heads = ["a", "b", "c", "d", "e", "f"].map((letter) => letter.repeat(40));
 const config = Object.fromEntries(
   prRoles.map((role, index) => [
@@ -68,6 +69,7 @@ function fixture() {
   let unavailablePullRequest = false;
   let unavailableIssues = false;
   let conflictingRex = false;
+  let rexProcess: "unavailable" | "exited" | "running" = "unavailable";
   let clock = Date.now() + 180_000;
   const calls: Array<Parameters<Execute>[0]> = [];
   const recoveries: string[] = [];
@@ -88,7 +90,10 @@ function fixture() {
   let unsigned = false;
   let beforeDispatch: (() => void) | undefined;
   let beforeInspect: ((id: string) => void) | undefined;
+  let beforeReadComments: (() => void | Promise<void>) | undefined;
   let editEvidence: ((role: PrRole) => void) | undefined;
+  let loseResult: PrRole | null = null;
+  let lostPublication: unknown;
   const published = () => new Date(clock).toISOString();
   let latestFinding = 0;
 
@@ -114,6 +119,7 @@ function fixture() {
       return reviews;
     },
     async readReviewComments() {
+      await beforeReadComments?.();
       return comments;
     },
     async readIssue(_: unknown, number: number) {
@@ -231,6 +237,15 @@ function fixture() {
       structuredOutput = { headSha, publishedHeadSha: nextHead };
     }
     editEvidence?.(role);
+    if (loseResult === role) {
+      lostPublication = structuredOutput;
+      agent.recordRemote(request.id, {
+        outcome: { outcome: "unknown", reason: "The fixture lost its native result." },
+        blockId,
+        nativeId: `native-${claim.session.id}`,
+      });
+      return { execution: agent.get(request.id)!, session: agent.session(claim.session.id)! };
+    }
     const result = {
       outcome: "completed",
       response: "Native transcript stays in Rex",
@@ -240,7 +255,7 @@ function fixture() {
     agent.recordRemote(request.id, {
       outcome: result,
       digest: "final-fixture",
-      blockId: "block:22222222-2222-2222-2222-222222222222",
+      blockId,
       nativeId: `native-${claim.session.id}`,
     });
     if (interrupt) throw new Error("Controller exited after native completion.");
@@ -254,6 +269,7 @@ function fixture() {
     const coordinator = createPrCoordinator({
       store,
       github,
+      reconcile,
       execute,
       now: () => clock,
       async inspect(id) {
@@ -266,7 +282,11 @@ function fixture() {
           execution,
           session: agent.session(execution.sessionId)!,
           observation: {
-            process: conflictingRex ? { state: "running" } : { state: "unavailable" },
+            process: conflictingRex
+              ? { state: "running" }
+              : rexProcess === "exited"
+                ? { state: "exited", exitCode: 1 }
+                : { state: rexProcess },
             evidence: conflictingRex ? "conflicting" : result ? "valid" : "unavailable",
           },
           ...(result ? { result } : {}),
@@ -331,6 +351,15 @@ function fixture() {
     set conflictingRex(value: boolean) {
       conflictingRex = value;
     },
+    set rexProcess(value: typeof rexProcess) {
+      rexProcess = value;
+    },
+    set loseResult(value: typeof loseResult) {
+      loseResult = value;
+    },
+    get lostPublication() {
+      return lostPublication;
+    },
     set retainedCommit(value: boolean) {
       retainedCommit = value;
     },
@@ -377,6 +406,9 @@ function fixture() {
     set beforeInspect(value: typeof beforeInspect) {
       beforeInspect = value;
     },
+    set beforeReadComments(value: typeof beforeReadComments) {
+      beforeReadComments = value;
+    },
     configured,
     set editEvidence(value: typeof editEvidence) {
       editEvidence = value;
@@ -392,6 +424,9 @@ function fixture() {
     },
     async tick() {
       await flows.reconcile(target);
+      return flows.coordinator(target, configured);
+    },
+    coordinate() {
       return flows.coordinator(target, configured);
     },
     restart() {
@@ -572,6 +607,49 @@ describe("autonomous PR coordination", () => {
     expect(f.workflow?.state).toBe("ready");
   });
 
+  it.each(["reviewer", "adjudicator"] as const)(
+    "discards stale %s evidence when another connection stops, abandons and resumes",
+    async (role) => {
+      const f = fixture();
+      f.hasFinding = true;
+      f.decision = "reject";
+      await f.tick();
+      if (role === "adjudicator") await f.tick();
+      const executionId = f.calls.at(-1)!.id;
+      const reading = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      f.beforeReadComments = () => {
+        reading.resolve();
+        return release.promise;
+      };
+      const stalePass = f.tick();
+      await reading.promise;
+      const operator = new WorkflowStore(f.path);
+      try {
+        const pr = operator.prWorkflows();
+        pr.operate(id, { kind: "stop", reason: "Discard the terminal assignment." });
+        pr.operate(id, { kind: "abandon", executionId, reason: "Discard the unverified claim." });
+        pr.operate(id, { kind: "resume", reason: "Reconcile without the abandoned publication." });
+      } finally {
+        operator.close();
+        f.beforeReadComments = undefined;
+        release.resolve();
+        await stalePass;
+      }
+      expect(f.assignments.at(-1)).toMatchObject({ executionId, superseded: true, proof: null });
+      if (role === "reviewer") {
+        expect(f.store.reviews().list(id)).toEqual([]);
+        f.hasFinding = false;
+      } else {
+        expect(f.store.reviews().list(id)[0]?.findings[0]?.disposition).toBeNull();
+      }
+      await f.tick();
+      expect(f.roles).toEqual(
+        role === "reviewer" ? ["reviewer", "reviewer"] : ["reviewer", "adjudicator", "adjudicator"],
+      );
+    },
+  );
+
   it("retains accepted findings across an external head change until the new review explicitly resolves them", async () => {
     const f = fixture();
     f.hasFinding = true;
@@ -693,6 +771,94 @@ describe("autonomous PR coordination", () => {
     await f.tick();
     expect(f.workflow?.state).toBe("ready");
   });
+
+  it.each(["reject", "defer"] as const)(
+    "requires replacement review to account for a present edited finding previously marked %s",
+    async (decision) => {
+      const f = fixture();
+      f.hasFinding = true;
+      f.decision = decision;
+      for (let i = 0; i < 3; i += 1) await f.tick();
+      expect(f.workflow?.state).toBe("ready");
+      f.comments[0]!.body = "A different actionable finding introduced by an edit.";
+      await f.tick();
+      expect(f.workflow?.state).toBe("escalated");
+      const pr = f.store.prWorkflows();
+      pr.operate(id, {
+        kind: "replace_evidence",
+        executionId: f.calls[0]!.id,
+        reason: "The existing finding now describes a different blocker.",
+      });
+      pr.operate(id, { kind: "resume", reason: "Review the edited finding." });
+      f.hasFinding = false;
+      f.resolvePrevious = false;
+      await f.tick();
+      expect(f.assignments.at(-1)?.input).toEqual({
+        role: "reviewer",
+        previousFindingIds: [f.findingId],
+      });
+      expect(f.calls.at(-1)?.prompt).toContain(findingUrl(target, f.findingId));
+      await f.tick();
+      expect(f.workflow?.state).toBe("escalated");
+      expect(f.attention?.references).toContain(findingUrl(target, f.findingId));
+
+      pr.operate(id, {
+        kind: "replace_evidence",
+        executionId: f.calls.at(-1)!.id,
+        reason: "The replacement review did not account for the edited finding.",
+      });
+      pr.operate(id, { kind: "resume", reason: "Verify that the edited finding is resolved." });
+      f.resolvePrevious = true;
+      await f.tick();
+      await f.tick();
+      expect(f.workflow?.state).toBe("ready");
+    },
+  );
+
+  it.each(["contrary outcome", "omitted root"] as const)(
+    "holds a trusted review with a competing %s until the publication is reconciled",
+    async (kind) => {
+      const f = fixture();
+      await f.tick();
+      const original = f.reviews[0]!;
+      const competing = {
+        ...original,
+        id: 900,
+        body: kind === "contrary outcome" ? "Review outcome: findings" : "Validation summary.",
+      };
+      f.reviews.push(
+        competing,
+        { ...competing, id: 901, user: { id: 555 }, body: "Review outcome: findings" },
+        { ...competing, id: 902, submitted_at: "2000-01-01Z", body: "Review outcome: findings" },
+      );
+      if (kind === "omitted root")
+        f.comments.push({
+          id: 903,
+          user: original.user,
+          original_commit_id: original.commit_id,
+          pull_request_review_id: competing.id,
+          path: "fixture.txt",
+          body: "An actionable root missing from the claimed clean review.",
+        });
+      await f.tick();
+      expect(f.workflow?.state).toBe("escalated");
+      expect(f.attention?.reason).toMatch(/contradictory reviews/);
+      expect(
+        f.attention?.references.filter((item) => item.includes("#pullrequestreview-")),
+      ).toEqual([
+        expect.stringContaining(`#pullrequestreview-${String(original.id)}`),
+        expect.stringContaining("#pullrequestreview-900"),
+      ]);
+      expect(f.assignments[0]?.proof).toBeNull();
+      expect(f.calls).toHaveLength(1);
+
+      Object.assign(competing, { state: "DISMISSED" });
+      f.store.prWorkflows().operate(id, { kind: "resume", reason: "The conflict was reconciled." });
+      await f.tick();
+      expect(f.workflow?.state).toBe("ready");
+      expect(f.calls).toHaveLength(1);
+    },
+  );
 
   it("accepts canonical repository casing in deferred issue and finding links", async () => {
     const f = fixture();
@@ -978,6 +1144,54 @@ describe("autonomous PR coordination", () => {
     expect(f.calls).toHaveLength(1);
   });
 
+  it("refreshes passing CI after review reads before recording readiness", async () => {
+    const f = fixture();
+    await f.tick();
+    f.beforeReadComments = () => {
+      f.check = "failed";
+    };
+    expect(await f.tick()).toBe(true);
+    expect(f.workflow).toMatchObject({
+      state: "awaiting_review",
+      checks: [{ name: "quality", sha: heads[0], outcome: "failed" }],
+    });
+    expect(f.store.transitions(id).some(({ to }) => to === "ready")).toBe(false);
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it.each(["cleared", "changed"] as const)(
+    "does not authorize a staged CI-driven revision after failures have %s",
+    async (failures) => {
+      const f = fixture();
+      f.check = "failed";
+      f.dependentCheck = "passed";
+      await f.tick();
+      f.beforeDispatch = () => {
+        f.check = "passed";
+        f.dependentCheck = failures === "cleared" ? "passed" : "failed";
+      };
+      expect(await f.tick()).toBe(true);
+      expect(f.store.agentExecutions().get(f.calls[1]!.id)).toMatchObject({
+        status: "not_started",
+        remote: { launchAuthorized: false },
+      });
+      expect(f.allowance.revisions.reservedOrUsed).toBe(0);
+      f.beforeDispatch = undefined;
+      await f.tick();
+      expect(f.assignments[1]?.superseded).toBe(true);
+      if (failures === "cleared") {
+        expect(f.workflow?.state).toBe("ready");
+        expect(f.calls).toHaveLength(2);
+      } else {
+        expect(f.assignments.at(-1)?.input).toMatchObject({
+          role: "implementer",
+          failedChecks: ["dependent"],
+        });
+        expect(f.allowance.revisions.reservedOrUsed).toBe(1);
+      }
+    },
+  );
+
   it("preserves review slots across heads and refuses a revision that cannot be re-reviewed", async () => {
     const f = fixture();
     for (let count = 0; count < 3; count += 1) {
@@ -1066,6 +1280,170 @@ describe("autonomous PR coordination", () => {
     expect(f.workflow?.state).toBe("escalated");
     expect(f.allowance.reviews.reservedOrUsed).toBe(1);
     expect(f.calls).toHaveLength(1);
+  });
+
+  it.each(prRoles)(
+    "recovers a published %s objective after losing the native result",
+    async (role) => {
+      const f = fixture();
+      f.loseResult = role;
+      f.hasFinding = role === "adjudicator";
+      f.decision = "defer";
+      f.check = role === "implementer" ? "failed" : "passed";
+      await f.tick();
+      if (role !== "reviewer") await f.tick();
+      const executionId = f.calls.at(-1)!.id;
+      f.rexProcess = "exited";
+      await f.tick();
+      expect(f.attention?.reason).toMatch(/unknown/);
+
+      const cli = (publication: unknown) =>
+        runPrCommand(
+          [
+            "workflow",
+            "direction",
+            id,
+            "--recover-outcome",
+            executionId,
+            JSON.stringify(publication),
+            "Inspected the correlated Rex process and GitHub publication.",
+          ],
+          f.path,
+        );
+      const output = vi.spyOn(console, "info").mockImplementation(() => {});
+      try {
+        if (role === "reviewer") {
+          expect(() => cli({ headSha: heads[1] })).toThrow("original assignment");
+          cli({ ...(f.lostPublication as object), reviewId: 9999 });
+          f.store
+            .prWorkflows()
+            .operate(id, { kind: "resume", reason: "Check the supplied review." });
+          await f.tick();
+          expect(f.attention?.reason).toMatch(/publication.*missing/);
+          expect(f.assignments[0]).toMatchObject({ claim: null, proof: null });
+          expect(f.store.reviews().list(id)).toEqual([]);
+          expect(f.calls).toHaveLength(1);
+        }
+        expect(cli(f.lostPublication)).toBe(true);
+      } finally {
+        output.mockRestore();
+      }
+      f.restart();
+      f.store
+        .prWorkflows()
+        .operate(id, { kind: "resume", reason: "Verify the recovered objective." });
+      await f.tick();
+      if (role === "implementer") await f.tick();
+      expect(f.workflow?.state).toBe("ready");
+      expect(f.calls.map((call) => call.id).filter((call) => call === executionId)).toHaveLength(1);
+      expect(f.calls).toHaveLength(role === "reviewer" ? 1 : role === "adjudicator" ? 2 : 3);
+      expect(
+        f.assignments.find((assignment) => assignment.executionId === executionId),
+      ).toMatchObject({
+        claim: f.lostPublication,
+        proof: expect.any(String),
+      });
+      expect(f.store.agentExecutions().get(executionId)).toMatchObject({
+        status: "unknown",
+        remote: { resultDigest: null },
+      });
+      expect(f.store.prWorkflows().events(id)).toContainEqual(
+        expect.objectContaining({
+          kind: "recover_outcome",
+          recovery: expect.objectContaining({ executionId, confirmedBy: { blockId } }),
+        }),
+      );
+      expect(f.allowance.reviews.reservedOrUsed).toBe(role === "implementer" ? 2 : 1);
+      expect(f.allowance.revisions.reservedOrUsed).toBe(role === "implementer" ? 1 : 0);
+      if (role === "implementer") {
+        f.loseResult = null;
+        f.check = "failed";
+        await f.tick();
+        expect(f.calls).toHaveLength(4);
+        expect(f.calls.at(-1)?.sessionId).toBeUndefined();
+      }
+    },
+  );
+
+  it("holds outcome recovery without quiescence and rejects attestation against a running process", async () => {
+    const f = fixture();
+    f.loseResult = "reviewer";
+    await f.tick();
+    await f.tick();
+    const executionId = f.calls[0]!.id;
+    const pr = f.store.prWorkflows();
+    const recovery = {
+      kind: "recover_outcome" as const,
+      executionId,
+      publication: f.lostPublication,
+      reason: "Inspected the native turn through its supported interface.",
+    };
+    pr.operate(id, { ...recovery, attestQuiescent: false });
+    pr.operate(id, { kind: "resume", reason: "Test quiescence without Rex process evidence." });
+    await f.tick();
+    expect(f.attention?.reason).toMatch(/quiescence/);
+    pr.operate(id, { ...recovery, attestQuiescent: true });
+    pr.operate(id, { kind: "resume", reason: "Check the operator attestation." });
+    f.rexProcess = "running";
+    await f.tick();
+    expect(f.attention?.reason).toMatch(/quiescence/);
+    expect(f.calls).toHaveLength(1);
+    expect(f.assignments[0]).toMatchObject({ claim: null, proof: null });
+
+    f.rexProcess = "unavailable";
+    pr.operate(id, { kind: "resume", reason: "Recheck after the running observation." });
+    await f.tick();
+    expect(f.workflow?.state).toBe("escalated");
+    expect(f.assignments[0]?.proof).toBeNull();
+    pr.operate(id, { ...recovery, attestQuiescent: true });
+    pr.operate(id, {
+      kind: "resume",
+      reason: "Confirmed the turn has stopped by native inspection.",
+    });
+    await f.tick();
+    expect(f.workflow?.state).toBe("ready");
+    expect(f.calls).toHaveLength(1);
+    expect(
+      pr.events(id).findLast((event) => event.kind === "recover_outcome")?.recovery,
+    ).toMatchObject({ confirmedBy: { operatorAttested: true } });
+  });
+
+  it("commits a recovered outcome once when another pass corroborates the same publication", async () => {
+    const f = fixture();
+    f.loseResult = "reviewer";
+    f.rexProcess = "exited";
+    await f.tick();
+    await f.tick();
+    const executionId = f.calls[0]!.id;
+    const pr = f.store.prWorkflows();
+    pr.operate(id, {
+      kind: "recover_outcome",
+      executionId,
+      publication: f.lostPublication,
+      attestQuiescent: false,
+      reason: "The correlated Rex block exited.",
+    });
+    pr.operate(id, { kind: "resume", reason: "Corroborate the review." });
+    const reading = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    f.beforeReadComments = () => {
+      f.beforeReadComments = undefined;
+      reading.resolve();
+      return release.promise;
+    };
+    const first = f.tick();
+    await reading.promise;
+    try {
+      await f.coordinate();
+      expect(f.workflow?.state).toBe("ready");
+    } finally {
+      release.resolve();
+      await first;
+    }
+    await f.tick();
+    expect(f.store.reviews().list(id)).toHaveLength(1);
+    expect(f.calls).toHaveLength(1);
+    expect(f.allowance.reviews.reservedOrUsed).toBe(1);
   });
 
   it("exposes durable attention, direction and capacity in the operator CLI", async () => {

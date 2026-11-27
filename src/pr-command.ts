@@ -9,6 +9,7 @@ const usage = `Usage:
   workflow initiate OWNER/REPO#NUMBER CONFIG.json
   workflow direction OWNER/REPO#NUMBER "direction"
   workflow direction OWNER/REPO#NUMBER --abandon EXECUTION_ID "reason"
+  workflow direction OWNER/REPO#NUMBER --recover-outcome EXECUTION_ID 'PUBLICATION_JSON' "reason" [--attest-quiescent]
   workflow direction OWNER/REPO#NUMBER --replace-evidence EXECUTION_ID "direction"
   workflow grant OWNER/REPO#NUMBER REVIEWS REVISIONS "reason"
   workflow resume OWNER/REPO#NUMBER "reason"
@@ -82,6 +83,17 @@ export function runPrCommand(args: string[], dbPath: string): boolean {
       }
       case "direction":
         if (
+          details[0] === "--recover-outcome" &&
+          (details.length === 4 || (details.length === 5 && details[4] === "--attest-quiescent"))
+        ) {
+          pr.operate(id, {
+            kind: "recover_outcome",
+            executionId: details[1]!,
+            publication: JSON.parse(details[2]!) as unknown,
+            reason: details[3]!,
+            attestQuiescent: details.length === 5,
+          });
+        } else if (
           details.length === 3 &&
           (details[0] === "--abandon" || details[0] === "--replace-evidence")
         ) {

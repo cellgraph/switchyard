@@ -1,7 +1,18 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import type { AssignmentClaim, AssignmentInput, PrAssignment } from "./pr-assignments.ts";
-import { isOperatorHeld, type Workflow, type WorkflowCommand } from "./workflow.ts";
+import {
+  parseClaim,
+  type AssignmentClaim,
+  type AssignmentInput,
+  type PrAssignment,
+} from "./pr-assignments.ts";
+import { createReviewStore } from "./review-store.ts";
+import {
+  isOperatorHeld,
+  requiredChecksPass,
+  type Workflow,
+  type WorkflowCommand,
+} from "./workflow.ts";
 
 export const prSchema = `
   CREATE TABLE pr_initiations (
@@ -30,9 +41,24 @@ export type Attention = { reason: string; action: string; references: string[] }
 type OperatorAction =
   | { kind: "direction" | "resume" | "stop"; reason: string }
   | { kind: "abandon" | "replace_evidence"; executionId: string; reason: string }
+  | {
+      kind: "recover_outcome";
+      executionId: string;
+      publication: unknown;
+      attestQuiescent: boolean;
+      reason: string;
+    }
   | { kind: "grant"; reason: string; reviews: number; revisions: number };
 
 type Guard = { workflow: Workflow; version: number };
+type Quiescence = { blockId: string } | { operatorAttested: true };
+type OutcomeRecovery = {
+  executionId: string;
+  claim: AssignmentClaim;
+  attestQuiescent: boolean;
+  reason: string;
+  confirmedBy?: Quiescence;
+};
 
 export function createPrStore(
   db: DatabaseSync,
@@ -109,7 +135,7 @@ export function createPrStore(
     unchanged,
     attention,
     events(id: string) {
-      return db
+      const rows = db
         .prepare(
           `
         SELECT id, kind, reason, review_slots AS reviews, revision_slots AS revisions,
@@ -124,6 +150,11 @@ export function createPrStore(
         revisions: number;
         createdAt: string;
       }[];
+      return rows.map((event) => {
+        if (event.kind !== "recover_outcome") return { ...event, recovery: undefined };
+        const recovery = JSON.parse(event.reason) as OutcomeRecovery;
+        return { ...event, reason: recovery.reason, recovery };
+      });
     },
     operate(id: string, action: OperatorAction) {
       return transaction(() => {
@@ -151,7 +182,9 @@ export function createPrStore(
             FROM pr_assignments AS assignment
             JOIN agent_executions AS execution ON execution.id=assignment.execution_id
             WHERE assignment.workflow_id=? AND assignment.execution_id=?
-              AND assignment.superseded=0 AND execution.status IN ('failed','completed')
+              AND assignment.superseded=0
+              AND (execution.status IN ('failed','completed')
+                OR (execution.status='unknown' AND assignment.proof IS NOT NULL))
           `,
             )
             .get(id, action.executionId);
@@ -168,10 +201,37 @@ export function createPrStore(
             );
           db.prepare("UPDATE pr_assignments SET superseded=1 WHERE id=?").run(eligible.id!);
         }
-        const reason =
+        let reason =
           action.kind === "abandon" || action.kind === "replace_evidence"
             ? `${action.executionId}: ${action.reason}`
             : action.reason;
+        if (action.kind === "recover_outcome") {
+          const assignment = this.list(id).findLast((item) => !item.proof && !item.superseded);
+          const unresolved = db
+            .prepare(
+              `SELECT 1 FROM agent_executions WHERE id=? AND status='unknown'
+               AND remote_key IS NOT NULL AND remote_launch_authorized=1
+               AND remote_result_digest IS NULL`,
+            )
+            .get(action.executionId);
+          if (
+            !isOperatorHeld(workflow) ||
+            assignment?.executionId !== action.executionId ||
+            !unresolved
+          )
+            throw new Error(
+              "Recovery requires a held workflow and its outstanding unknown Rex execution.",
+            );
+          const claim = parseClaim(assignment, action.publication);
+          if (!claim)
+            throw new Error("Provide valid publication references for the original assignment.");
+          reason = JSON.stringify({
+            executionId: action.executionId,
+            claim,
+            attestQuiescent: action.attestQuiescent,
+            reason: action.reason,
+          } satisfies OutcomeRecovery);
+        }
         db.prepare(
           "INSERT INTO pr_operator_events(workflow_id,kind,reason,review_slots,revision_slots,created_at) VALUES (?,?,?,?,?,?)",
         ).run(id, action.kind, reason, ...slots, new Date().toISOString());
@@ -198,7 +258,9 @@ export function createPrStore(
     },
     setReady(guard: Guard, ready: boolean) {
       transaction(() => {
-        if (unchanged(guard)) transition(guard.workflow.id, { type: "readiness", ready });
+        if (!unchanged(guard)) return;
+        const current = findWorkflow(guard.workflow.id)!;
+        transition(current.id, { type: "readiness", ready: ready && requiredChecksPass(current) });
       });
     },
     list(workflowId: string): PrAssignment[] {
@@ -276,19 +338,62 @@ export function createPrStore(
     },
     capture(assignment: PrAssignment, claim: AssignmentClaim) {
       db.prepare(
-        "UPDATE pr_assignments SET claim=? WHERE id=? AND execution_id=? AND claim IS NULL",
+        "UPDATE pr_assignments SET claim=? WHERE id=? AND execution_id=? AND claim IS NULL AND superseded=0",
       ).run(JSON.stringify(claim), assignment.id, assignment.executionId);
     },
-    corroborate(assignment: PrAssignment, proof: string) {
-      db.prepare("UPDATE pr_assignments SET proof=? WHERE id=? AND proof IS NULL").run(
-        proof,
-        assignment.id,
-      );
+    corroborate(
+      guard: Guard,
+      assignment: PrAssignment,
+      proof: string,
+      record: (reviews: ReturnType<typeof createReviewStore>) => void,
+      recovery?: { id: number; claim: AssignmentClaim; confirmedBy: Quiescence },
+    ): boolean {
+      return transaction(() => {
+        if (!unchanged(guard)) return false;
+        if (recovery) {
+          const execution = db
+            .prepare(
+              `SELECT remote_block_id AS blockId FROM agent_executions
+             WHERE id=? AND status='unknown' AND remote_result_digest IS NULL`,
+            )
+            .get(assignment.executionId);
+          if (
+            !execution ||
+            ("blockId" in recovery.confirmedBy &&
+              execution.blockId !== recovery.confirmedBy.blockId)
+          )
+            return false;
+        }
+        const { changes } = db
+          .prepare(
+            `UPDATE pr_assignments SET claim=?, proof=? WHERE id=? AND workflow_id=?
+           AND execution_id=? AND superseded=0 AND claim IS ? AND proof IS NULL`,
+          )
+          .run(
+            JSON.stringify(recovery?.claim ?? assignment.claim),
+            proof,
+            assignment.id,
+            guard.workflow.id,
+            assignment.executionId,
+            assignment.claim ? JSON.stringify(assignment.claim) : null,
+          );
+        if (!changes) return false;
+        // Review metadata and provenance belong to the transaction that owns the proof.
+        record(createReviewStore(db, (run) => run()));
+        if (recovery)
+          db.prepare(
+            "UPDATE pr_operator_events SET reason=json_set(reason, '$.confirmedBy', json(?)) WHERE id=?",
+          ).run(JSON.stringify(recovery.confirmedBy), recovery.id);
+        return true;
+      });
     },
-    supersede(assignment: PrAssignment) {
-      db.prepare("UPDATE pr_assignments SET superseded=1 WHERE id=? AND proof IS NULL").run(
-        assignment.id,
-      );
+    supersede(guard: Guard, assignment: PrAssignment) {
+      transaction(() => {
+        if (!unchanged(guard)) return;
+        db.prepare(
+          "UPDATE pr_assignments SET superseded=1 WHERE id=? AND execution_id=? AND proof IS NULL",
+        ).run(assignment.id, assignment.executionId);
+      });
     },
     needsExecutionRecovery(workflowId: string): boolean {
       return Boolean(
@@ -297,7 +402,8 @@ export function createPrStore(
             `
         SELECT 1 FROM pr_assignments
         JOIN agent_executions ON agent_executions.id=pr_assignments.execution_id
-        WHERE workflow_id=? AND superseded=0 AND agent_executions.status IN ('running','unknown')
+        WHERE workflow_id=? AND superseded=0 AND proof IS NULL
+          AND agent_executions.status IN ('running','unknown')
           AND remote_result_digest IS NULL LIMIT 1
       `,
           )
@@ -310,7 +416,7 @@ export function createPrStore(
           `
         SELECT agent_executions.id FROM pr_assignments
         JOIN agent_executions ON agent_executions.id=pr_assignments.execution_id
-        WHERE workflow_id!=? AND agent_executions.status IN ('running','unknown')
+        WHERE workflow_id!=? AND proof IS NULL AND agent_executions.status IN ('running','unknown')
           AND remote_result_digest IS NULL
       `,
         )
