@@ -5,7 +5,7 @@
 
 ## Goal
 
-Deliver Switchyard's first software development workflow: bounded PR review and revision with native coding agents, exact-head GitHub evidence and human acceptance. Keep execution, native sessions, placement, execution history and the operator interface independent of PR-specific policy. A future implementation plan may invoke this PR workflow as one step and may run assignments with no PR. Implement the concrete PR workflow in TypeScript functions; defer broader workflows, a generic engine, a workflow language and a plugin framework.
+Deliver self-hosted development for Switchyard as the priority for the remainder of Plan 003. Explicit remote placement in Phase C and bounded PR review and revision in Phase D support the approved-plan workflow in Phase E. Keep execution, native sessions, placement, execution history and the operator interface independent of PR-specific policy. Implement these concrete workflows in TypeScript functions.
 
 This plan supersedes the remaining work in [Plan 001](001-pr-review-loop.md) and the implementation proposal in [Plan 002](002-claude-code-authentication.md). Their completed work and investigation remain historical context.
 
@@ -72,9 +72,13 @@ Phase B2 uses one reconciliation worker for startup, periodic sweeps, authentica
 
 ### Phase C — Investigate Rex, then implement explicit remote placement
 
-Before selecting a remote implementation, spike Superlogical Rex's supported programmable interfaces and agent-facing capabilities between the VM controller and the Mac mini. Test launch, execution that persists through controller disconnection, programmatic output retrieval, terminal status and result reporting, cancellation, and reconnection and inspection of an existing execution. Record what was observed, which interfaces are supported, the limitations and how each option handles uncertainty without duplicate work. Decide whether Rex replaces the worker, supplies primitives for a thinner worker, or is unsuitable. The spike gates Phase C's implementation choice. Phases A and B can proceed independently.
+#### C1 — Rex execution mechanism spike
 
-If Rex is unsuitable, consult the [historical HTTP worker implementation and tests](../distributed-workers.md) against the simplified contract. Select the transport and lifecycle behavior needed for authenticated dispatch, result correlation and recovery. Treat a disconnect or expired claim as uncertainty when it cannot prove non-execution. Use the same logical execution and result interface for local and remote placement.
+The [C1 spike report](../rex-execution-spike.md) records live VM-to-Mac launch, reconnection, exit evidence, file transfer, cancellation, native session continuation and the offline Codex SDK crash. It recommends the Rex CLI plus a thin executor, subject to operator acceptance of the mechanism and production access boundary.
+
+#### C2 — Explicit remote placement
+
+Select the transport and lifecycle behavior needed for authenticated dispatch, result correlation and recovery. If Rex proves unsuitable, consult the [historical HTTP worker implementation and tests](../distributed-workers.md) against the simplified contract. Treat a disconnect or expired claim as uncertainty when it cannot prove non-execution. Use the same logical execution and result interface for local and remote placement.
 
 Introduce named agent configurations as concrete placement and role needs emerge in Phases C and D. They can describe the communication mechanism, placement, runtime, model and invocation context. Consider attribution and appropriately scoped access on distributed hosts and as roles act more independently.
 
@@ -91,6 +95,25 @@ Provide a CLI for humans and agents to list and inspect workflows, filter for at
 **Acceptance.** With fixtures and a disposable live PR, demonstrate automatic and explicit initiation, a published review and disposition, an agent-owned revision with observed exact-head CI, and handoff without per-step approval. Cover clean and rejected/deferred-only handoff without redundant review, accepted and escalated blockers, CI-only and combined fixes, external head changes, missing or stale evidence, limit exhaustion and operator continuation. Verify the CLI can account for pauses and recoveries after restart. Stop/closure and reconnection must prevent unintended dispatch. Keep the PR open for human acceptance.
 
 Before deploying the replacement, stop the old controller and archive its SQLite database. Preserve native sessions, repository clones and worktrees independently. Start the new controller on a fresh database, with no migration, compatibility layer or parallel legacy execution path. Keep deployment verification and rollback instructions, record the tested commit, topology and observed native outcomes, and update operating guides to match the shipped behavior. One controller owns the active SQLite state.
+
+### Phase E — Approved implementation-plan execution and self-hosting
+
+Execute an operator-approved, multi-increment implementation plan stored in the repository. The first implementation can process increments sequentially.
+
+1. Accept the operator's approval of a specific repository plan revision and record it durably.
+2. Identify the next implementation increment from the approved revision.
+3. Start an Implementer assignment for that increment.
+4. Correlate the resulting PR with the increment and persist the reference.
+5. Use the Phase D workflow for independent review, adjudication, revision and exact-head CI.
+6. Escalate consequential decisions and unresolved failures, including ambiguous execution or PR association.
+7. Request operator acceptance when the PR is ready.
+8. Observe the operator's merge through GitHub reconciliation.
+9. Start the next increment after recording the merge.
+10. Continue until the approved plan is complete.
+
+Persist plan, increment, assignment and PR progress so the controller can resume conservatively after restart. Reconcile outstanding executions and PRs before dispatching more work. Hold ambiguous outcomes for inspection or operator direction. The operator retains authority over plan approval, consequential architectural decisions, additional execution allowances and final PR merge. A generalized workflow engine, dependency graph, parallel implementation scheduling and workflow definition language are outside Phase E.
+
+**Self-hosting acceptance.** Switchyard executes an approved development plan for the Switchyard repository itself, from the first implementation assignment through subsequent increments. The operator interacts primarily through plan approval, consequential decisions, attention requests and final acceptance. Switchyard carries context between agents without manual prompt transfer.
 
 ## Remaining implementation choices
 
