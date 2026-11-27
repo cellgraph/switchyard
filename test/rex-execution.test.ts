@@ -296,46 +296,16 @@ it("preserves launch authorization when recovery read staging state first", asyn
   }
 });
 
-it("upgrades old Rex claims conservatively and preserves accepted final digests", async () => {
-  const controller = subsystem();
-  const completed = await controller.execute(intent());
-  const { execution: pending } = controller.executions.claim({
-    ...intent("pending"),
-    assignmentId: "other",
-  });
-  const oldBlockId = "block:" + randomUUID();
-  store.close();
+it.each([20, 21])("rejects pre-Phase D database schema %s without upgrading it", (version) => {
+  const database = join(root, "pre-phase-d.sqlite");
+  new WorkflowStore(database).close();
   {
-    using old = new DatabaseSync(db);
-    old
-      .prepare("UPDATE agent_executions SET remote_block_id=? WHERE id=?")
-      .run(oldBlockId, pending.id);
-    old.exec(`
-      ALTER TABLE agent_executions DROP COLUMN remote_launch_authorized;
-      ALTER TABLE agent_executions DROP COLUMN remote_acknowledged_block_id;
-      PRAGMA user_version = 20;
-    `);
+    using old = new DatabaseSync(database);
+    old.exec(`PRAGMA user_version = ${version}`);
   }
-  store = new WorkflowStore(db);
-  const restarted = subsystem();
-  expect(await restarted.recover()).toMatchObject([
-    {
-      execution: {
-        status: "unknown",
-        remote: { launchAuthorized: true, acknowledgedBlockId: oldBlockId, blockId: null },
-      },
-    },
-  ]);
-  expect(await restarted.inspect(completed.execution.id)).toMatchObject({
-    execution: {
-      status: "completed",
-      remote: {
-        blockId: completed.execution.remote!.blockId,
-        resultDigest: completed.execution.remote!.resultDigest,
-      },
-    },
-    result: { outcome: "completed", response: "fixture done" },
-  });
+  expect(() => new WorkflowStore(database)).toThrow("Unsupported Switchyard database");
+  using old = new DatabaseSync(database, { readOnly: true });
+  expect(old.prepare("PRAGMA user_version").get()?.user_version).toBe(version);
 });
 
 it("reconciles a lost launch acknowledgement after restart without replay and retrieves the same result", async () => {

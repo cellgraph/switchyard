@@ -7,11 +7,17 @@ import {
   type AgentResult,
   type AgentTurn,
 } from "./agent.ts";
-import { type createAgentStore, type ExecutionIntent } from "./agent-store.ts";
+import {
+  type createAgentStore,
+  type ExecutionIntent,
+  type ExecutionRecord,
+  type SessionRecord,
+} from "./agent-store.ts";
 import { createNativeAgent } from "./native-agent.ts";
 import { createRexExecution } from "./rex-execution.ts";
 
-type Assignment = ExecutionIntent & Pick<AgentTurn, "prompt" | "outputSchema" | "signal">;
+type Assignment = ExecutionIntent &
+  Pick<AgentTurn, "prompt" | "outputSchema" | "signal"> & { mayLaunch?: () => boolean };
 
 const persistenceRetryDelays = [25, 75];
 
@@ -28,7 +34,11 @@ export function createAgentController(
   remote = createRexExecution(executions),
 ) {
   return {
-    async execute(assignment: Assignment) {
+    async execute(assignment: Assignment): Promise<{
+      execution: ExecutionRecord;
+      session: SessionRecord;
+      result?: Extract<AgentResult, { outcome: "completed" }>;
+    }> {
       const { id, assignmentId, context, prompt, outputSchema, signal } = assignment;
       if (![id, assignmentId].every(validIdentifier))
         throw new Error("Execution and assignment IDs must be short identifiers.");

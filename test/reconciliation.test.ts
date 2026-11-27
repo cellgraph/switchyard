@@ -483,6 +483,8 @@ describe("repository configuration", () => {
       repositories,
       reconcileIntervalMs: 60_000,
       requiredChecks: new Map([["owner/one", ["CI"]]]),
+      checkApps: new Map(),
+      workflows: new Map(),
     });
   });
 

@@ -1,6 +1,6 @@
 # Switchyard architecture
 
-[ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture. [Plan 003](plans/003-architectural-simplification.md) sequences the replacement. Phase B2 implements repository discovery and shared reconciliation. Phase C2 adds explicit remote native execution and recovery.
+[ADR-0006](adr/0006-orchestrate-through-native-tools.md) records the accepted architecture. [Plan 003](plans/003-architectural-simplification.md) sequences the replacement. Phase B2 implements repository discovery and shared reconciliation. Phase C2 adds explicit remote native execution and recovery. Phase D coordinates the autonomous PR loop through those paths.
 
 ## Accepted direction
 
@@ -19,7 +19,7 @@ A persistent TypeScript controller on a VM uses SQLite for workflow state, execu
 | GitHub observation        | The read-only App lists open PRs in explicitly enabled repositories. Individual PR reads determine lifecycle and eligibility. Startup, webhook, periodic and operator requests use the same worker. |
 | Workflow state            | SQLite retains workflow IDs, history and exact-head checks. Durable generations guard overlapping observations. A final PR read confirms eligibility and head before evidence is applied.           |
 | Operator visibility       | Status shows process state, pass results, PR heads, GitHub lifecycle and durable holds. A hold prevents active coordination while lifecycle observation can continue.                               |
-| Review evidence           | SQLite records exact-head review and finding metadata with GitHub references. Phase D adds corroboration and handoff policy.                                                                        |
+| Review evidence           | SQLite records exact-head review and finding metadata with GitHub references. The autonomous workflow verifies review and disposition references against GitHub before advancing.                   |
 | Explicit native execution | The Codex SDK and Claude Code CLI start or continue sessions locally or through a Rex-launched executor.                                                                                            |
 
 ```mermaid
@@ -33,6 +33,8 @@ flowchart LR
     Discovery --> Detail[Individual PR and exact-head CI reads]
     Observe --> Detail
     Detail --> Apply[Guarded SQLite workflow update]
+    Apply --> Coordinate[Corroborate and coordinate roles]
+    Coordinate --> Observe
 ```
 
 An open listing supplies candidates. A full sweep also reads tracked PRs individually, so an absent entry does not establish closure. A PR-specific hint can go straight to the individual read. A repository hint requests discovery and tracked PR observation. Signals arriving during an active pass can request another pass. Startup and periodic sweeps recover lost signals. The SQLite delivery inbox, claims and replay machinery were removed. [GitHub App setup](github-app.md) · [Operating guide](unattended.md) · [Workflow state](state-model.md)
@@ -49,8 +51,8 @@ For Rex placement, the claim includes a unique attempt key independent of the ex
 
 A live Rex block is evidence of a running process. Its exit status or a missing acknowledgement can leave the native outcome unknown. After controller restart, explicit recovery and inspection reconcile existing attempts without launching them. An interrupt targets the correlated Rex block, and later evidence may establish process exit and a native outcome separately. [Execution operating guide](agent-sessions.md) · [C1 spike](rex-execution-spike.md)
 
-[Phase A3 verification](native-execution-verification.md) identified an uncaught SDK error that can kill the Node process hosting a Codex turn. The C2 executor confines that crash to the Rex child on the agent VM. The controller's claim remains durable and held when the child exits without a result. Phase D adds autonomous role dispatch, execution limits, operator workflow commands and deployment cutover.
+[Phase A3 verification](native-execution-verification.md) identified an uncaught SDK error that can kill the Node process hosting a Codex turn. The C2 executor confines that crash to the Rex child on the agent VM. The controller's claim remains durable and held when the child exits without a result. [Autonomous role dispatch](autonomous-pr-workflow.md) requires Rex to preserve that process boundary.
 
 ### Review evidence
 
-A review row associates a workflow and exact commit with a native GitHub review ID and completion metadata. Finding rows reference native review comments and can record an accept, reject, defer or escalate disposition, a reference to the published reasoning, an issue reference for deferral and a claimed resolving SHA for an accepted finding. Substantive content lives on GitHub. Phase D will corroborate review results and establish handoff eligibility. [Review evidence and inspection](reviews.md)
+A review row associates a workflow and exact commit with a native GitHub review ID and completion metadata. Finding rows reference native review comments and can record an accept, reject, defer or escalate disposition, a reference to the published reasoning, an issue reference for deferral and a claimed resolving SHA for an accepted finding. Substantive content lives on GitHub. Phase D keeps assignment reservations and normalized claims alongside those references. GitHub evidence is refreshed before handoff and after restart. [Review evidence and inspection](reviews.md)

@@ -210,6 +210,12 @@ export function createAgentStore(
   return {
     get,
     session,
+    forAssignment(assignmentId: string): ExecutionRecord[] {
+      return db
+        .prepare("SELECT id FROM agent_executions WHERE assignment_id=? ORDER BY rowid")
+        .all(assignmentId)
+        .map((row) => get(String(row.id))!);
+    },
     unresolvedRemote(): string[] {
       return db
         .prepare(
@@ -218,17 +224,19 @@ export function createAgentStore(
         .all()
         .map((row) => String(row.id));
     },
-    authorizeRemoteDispatch(id: string): boolean {
-      return (
-        db
-          .prepare(
-            `
+    authorizeRemoteDispatch(id: string, mayLaunch: () => boolean = () => true): boolean {
+      return transaction(
+        () =>
+          mayLaunch() &&
+          db
+            .prepare(
+              `
         UPDATE agent_executions SET remote_launch_authorized=1
         WHERE id=? AND remote_key IS NOT NULL AND status='running'
           AND remote_launch_authorized=0 AND owner_pid=?
       `,
-          )
-          .run(id, process.pid).changes === 1
+            )
+            .run(id, process.pid).changes === 1,
       );
     },
     recoverRemotePrelaunch(id: string): void {

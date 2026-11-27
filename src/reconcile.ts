@@ -2,6 +2,7 @@ import type { GitHubReader, PullRequestState, PullRequestTarget } from "./github
 import { checkGitHubDrain, githubRetryError } from "./github-app.ts";
 import type { GitHubObservationWriter, WorkflowStore } from "./store.ts";
 import {
+  isActive,
   isOperatorHeld,
   type CheckEvidence,
   type GitHubPullRequestStatus,
@@ -28,7 +29,7 @@ export function canReadPullRequestChecks(
   return !isOperatorHeld(store.findWorkflow(repository, pullRequest));
 }
 
-function statusOf(snapshot: PullRequestState, repository: string): GitHubPullRequestStatus {
+export function statusOf(snapshot: PullRequestState, repository: string): GitHubPullRequestStatus {
   if (snapshot.merged) return "merged";
   if (snapshot.state === "closed") return "closed";
   if (snapshot.headRepository !== repository) return "fork";
@@ -90,7 +91,7 @@ export function createReconciler(
     function clearCurrentChecks() {
       apply((observation) => {
         const current = findWorkflow();
-        if (current?.state === "awaiting_review") recordChecks(observation, current, []);
+        if (isActive(current)) recordChecks(observation, current, []);
       });
     }
 
@@ -109,7 +110,7 @@ export function createReconciler(
         if (status !== "eligible" || isOperatorHeld(tracked)) {
           observe(start, status, observation);
           active = false;
-        } else if (tracked?.state === "awaiting_review") {
+        } else if (isActive(tracked)) {
           observe(start, status, observation);
         }
       });
@@ -148,7 +149,7 @@ export function createReconciler(
         const tracked = findWorkflow();
         activeAtEnd = latestStatus === "eligible" && !isOperatorHeld(tracked);
         // Require a stable, eligible observation before enrolling or reactivating.
-        if (activeAtEnd && headChanged && tracked?.state !== "awaiting_review") return;
+        if (activeAtEnd && headChanged && !isActive(tracked)) return;
         const updated = observe(latest, latestStatus, observation);
         if (activeAtEnd && updated && !headChanged)
           recordChecks(observation, updated, checks ?? []);

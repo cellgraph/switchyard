@@ -29,6 +29,7 @@ export interface GitHubReader {
 
 export function createGitHubReader(
   client: Pick<GitHubAppClient, "get" | "completeReconciliation">,
+  checkApps: ReadonlyMap<string, ReadonlyMap<string, number>> = new Map(),
 ) {
   async function list(
     target: GitHubRepository,
@@ -72,6 +73,12 @@ export function createGitHubReader(
       list(target, `/pulls/${target.pullRequest}/comments`, signal, undefined, target.pullRequest),
     readIssueComments: (target: PullRequestTarget, signal?: AbortSignal) =>
       list(target, `/issues/${target.pullRequest}/comments`, signal, undefined, target.pullRequest),
+    async readIssue(target: PullRequestTarget, number: number, signal?: AbortSignal) {
+      return (await client.get(target, `/issues/${number}`, target.pullRequest, signal)).data;
+    },
+    async readCommit(target: PullRequestTarget, sha: string, signal?: AbortSignal) {
+      return (await client.get(target, `/commits/${sha}`, target.pullRequest, signal)).data;
+    },
     completeReconciliation(target: GitHubRepository, pullRequest?: number) {
       client.completeReconciliation(target, pullRequest);
     },
@@ -136,9 +143,12 @@ export function createGitHubReader(
       );
 
       const checks = new Map<string, CheckEvidence>();
-      function add(name: unknown, outcome: CheckOutcome): void {
+      const expectedApps = checkApps.get(target.repository);
+      function add(name: unknown, outcome: CheckOutcome, app?: unknown): void {
         if (typeof name !== "string" || !name.trim())
           throw new Error("GitHub returned check evidence without a name.");
+        const expectedApp = expectedApps?.get(name);
+        if (expectedApp !== undefined && app !== expectedApp) return;
         // A name alone cannot disambiguate checks from multiple producers.
         checks.set(name, { name, sha: headSha, outcome: checks.has(name) ? "unknown" : outcome });
       }
@@ -147,7 +157,8 @@ export function createGitHubReader(
         const sha = commitSha(run?.head_sha);
         if (!run || !sha || typeof run.status !== "string")
           throw new Error("GitHub returned an invalid check run.");
-        if (sha === headSha) add(run.name, checkRunOutcome(run.status, run.conclusion));
+        if (sha === headSha)
+          add(run.name, checkRunOutcome(run.status, run.conclusion), object(run.app)?.id);
       }
       for (const item of statuses) {
         const status = object(item);

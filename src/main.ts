@@ -1,5 +1,6 @@
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
+import { createAgentController } from "./agent-controller.ts";
 import { runAgentCommand } from "./agent-command.ts";
 import {
   createController,
@@ -17,10 +18,17 @@ import {
 } from "./github-app.ts";
 import { positiveInteger } from "./github-data.ts";
 import { canReadPullRequestChecks, createReconciler } from "./reconcile.ts";
+import { runPrCommand } from "./pr-command.ts";
+import { createPrCoordinator } from "./pr-workflow.ts";
+import { createRexExecution } from "./rex-execution.ts";
 import { WorkflowStore } from "./store.ts";
 import { createWebhookServer } from "./webhook.ts";
 
-function makeReader(store: WorkflowStore, repositories: GitHubRepository[]) {
+function makeReader(
+  store: WorkflowStore,
+  repositories: GitHubRepository[],
+  checkApps: ReadonlyMap<string, ReadonlyMap<string, number>>,
+) {
   const clientId = process.env.GITHUB_APP_CLIENT_ID;
   const keyPath = process.env.GITHUB_APP_PRIVATE_KEY_PATH;
   if (!clientId || !keyPath)
@@ -28,6 +36,7 @@ function makeReader(store: WorkflowStore, repositories: GitHubRepository[]) {
   return createGitHubReader(
     createGitHubAppClient({
       clientId,
+      workflowEvidence: (target) => checkApps.has(target.repository),
       privateKey: readFileSync(keyPath, "utf8"),
       rateLimits: store.githubRateLimits(),
       retryDeadlines: store.reconciliationRetries(),
@@ -35,6 +44,7 @@ function makeReader(store: WorkflowStore, repositories: GitHubRepository[]) {
       canReadPullRequestChecks: (target, pullRequest) =>
         canReadPullRequestChecks(store, target.repository, pullRequest),
     }),
+    checkApps,
   );
 }
 
@@ -42,7 +52,7 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const dbPath = process.env.SWITCHYARD_DB_PATH ?? "switchyard.sqlite";
   process.umask(0o077);
-  if (await runAgentCommand(args, dbPath)) return;
+  if (runPrCommand(args, dbPath) || (await runAgentCommand(args, dbPath))) return;
   if (args[0] === "--review-status") {
     const workflowId = args[1];
     if (args.length !== 2 || !workflowId) throw new Error("Usage: --review-status WORKFLOW_ID");
@@ -104,7 +114,15 @@ async function main(): Promise<void> {
   let server: ReturnType<typeof createWebhookServer> | undefined;
 
   try {
-    const github = makeReader(store, config.repositories);
+    const github = makeReader(store, config.repositories, config.checkApps);
+    const executions = store.agentExecutions();
+    const rex = createRexExecution(executions);
+    const coordinator = createPrCoordinator({
+      store,
+      github,
+      execute: createAgentController(executions, undefined, rex).execute,
+      inspect: rex.inspect,
+    });
     const controller = createController({
       store,
       repositories: config.repositories,
@@ -114,6 +132,10 @@ async function main(): Promise<void> {
         github,
         (target) => config.requiredChecks.get(target.repository) ?? null,
       ),
+      async coordinate(target, signal) {
+        const workflow = config.workflows.get(target.repository);
+        return workflow ? coordinator(target, workflow, signal) : false;
+      },
       reportError,
       signal: abort.signal,
     });

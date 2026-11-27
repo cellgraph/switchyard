@@ -71,6 +71,15 @@ export function installationAuthRetryKey(target: GitHubRepository): string {
   return `auth:${target.installationId}`;
 }
 
+export class GitHubResponseError extends Error {
+  readonly status: number;
+
+  constructor(status: number, path: string) {
+    super(`GitHub API GET ${path} failed (HTTP ${status}).`);
+    this.status = status;
+  }
+}
+
 export class GitHubDrainError extends Error {
   constructor() {
     super("GitHub reconciliation was interrupted by worker shutdown.");
@@ -168,6 +177,7 @@ function memoryRetryDeadlines(): GitHubRetryDeadlines {
 export function createGitHubAppClient({
   clientId,
   privateKey,
+  workflowEvidence = () => false,
   fetcher = fetch,
   now = Date.now,
   rateLimits = new Map<RateLimitScope, GitHubRateLimitState>(),
@@ -177,6 +187,7 @@ export function createGitHubAppClient({
 }: {
   clientId: string;
   privateKey: string;
+  workflowEvidence?: (target: GitHubRepository) => boolean;
   fetcher?: typeof fetch;
   now?: () => number;
   rateLimits?: GitHubRateLimits;
@@ -427,7 +438,9 @@ export function createGitHubAppClient({
         drainSignal,
         body: JSON.stringify({
           repositories: [target.repository.split("/")[1]],
-          permissions,
+          permissions: workflowEvidence(target)
+            ? { ...permissions, issues: "read", contents: "read" }
+            : permissions,
         }),
       },
       appJwt(),
@@ -562,8 +575,7 @@ export function createGitHubAppClient({
             rejectAuthentication(target);
           }
         }
-        if (!response.ok)
-          throw new Error(`GitHub API GET ${path} failed (HTTP ${response.status}).`);
+        if (!response.ok) throw new GitHubResponseError(response.status, path);
         return {
           data: await readJson(response),
           hasNext: /;\s*rel="next"/.test(response.headers.get("link") ?? ""),

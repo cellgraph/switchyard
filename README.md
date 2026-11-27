@@ -31,3 +31,5 @@ Install dependencies with `npm ci`. Run `npm run format:check`, `npm run lint`, 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) before making changes. Use semantic commit messages, work on feature branches, and submit pull requests to `main`. Implementation PRs need independent automated Codex review and passing CI.
 
 Switchyard is licensed under the [MIT License](LICENSE).
+
+See [autonomous PR workflow operation](docs/autonomous-pr-workflow.md) for named roles, CLI inspection and controller cutover.

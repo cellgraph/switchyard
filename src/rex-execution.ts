@@ -253,7 +253,12 @@ export function createRexExecution(
     async dispatch(
       execution: ExecutionRecord,
       session: SessionRecord,
-      { prompt, outputSchema, signal }: Pick<AgentTurn, "prompt" | "outputSchema" | "signal">,
+      {
+        prompt,
+        outputSchema,
+        signal,
+        mayLaunch,
+      }: Pick<AgentTurn, "prompt" | "outputSchema" | "signal"> & { mayLaunch?: () => boolean },
     ) {
       const id = execution.id;
       const { rex, correlation, directory } = attempt(id);
@@ -282,7 +287,8 @@ export function createRexExecution(
         return notStarted("Could not stage the Rex request before dispatch.");
       }
       if (signal?.aborted) return notStarted("Canceled before Rex dispatch.");
-      if (!executions.authorizeRemoteDispatch(id)) return saved();
+      if (!executions.authorizeRemoteDispatch(id, mayLaunch))
+        return notStarted("Rex dispatch authorization no longer applies.");
 
       let ack: unknown;
       try {
