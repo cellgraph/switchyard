@@ -72,3 +72,5 @@ After five secondary throttles, the pause persists across restarts and requires 
 ## Verification
 
 Run `npm test` without App credentials. Offline fixtures sign notifications, send them to a loopback server and exercise the read-only REST client with a generated RSA key. A live App grant and receiver check remains part of deployment verification. Use a fresh SQLite path and run `--once` against an installed App to check discovery and compare tracked heads and check results with GitHub. The production GraphQL review thread integration is gated pending Phase D corroboration requirements and credential and rate-limit verification. [Plan 003 integration gates](plans/003-architectural-simplification.md#remaining-implementation-choices)
+
+For [autonomous PR coordination](autonomous-pr-workflow.md#configure-a-repository), also grant **Issues: Read-only** and **Contents: Read-only**. The controller uses them to verify deferred issues and signed revisions, respectively. Approve the updated App permissions on each installation before enabling coordination.

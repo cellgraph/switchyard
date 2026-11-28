@@ -16,6 +16,12 @@ Phase B2 observes current state and evidence. Review corroboration, autonomous a
 
 ## SQLite baseline
 
-Point `SWITCHYARD_DB_PATH` at an unused or empty file. The store uses application ID `SWYD` and schema version 21. It upgrades version 20 in place, treating existing Rex attempts as possibly dispatched and requiring executor evidence to verify any block without a final digest. It rejects incompatible and foreign databases before persistent modification. Archiving the deployed database and opening a fresh one are Phase D cutover work.
+Point `SWITCHYARD_DB_PATH` at an unused or empty file. The store uses application ID `SWYD` and schema version 22. It rejects incompatible and foreign databases before persistent modification. Archive the previous database and keep it alongside the prior service release for rollback. See the [cutover procedure](autonomous-pr-workflow.md#cutover-and-rollback).
 
 SQLite retains workflow identity and history, check snapshots, GitHub observation generations and retry state, review metadata, and native session and execution records. The delivery inbox and replay state were removed. Startup and periodic sweeps recover missed notifications by reading current GitHub state. On restart, live local owners retain their claims. Local claims with lost owners become unknown. For Rex attempts, the controller retrieves the recorded attempt's files and observes the correlated block when available. A valid final file can resolve a held attempt. Missing or conflicting evidence keeps the assignment and session held. See [execution recovery](agent-sessions.md#recovery).
+
+## Autonomous assignment state
+
+`ready` records corroborated exact-head review evidence and passing configured CI. A head change or loss of qualifying evidence clears readiness. GitHub lifecycle and explicit operator holds are recorded independently.
+
+The PR workflow records reserved assignments before dispatch, then uses the existing execution claims. Counts derive from durable reservations, executions and operator grants. Known non-execution preserves the slot for retry. Claims store only normalized publication references. Review and adjudication hashes detect subsequent edits. Attention records capture the reason, references and operator action needed. See the [workflow commands](autonomous-pr-workflow.md#inspect-and-direct-a-workflow).

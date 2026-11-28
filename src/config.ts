@@ -1,6 +1,12 @@
 import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { loadNamedAgent, type AgentSelection } from "./agent-config.ts";
+import { prRoles, type PrRole } from "./pr-assignments.ts";
 import type { GitHubRepository } from "./github-app.ts";
 import { object, positiveInteger, repositoryName } from "./github-data.ts";
+
+export type PrRoleConfig = { agent: AgentSelection & { agentName: string }; producerId: number };
+export type PrWorkflowConfig = Record<PrRole, PrRoleConfig>;
 
 export function loadConfig(path: string) {
   const raw = readFileSync(path, "utf8");
@@ -52,5 +58,51 @@ export function loadConfig(path: string) {
       requiredChecks.set(repository, names);
     }
   }
-  return { repositories, reconcileIntervalMs: interval, requiredChecks };
+  const workflows = new Map<string, PrWorkflowConfig>();
+  const checkApps = new Map<string, Map<string, number>>();
+  if (config.prWorkflows !== undefined) {
+    const entries = object(config.prWorkflows);
+    const agentsFile = config.agentsFile;
+    if (!entries || typeof agentsFile !== "string" || !agentsFile.trim())
+      throw new Error("prWorkflows requires an agentsFile and a map of enabled repositories.");
+    for (const [key, entry] of Object.entries(entries)) {
+      const repository = repositoryName(key);
+      const settings = object(entry);
+      if (!repository || !seen.has(repository) || workflows.has(repository) || !settings)
+        throw new Error("Each prWorkflows key must match a distinct enabled repository.");
+      const roles = prRoles.map((role) => {
+        const { agent: name, githubUserId } = object(settings[role]) ?? {};
+        if (typeof name !== "string" || !positiveInteger(githubUserId))
+          throw new Error(`Configure a named ${role} and numeric githubUserId for ${repository}.`);
+        const agent = loadNamedAgent(resolve(dirname(path), agentsFile), name);
+        if (!agent.rex)
+          throw new Error(`Autonomous ${role} dispatch requires a supervised Rex placement.`);
+        return [role, { agent: { ...agent, agentName: name }, producerId: githubUserId }] as const;
+      });
+      if (
+        new Set(roles.map(([, configured]) => configured.agent.agentName)).size !== prRoles.length
+      )
+        throw new Error(`Configure a separate named agent for each role in ${repository}.`);
+
+      const apps = object(settings.checkApps);
+      const checks = requiredChecks.get(repository);
+      if (!checks || !apps || Object.keys(apps).length !== checks.length)
+        throw new Error(
+          `Configure a trusted GitHub App ID for every required check in ${repository}.`,
+        );
+      checkApps.set(
+        repository,
+        new Map(
+          checks.map((name) => {
+            const id = Object.hasOwn(apps, name) ? apps[name] : undefined;
+            if (!positiveInteger(id))
+              throw new Error(`Required check "${name}" needs a numeric GitHub App ID.`);
+            return [name, id];
+          }),
+        ),
+      );
+      workflows.set(repository, Object.fromEntries(roles) as PrWorkflowConfig);
+    }
+  }
+  return { repositories, reconcileIntervalMs: interval, requiredChecks, workflows, checkApps };
 }

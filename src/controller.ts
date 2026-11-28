@@ -61,6 +61,7 @@ export function createController({
   repositories,
   github,
   reconcile,
+  coordinate,
   reportError,
   signal,
   now = Date.now,
@@ -68,7 +69,8 @@ export function createController({
   store: WorkflowStore;
   repositories: readonly GitHubRepository[];
   github: Pick<GitHubReader, "listOpenPullRequests" | "completeReconciliation">;
-  reconcile: (target: PullRequestTarget, signal?: AbortSignal) => Promise<void>;
+  reconcile: (target: PullRequestTarget, signal?: AbortSignal, complete?: boolean) => Promise<void>;
+  coordinate?: (target: PullRequestTarget, signal?: AbortSignal) => Promise<boolean>;
   reportError: (message: string) => void;
   signal?: AbortSignal;
   now?: () => number;
@@ -76,6 +78,7 @@ export function createController({
   const enabled = new Map(repositories.map((target) => [target.repository, target]));
   const isRetryOwnerActive = createGitHubRetryOwnerCheck(store, repositories);
   const rateLimits = store.githubRateLimits();
+  const pr = store.prWorkflows();
   const retries = store.reconciliationRetries();
   let pending = new Map<GitHubRepository, { discover: boolean; pullRequests: Set<number> }>();
   let wake = Promise.withResolvers<void>();
@@ -130,6 +133,24 @@ export function createController({
     if (abandoned) reportError(`Recovered ${abandoned} agent execution(s) with unknown outcomes.`);
     retries.prune(now());
     retireInactiveGitHubRetry(rateLimits, isRetryOwnerActive);
+    let succeeded = true;
+    for (const [target, selectionEntry] of selection) {
+      if (!selectionEntry.discover) continue;
+      for (const workflow of store.listWorkflows(target.repository)) {
+        if (signal?.aborted) return false;
+        const { pullRequest } = workflow.identity;
+        if (workflow.githubStatus !== "merged") selectionEntry.pullRequests.add(pullRequest);
+        else if (coordinate && pr.needsExecutionRecovery(workflow.id)) {
+          try {
+            await coordinate({ ...target, pullRequest }, signal);
+          } catch (error) {
+            if (signal?.aborted) return false;
+            reportError(`${workflow.id}: ${describeError(error)}`);
+            succeeded = false;
+          }
+        }
+      }
+    }
     const secondary = rateLimits.get("secondary");
     if (secondary && (isSecondaryLimitPaused(secondary) || secondary.retryAt > now())) {
       reportError(
@@ -139,13 +160,10 @@ export function createController({
       );
       return false;
     }
-    let succeeded = true;
     for (const [target, { discover, pullRequests }] of selection) {
       if (signal?.aborted) return false;
       if (discover) {
-        for (const workflow of store.listWorkflows(target.repository)) {
-          if (workflow.githubStatus !== "merged") pullRequests.add(workflow.identity.pullRequest);
-        }
+        for (const { pullRequest } of pr.requests(target.repository)) pullRequests.add(pullRequest);
         const discovered = await attempt(target, undefined, async () => {
           for (const number of await github.listOpenPullRequests(target, signal))
             pullRequests.add(number);
@@ -164,7 +182,15 @@ export function createController({
       for (const pullRequest of pullRequests) {
         if (signal?.aborted) return false;
         if (
-          !(await attempt(target, pullRequest, () => reconcile({ ...target, pullRequest }, signal)))
+          !(await attempt(target, pullRequest, async () => {
+            const selected = { ...target, pullRequest };
+            await reconcile(selected, signal, !coordinate);
+            pr.acknowledge(target.repository, pullRequest);
+            if (coordinate) {
+              if (await coordinate(selected, signal)) schedule(target, pullRequest);
+              github.completeReconciliation(target, pullRequest);
+            }
+          }))
         )
           succeeded = false;
       }

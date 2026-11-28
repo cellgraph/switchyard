@@ -1569,6 +1569,78 @@ describe("GitHub App and REST adapter", () => {
     expect(pagesSeen).toContain(`/commits/${sha}/check-runs:2`);
   });
 
+  it("uses scoped read-only permissions and requires the configured check App", async () => {
+    const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+      const path = requestUrl(input).pathname;
+      if (path === "/app/installations/42/access_tokens") {
+        expect(JSON.parse(String(options?.body))).toEqual({
+          repositories: ["repo"],
+          permissions: {
+            pull_requests: "read",
+            checks: "read",
+            statuses: "read",
+            contents: "read",
+            issues: "read",
+          },
+        });
+        return Response.json({
+          token: "fixture-token",
+          expires_at: new Date(Date.now() + 3_600_000),
+        });
+      }
+      expect(options?.method ?? "GET").toBe("GET");
+      if (path.endsWith("/check-runs")) {
+        const run = (name: string, id: number, conclusion: string) => ({
+          name,
+          head_sha: sha,
+          status: "completed",
+          conclusion,
+          app: { id },
+        });
+        return Response.json({
+          check_runs: [
+            run("Verified", 30, "failure"),
+            run("Verified", 31, "success"),
+            run("Spoofed", 31, "success"),
+            run("Ambiguous", 30, "success"),
+            run("Ambiguous", 30, "failure"),
+          ],
+        });
+      }
+      if (path.endsWith("/status"))
+        return Response.json({ sha, statuses: [{ context: "Spoofed", state: "success" }] });
+      if (path.endsWith("/issues/19")) return Response.json({ number: 19 });
+      if (path.endsWith(`/commits/${sha}`)) return Response.json({ sha });
+      throw new Error(`Unexpected fixture endpoint ${path}`);
+    });
+
+    const client = createGitHubAppClient({
+      clientId: "fixture-client-id",
+      privateKey,
+      fetcher,
+      workflowEvidence: () => true,
+    });
+    const api = createGitHubReader(
+      client,
+      new Map([
+        [
+          target.repository,
+          new Map([
+            ["Verified", 30],
+            ["Spoofed", 30],
+            ["Ambiguous", 30],
+          ]),
+        ],
+      ]),
+    );
+    expect(await api.readChecks(target, sha)).toEqual([
+      { name: "Ambiguous", sha, outcome: "unknown" },
+      { name: "Verified", sha, outcome: "failed" },
+    ]);
+    expect(await api.readIssue(target, 19)).toEqual({ number: 19 });
+    expect(await api.readCommit(target, sha)).toEqual({ sha });
+  });
+
   it("reads a referenced thread with a paginated GraphQL query and read-only credentials", async () => {
     const seenCursors: (string | null)[] = [];
     const fetcher = vi.fn<typeof fetch>(async (input, options) => {
