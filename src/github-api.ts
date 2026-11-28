@@ -115,9 +115,20 @@ export function createGitHubReader(
     return [...new Set(numbers)];
   }
 
-  async function pullData(target: PullRequestTarget, signal?: AbortSignal) {
-    return (await client.get(target, `/pulls/${target.pullRequest}`, target.pullRequest, signal))
-      .data;
+  async function pullData(
+    target: PullRequestTarget,
+    signal?: AbortSignal,
+    retryScope?: "repository",
+  ) {
+    return (
+      await client.get(
+        target,
+        `/pulls/${target.pullRequest}`,
+        target.pullRequest,
+        signal,
+        retryScope,
+      )
+    ).data;
   }
 
   return {
@@ -173,8 +184,9 @@ export function createGitHubReader(
     async readPlanPullRequest(
       target: PullRequestTarget,
       signal?: AbortSignal,
+      retryScope?: "repository",
     ): Promise<PlanPullRequest> {
-      const data = await pullData(target, signal);
+      const data = await pullData(target, signal, retryScope);
       const snapshot = readPullRequestState(data, target);
       const pull = object(data)!;
       const headRef = object(pull.head)?.ref;
@@ -209,17 +221,31 @@ export function createGitHubReader(
     async readIssue(target: PullRequestTarget, number: number, signal?: AbortSignal) {
       return (await client.get(target, `/issues/${number}`, target.pullRequest, signal)).data;
     },
-    async readCommit(target: PullRequestTarget, sha: string, signal?: AbortSignal) {
-      return (await client.get(target, `/commits/${sha}`, target.pullRequest, signal)).data;
+    async readCommit(
+      target: PullRequestTarget,
+      sha: string,
+      signal?: AbortSignal,
+      retryScope?: "repository",
+    ) {
+      return (await client.get(target, `/commits/${sha}`, target.pullRequest, signal, retryScope))
+        .data;
     },
     async readComparison(
       target: PullRequestTarget,
       base: string,
       head: string,
       signal?: AbortSignal,
+      retryScope?: "repository",
     ) {
-      return (await client.get(target, `/compare/${base}...${head}`, target.pullRequest, signal))
-        .data;
+      return (
+        await client.get(
+          target,
+          `/compare/${base}...${head}`,
+          target.pullRequest,
+          signal,
+          retryScope,
+        )
+      ).data;
     },
     completeReconciliation(target: GitHubRepository, pullRequest?: number) {
       client.completeReconciliation(target, pullRequest);

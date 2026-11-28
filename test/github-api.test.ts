@@ -1898,55 +1898,70 @@ describe("GitHub App and REST adapter", () => {
     }
   });
 
-  it("pauses after repeated branch discovery throttling despite successful open PR discovery", async () => {
-    const store = new WorkflowStore();
-    let now = Date.UTC(2026, 0, 1);
-    const fetcher = vi.fn<typeof fetch>(async (input, options) => {
-      if (options?.method === "POST")
-        return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
-      const query = requestUrl(input).searchParams;
-      return query.has("head") ? new Response(null, { status: 429 }) : Response.json([]);
-    });
-    try {
-      const rateLimits = store.githubRateLimits();
-      const github = createGitHubReader(
-        createGitHubAppClient({
-          clientId: "fixture-client-id",
-          privateKey,
-          fetcher,
-          rateLimits,
-          now: () => now,
-        }),
-      );
-      const reportError = vi.fn();
-      const controller = createController({
-        store,
-        repositories: [target],
-        github,
-        reconcile: createReconciler(store, github),
-        coordinatePlans: async (repository, signal) => {
-          await github.listBranchPullRequests(repository, "feat/reserved", signal);
-        },
-        reportError,
-        now: () => now,
+  it.each(["branch discovery", "publication verification"])(
+    "pauses after repeated %s throttling despite successful PR reconciliation",
+    async (operation) => {
+      const store = new WorkflowStore();
+      let now = Date.UTC(2026, 0, 1);
+      const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+        if (options?.method === "POST")
+          return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+        const url = requestUrl(input);
+        if (url.pathname.endsWith("/pulls/7"))
+          return prFixture(input, { number: 7, state: "open", head: { sha } });
+        if (url.pathname.endsWith("/status")) return Response.json({ sha, statuses: [] });
+        if (url.pathname.endsWith("/check-runs")) return Response.json({ check_runs: [] });
+        if (url.pathname.endsWith(`/commits/${sha}`)) return new Response(null, { status: 429 });
+        if (url.searchParams.has("head") && operation === "branch discovery")
+          return new Response(null, { status: 429 });
+        return Response.json([{ number: 7 }]);
       });
-      for (const minutes of [1, 2, 4, 8, 16]) {
+      try {
+        const rateLimits = store.githubRateLimits();
+        const github = createGitHubReader(
+          createGitHubAppClient({
+            clientId: "fixture-client-id",
+            privateKey,
+            fetcher,
+            rateLimits,
+            now: () => now,
+          }),
+        );
+        const reportError = vi.fn();
+        const controller = createController({
+          store,
+          repositories: [target],
+          github,
+          reconcile: createReconciler(store, github),
+          coordinate: async () => false,
+          coordinatePlans: async (repository, signal) => {
+            await github.listBranchPullRequests(repository, "feat/reserved", signal);
+            await github.readCommit({ ...repository, pullRequest: 7 }, sha, signal, "repository");
+          },
+          reportError,
+          now: () => now,
+        });
+        for (const minutes of [1, 2, 4, 8, 16]) {
+          controller.scheduleSweep();
+          expect(await controller.runPass()).toBe(false);
+          now += minutes * 60_000;
+          expect(rateLimits.get("secondary")).toMatchObject({
+            retryAt: now,
+            retryRequest: repositoryRetryKey(target),
+          });
+        }
+        const requests = fetcher.mock.calls.length;
         controller.scheduleSweep();
         expect(await controller.runPass()).toBe(false);
-        now += minutes * 60_000;
-        expect(rateLimits.get("secondary")?.retryAt).toBe(now);
+        expect(reportError).toHaveBeenLastCalledWith(
+          expect.stringContaining("paused after repeated secondary rate limits"),
+        );
+        expect(fetcher).toHaveBeenCalledTimes(requests);
+      } finally {
+        store.close();
       }
-      const requests = fetcher.mock.calls.length;
-      controller.scheduleSweep();
-      expect(await controller.runPass()).toBe(false);
-      expect(reportError).toHaveBeenLastCalledWith(
-        expect.stringContaining("paused after repeated secondary rate limits"),
-      );
-      expect(fetcher).toHaveBeenCalledTimes(requests);
-    } finally {
-      store.close();
-    }
-  });
+    },
+  );
 
   it("clears the retry count when a PR closes on the final read", async () => {
     const store = new WorkflowStore();

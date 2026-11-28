@@ -221,7 +221,7 @@ export function createPlanCoordinator({
       const url = pullUrl(selected);
       let snapshot;
       try {
-        snapshot = await github.readPlanPullRequest(selected, signal);
+        snapshot = await github.readPlanPullRequest(selected, signal, "repository");
       } catch (error) {
         if (!(error instanceof GitHubResponseError) || error.status !== 404) throw error;
         pause(
@@ -363,11 +363,13 @@ export function createPlanCoordinator({
           return;
         }
         if (candidates.includes(publication.pullRequest)) {
-          const snapshot = await github.readPlanPullRequest(selected, signal);
+          const snapshot = await github.readPlanPullRequest(selected, signal, "repository");
           if (matches(plan, assignment, snapshot) && snapshot.state === "open" && !snapshot.draft) {
             let verified = false;
             try {
-              const commit = object(await github.readCommit(selected, publication.headSha, signal));
+              const commit = object(
+                await github.readCommit(selected, publication.headSha, signal, "repository"),
+              );
               verified =
                 commitSha(commit?.sha) === publication.headSha &&
                 object(commit?.committer)?.id === assignment.producerId &&
@@ -378,6 +380,7 @@ export function createPlanCoordinator({
                   publication.headSha,
                   snapshot.headSha,
                   signal,
+                  "repository",
                 )) === true;
             } catch (error) {
               if (!(error instanceof GitHubResponseError) || error.status !== 404) throw error;

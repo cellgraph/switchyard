@@ -584,10 +584,17 @@ it("holds multiple candidates and invalid evidence, then honors an explicit veri
     headSha: secondHead,
     reason: "PR 6 is the reviewed implementation publication.",
   });
+  const readCommit = vi.spyOn(f.github, "readCommit");
   f.blockedSignatures.add(secondHead);
   f.operate({ kind: "resume", reason: "Verify PR 6." });
   await f.sweep();
   expect(f.read().attention?.reason).toContain("lacks verified publication");
+  expect(readCommit).toHaveBeenCalledWith(
+    { ...target, pullRequest: 6 },
+    secondHead,
+    undefined,
+    "repository",
+  );
   expect(f.read().increments[0]!.publication).toBeNull();
   f.blockedSignatures.delete(secondHead);
   f.operate({ kind: "resume", reason: "Signature verified by GitHub." });

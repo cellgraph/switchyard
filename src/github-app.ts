@@ -115,7 +115,7 @@ type Token = { value: string; expiresAt: number };
 type ApiRequest = {
   path: string;
   reconcilePullRequest?: number | undefined;
-  repositoryDiscovery?: boolean | undefined;
+  repositoryReconciliation?: boolean | undefined;
   commitRetryKey?: string | undefined;
   drainSignal?: AbortSignal | undefined;
 } & (
@@ -261,7 +261,7 @@ export function createGitHubAppClient({
       method,
       body,
       reconcilePullRequest,
-      repositoryDiscovery,
+      repositoryReconciliation,
       commitRetryKey,
       drainSignal,
     }: ApiRequest,
@@ -283,12 +283,12 @@ export function createGitHubAppClient({
     const tokenRequest = method === "POST" && path.startsWith("/app/installations/");
     const requestKey = tokenRequest
       ? tokenRetryKey(target)
-      : pullRequestKey !== undefined
-        ? `pr:${pullRequestKey}`
-        : repositoryDiscovery
-          ? repositoryRetryKey(target)
+      : repositoryReconciliation
+        ? repositoryRetryKey(target)
+        : pullRequestKey !== undefined
+          ? `pr:${pullRequestKey}`
           : `${target.installationId}:GET:${path}`;
-    const deadlineKey = tokenRequest || repositoryDiscovery ? requestKey : pullRequestKey;
+    const deadlineKey = tokenRequest || repositoryReconciliation ? requestKey : pullRequestKey;
     const startedAt = now();
     const limit = limitsFor(scope);
     const paused = limit.throttledAttempts >= maxSecondaryAttempts;
@@ -399,7 +399,7 @@ export function createGitHubAppClient({
       response.ok &&
       limit.throttledAttempts > 0 &&
       reconcilePullRequest === undefined &&
-      !repositoryDiscovery &&
+      !repositoryReconciliation &&
       !tokenRequest
     )
       clearSecondaryAttempts(startedAt, (key) => key === requestKey);
@@ -538,6 +538,7 @@ export function createGitHubAppClient({
       suffix: string,
       reconcilePullRequest?: number,
       drainSignal?: AbortSignal,
+      retryScope?: "repository",
     ): Promise<{ data: unknown; hasNext: boolean }> {
       const cacheKey = `${target.installationId}:${target.repository}`;
       const path = `/repos/${target.repository}${suffix}`;
@@ -549,8 +550,14 @@ export function createGitHubAppClient({
       const commitRetryKey = suffix.startsWith("/commits/")
         ? `commit:${target.installationId}:${path.split("?", 1)[0]}`
         : undefined;
-      const repositoryDiscovery = suffix.startsWith("/pulls?");
-      const read = { path, reconcilePullRequest, repositoryDiscovery, commitRetryKey, drainSignal };
+      const repositoryReconciliation = retryScope === "repository" || suffix.startsWith("/pulls?");
+      const read = {
+        path,
+        reconcilePullRequest,
+        repositoryReconciliation,
+        commitRetryKey,
+        drainSignal,
+      };
       return queueRead(target.installationId, async () => {
         checkGitHubDrain(drainSignal);
         checkAuthentication(target);
@@ -561,7 +568,7 @@ export function createGitHubAppClient({
         )
           throw new Error("Pull request reconciliation was stopped.");
         checkRetryDeadline(
-          repositoryDiscovery ? repositoryRetryKey(target) : prRetryKey,
+          repositoryReconciliation ? repositoryRetryKey(target) : prRetryKey,
           commitRetryKey,
         );
         let token = await tokenFor(target, cacheKey, reconcilePullRequest, drainSignal);

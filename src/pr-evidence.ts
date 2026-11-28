@@ -21,6 +21,7 @@ export type PublicationReader = {
     base: string,
     head: string,
     signal?: AbortSignal,
+    retryScope?: "repository",
   ): Promise<unknown>;
 };
 
@@ -304,9 +305,10 @@ export async function includesCommit(
   base: string,
   head: string,
   signal?: AbortSignal,
+  retryScope?: "repository",
 ): Promise<boolean | null> {
   if (base === head) return true;
-  const comparison = object(await github.readComparison(target, base, head, signal));
+  const comparison = object(await github.readComparison(target, base, head, signal, retryScope));
   const mergeBase = commitSha(object(comparison?.merge_base_commit)?.sha);
   if (commitSha(object(comparison?.base_commit)?.sha) !== base || !mergeBase) return null;
   if (comparison?.status === "ahead" && mergeBase === base) return true;
