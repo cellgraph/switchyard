@@ -150,10 +150,13 @@ export function findingUrl(identity: WorkflowIdentity, id: number): string {
   return `${pullUrl(identity)}#discussion_r${id}`;
 }
 
+export type PriorReview = { headSha: string; reviewId: number };
+
 export function assignmentTurn(
   assignment: PrAssignment,
   identity: WorkflowIdentity,
   direction?: string,
+  priorReview?: PriorReview,
 ) {
   const input = assignment.input;
   const prompt = [
@@ -168,6 +171,10 @@ export function assignmentTurn(
     case "reviewer":
       prompt.push(
         "Independently review the exact head and run relevant validation. Use a separate worktree if needed. Do not edit, commit, or push to the PR.",
+        priorReview
+          ? `Prior verified review at ${priorReview.headSha}: ${pullUrl(identity)}#pullrequestreview-${priorReview.reviewId}. Compare that head with the exact target head. Normally focus on verifying corrections, checking affected invariants and looking for regressions, even if there are no listed findings. Broaden the review when substantial changes or material architectural changes warrant it, or when the available comparison or prior review is insufficient for a targeted review.`
+          : "Conduct a comprehensive independent review of the PR against its base. A missing, incomplete or unverified prior review cannot substitute for that review.",
+        "In every round, report newly discovered consequential defects, including those outside the revision diff. Explain the plausible trigger, the consequence and the behavior that needs correction.",
         "Publish one submitted GitHub COMMENT review with commit_id set to the exact target head. Publish each actionable finding as a root inline comment in that same review. Start the review body with 'Review outcome: clean' or 'Review outcome: findings', then summarize validation.",
         `Prior Switchyard findings for this assignment: ${JSON.stringify(links(input.previousFindingIds))}`,
         "Only the listed Switchyard findings are exempt from new inline publication. If you independently confirm an actionable issue already raised in another review and it is outside that list, publish your own root inline finding in this review.",
@@ -178,6 +185,8 @@ export function assignmentTurn(
     case "adjudicator":
       prompt.push(
         `Retrieve and assess each finding independently: ${JSON.stringify(links(input.findingIds))}`,
+        "Evaluate the evidence in the expected operating environment, including expected usage and trust boundaries. Explain how likelihood, impact, recoverability and correction cost together support each disposition. A technically valid finding may be nonblocking.",
+        "Accept findings that warrant correction before acceptance. Reject unsupported or immaterial findings. Defer worthwhile nonblocking work with a linked issue. Escalate consequential decisions that require operator judgment.",
         "Publish one inline reply directly to each finding using the pull request review comment replies endpoint. Use the exact first line 'Decision: accept', 'Decision: reject', 'Decision: defer', or 'Decision: escalate'. Follow it with substantive reasoning. Do not edit or push code.",
         "For defer, create a same-repository GitHub issue whose body contains the full finding URL. Include the full issue URL on its own line in your reply. Return the numeric REST finding and reply IDs, decision, and deferred issue number. Use null for issueNumber on all other dispositions.",
       );

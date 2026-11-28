@@ -10,6 +10,7 @@ import {
   type AssignmentInput,
   type Disposition,
   type PrAssignment,
+  type PriorReview,
 } from "./pr-assignments.ts";
 import {
   candidatePublications,
@@ -156,7 +157,7 @@ export function createPrCoordinator({
       return pr.unchanged(guard);
     }
 
-    async function dispatch(assignment: PrAssignment) {
+    async function dispatch(assignment: PrAssignment, priorReview?: PriorReview) {
       const configured = config[assignment.input.role];
       if (
         configured.agent.agentName !== assignment.agentName ||
@@ -223,6 +224,7 @@ export function createPrCoordinator({
         assignment,
         target,
         direction && direction.id <= assignment.operatorVersion ? direction.reason : undefined,
+        priorReview,
       );
       const result = await execute({
         id: assignment.executionId,
@@ -391,6 +393,7 @@ export function createPrCoordinator({
             findingIds: assignment.claim.findingIds,
           });
       }
+      let priorReview: PriorReview | undefined;
       for (const assignment of assignments) {
         const recovered = assignment.id === pending?.id ? recovery : undefined;
         const claim = recovered?.claim ?? assignment.claim;
@@ -413,8 +416,14 @@ export function createPrCoordinator({
           claim.outcome === "clean" &&
           claim.headSha !== workflow.headSha
         ) {
-          // An old clean review has no findings to carry onto the new head.
-          if (!assignment.proof) pr.supersede(guard, assignment);
+          // An old clean review can guide scope but carries no findings or readiness forward.
+          if (!assignment.proof) {
+            pr.supersede(guard, assignment);
+          } else if (!conflictingReviews(snapshot, assignment, claim, supersededReviewIds).length) {
+            const evidence = await publicationProof(github, target, snapshot, assignment, signal);
+            if (evidence?.proof === assignment.proof)
+              priorReview = { headSha: claim.headSha, reviewId: claim.reviewId };
+          }
           continue;
         }
         const revision = "publishedHeadSha" in claim;
@@ -533,6 +542,8 @@ export function createPrCoordinator({
           if (!recorded) return true;
         }
         if ("reviewId" in claim) {
+          if (claim.headSha !== workflow.headSha)
+            priorReview = { headSha: claim.headSha, reviewId: claim.reviewId };
           verifiedReviews.push({
             assignment,
             findingIds: claim.findingIds,
@@ -716,7 +727,7 @@ export function createPrCoordinator({
           ? pr.retry(guard, unlaunched)
           : unlaunched
         : pr.reserve(guard, next, agent.agentName, producerId);
-      return assignment ? await dispatch(assignment) : false;
+      return assignment ? await dispatch(assignment, priorReview) : false;
     } catch (error) {
       wait();
       throw error;
