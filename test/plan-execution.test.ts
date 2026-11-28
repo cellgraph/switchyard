@@ -598,6 +598,32 @@ it("holds multiple candidates and invalid evidence, then honors an explicit veri
   expect(f.store.prWorkflows().list(`${target.repository}#5`)).toEqual([]);
 });
 
+it.each([false, true])(
+  "rechecks the reserved branch on retry when candidate reappears: %s",
+  async (reappears) => {
+    const f = await fixture();
+    await f.sweep();
+    const first = f.assignment();
+    f.publish(1, 5, head);
+    f.pulls.delete(5);
+    f.advance(180_000);
+    await f.sweep();
+    expect(f.read().attention?.reason).toContain("The reported PR is missing");
+
+    f.operate({ kind: "retry", assignmentId: first.id, reason: "Authorize replacement." });
+    f.operate({ kind: "resume", reason: "Recheck GitHub before replacing the assignment." });
+    if (reappears) f.openPull(first, 5, head);
+    await f.sweep();
+
+    const increment = f.read().increments[0]!;
+    expect(increment.assignments).toHaveLength(reappears ? 1 : 2);
+    expect(increment.assignments[0]!.claim).toMatchObject({ outcome: "published", pullRequest: 5 });
+    if (reappears)
+      expect(increment.publication).toMatchObject({ pullRequest: 5, source: "native" });
+    else expect(increment.publication).toBeNull();
+  },
+);
+
 it("records consequential direction and requires a fresh grant for a terminal assignment", async () => {
   const f = await fixture();
   await f.sweep();

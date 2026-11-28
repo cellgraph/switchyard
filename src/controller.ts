@@ -164,6 +164,7 @@ export function createController({
     }
     for (const [target, { discover, pullRequests }] of selection) {
       if (signal?.aborted) return false;
+      let discovered = false;
       if (discover) {
         for (const { pullRequest } of pr.requests(target.repository)) pullRequests.add(pullRequest);
         if (coordinatePlans) {
@@ -177,10 +178,10 @@ export function createController({
               pullRequests.add(publication.pullRequest);
           }
         }
-        const discovered = await attempt(target, undefined, async () => {
+        discovered = await attempt(target, undefined, async () => {
           for (const number of await github.listOpenPullRequests(target, signal))
             pullRequests.add(number);
-          github.completeReconciliation(target);
+          if (!coordinatePlans) github.completeReconciliation(target);
           // An untracked PR absent from a complete listing has no active retry owner.
           const prefix = `pr:${target.installationId}:${target.repository}:`;
           retireInactiveGitHubRetry(
@@ -212,7 +213,8 @@ export function createController({
         discover &&
         !(await attempt(target, undefined, async () => {
           await coordinatePlans(target, signal);
-          github.completeReconciliation(target);
+          // Both discovery steps share the repository secondary-rate-limit retry owner.
+          if (discovered) github.completeReconciliation(target);
         }))
       )
         succeeded = false;

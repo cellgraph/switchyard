@@ -1898,6 +1898,56 @@ describe("GitHub App and REST adapter", () => {
     }
   });
 
+  it("pauses after repeated branch discovery throttling despite successful open PR discovery", async () => {
+    const store = new WorkflowStore();
+    let now = Date.UTC(2026, 0, 1);
+    const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+      if (options?.method === "POST")
+        return Response.json({ token: "fixture-token", expires_at: new Date(now + 3_600_000) });
+      const query = requestUrl(input).searchParams;
+      return query.has("head") ? new Response(null, { status: 429 }) : Response.json([]);
+    });
+    try {
+      const rateLimits = store.githubRateLimits();
+      const github = createGitHubReader(
+        createGitHubAppClient({
+          clientId: "fixture-client-id",
+          privateKey,
+          fetcher,
+          rateLimits,
+          now: () => now,
+        }),
+      );
+      const reportError = vi.fn();
+      const controller = createController({
+        store,
+        repositories: [target],
+        github,
+        reconcile: createReconciler(store, github),
+        coordinatePlans: async (repository, signal) => {
+          await github.listBranchPullRequests(repository, "feat/reserved", signal);
+        },
+        reportError,
+        now: () => now,
+      });
+      for (const minutes of [1, 2, 4, 8, 16]) {
+        controller.scheduleSweep();
+        expect(await controller.runPass()).toBe(false);
+        now += minutes * 60_000;
+        expect(rateLimits.get("secondary")?.retryAt).toBe(now);
+      }
+      const requests = fetcher.mock.calls.length;
+      controller.scheduleSweep();
+      expect(await controller.runPass()).toBe(false);
+      expect(reportError).toHaveBeenLastCalledWith(
+        expect.stringContaining("paused after repeated secondary rate limits"),
+      );
+      expect(fetcher).toHaveBeenCalledTimes(requests);
+    } finally {
+      store.close();
+    }
+  });
+
   it("clears the retry count when a PR closes on the final read", async () => {
     const store = new WorkflowStore();
     const now = Date.UTC(2026, 0, 1);

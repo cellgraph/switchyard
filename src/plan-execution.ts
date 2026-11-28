@@ -342,7 +342,14 @@ export function createPlanCoordinator({
         observed?.observation?.evidence !== "conflicting" &&
         (knownTerminal ||
           (latest?.remote?.blockId && observed?.observation?.process.state === "exited"));
-      if (publication && quiescent && (knownTerminal || operatorPublication)) {
+      const retryMissingPublication =
+        direction?.kind === "retry" && knownTerminal && !candidates.length;
+      if (
+        publication &&
+        quiescent &&
+        (knownTerminal || operatorPublication) &&
+        !retryMissingPublication
+      ) {
         const selected = { ...target, pullRequest: publication.pullRequest };
         if (
           !operatorPublication &&
