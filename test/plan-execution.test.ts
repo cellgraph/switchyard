@@ -78,6 +78,33 @@ async function fixture() {
     rmSync(directory, { recursive: true, force: true });
   });
   const pulls = new Map<number, PlanPullRequest>();
+  const mergeEvidence = new Map<number, Record<string, unknown>>();
+  const planReader = createGitHubReader({
+    completeReconciliation() {},
+    async get({ repository }, _suffix, pullRequest) {
+      const pull = pulls.get(pullRequest!)!;
+      return {
+        data: {
+          number: pullRequest,
+          state: pull.state,
+          draft: pull.draft,
+          merged: pull.merged,
+          head: { sha: pull.headSha, ref: pull.headRef, repo: { full_name: pull.headRepository } },
+          base: { ref: pull.baseRef, repo: { full_name: repository } },
+          user: { id: pull.authorId },
+          created_at: pull.createdAt,
+          merged_at: pull.merge?.mergedAt,
+          merged_by: { id: pull.merge?.mergedBy },
+        },
+        hasNext: false,
+      };
+    },
+    async readPlanMerge({ repository, pullRequest }) {
+      return {
+        repository: { nameWithOwner: repository, pullRequest: mergeEvidence.get(pullRequest) },
+      };
+    },
+  });
   const reviews = new Map<number, Record<string, unknown>[]>();
   const outputs = new Map<string, Result>();
   const calls: Array<Parameters<Execute>[0]> = [];
@@ -100,9 +127,7 @@ async function fixture() {
     async listOpenPullRequests() {
       return [...pulls].filter(([, pull]) => pull.state === "open").map(([number]) => number);
     },
-    async readPlanPullRequest({ pullRequest }: { pullRequest: number }) {
-      return structuredClone(pulls.get(pullRequest)!);
-    },
+    readPlanPullRequest: planReader.readPlanPullRequest,
     async readPullRequest({ pullRequest }: { pullRequest: number }) {
       return structuredClone(pulls.get(pullRequest)!);
     },
@@ -193,6 +218,13 @@ async function fixture() {
     pull.state = "closed";
     pull.merged = true;
     pull.merge = { mergeSha, mergedBy: 71, mergedAt: timestamp() };
+    mergeEvidence.set(pullRequest, {
+      number: pullRequest,
+      merged: true,
+      headRefOid: pull.headSha,
+      mergedAt: pull.merge.mergedAt,
+      mergeCommit: { oid: mergeSha },
+    });
   }
 
   const execute: Execute = async (request) => {
@@ -317,6 +349,7 @@ async function fixture() {
     openPull,
     publish,
     merge,
+    mergeEvidence,
     pulls,
     calls,
     errors,
@@ -377,7 +410,7 @@ it("pins approval to the GitHub commit and blob and snapshots only ordered incre
       };
     return { data: { full_name: "cellgraph/fixture", default_branch: "main" }, hasNext: false };
   });
-  const github = createGitHubReader({ get, completeReconciliation() {} });
+  const github = createGitHubReader({ get, readPlanMerge: vi.fn(), completeReconciliation() {} });
   await expect(loadApproval(github, target, path, "main")).rejects.toThrow("full 40-character");
   expect(get).not.toHaveBeenCalled();
   const approved = await loadApproval(github, target, path, revision);
@@ -451,6 +484,17 @@ it("runs two increments in order through the real Phase D coordinator and waits 
   await f.sweep();
   expect(f.calls).toHaveLength(2);
   f.merge(5);
+  const evidence = f.mergeEvidence.get(5)!;
+  f.mergeEvidence.set(5, { ...evidence, headRefOid: secondHead });
+  expect(await f.sweep()).toBe(false);
+  expect(f.read().increments[0]!.merge).toBeNull();
+  expect(f.read().increments[1]!.assignments).toEqual([]);
+  expect(f.calls).toHaveLength(2);
+  expect(f.errors.splice(0)).toEqual([
+    `${target.repository}#5: GitHub did not identify the PR merge.`,
+    `${target.repository}: GitHub did not identify the PR merge.`,
+  ]);
+  f.mergeEvidence.set(5, evidence);
   f.restart();
   await f.sweep();
   expect(f.read().increments[0]!.merge).toMatchObject({ headSha: head, mergeSha, mergedBy: 71 });

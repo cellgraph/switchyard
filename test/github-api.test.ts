@@ -1695,9 +1695,90 @@ describe("GitHub App and REST adapter", () => {
     expect(fetcher).toHaveBeenCalledTimes(3);
   });
 
+  it.each(["verified", "missing commit", "partial response", "wrong PR"] as const)(
+    "reads plan merge evidence with the read-only installation token (%s)",
+    async (evidence) => {
+      const mergedAt = "2026-11-28T07:00:50Z";
+      const repository = { full_name: target.repository };
+      const fetcher = vi.fn<typeof fetch>(async (input, options) => {
+        const path = requestUrl(input).pathname;
+        if (path === "/app/installations/42/access_tokens") {
+          expect(JSON.parse(String(options?.body))).toEqual({
+            repositories: ["repo"],
+            permissions: {
+              pull_requests: "read",
+              checks: "read",
+              statuses: "read",
+              issues: "read",
+              contents: "read",
+            },
+          });
+          return Response.json({
+            token: "fixture-token",
+            expires_at: new Date(Date.now() + 3_600_000),
+          });
+        }
+        expect(new Headers(options?.headers).get("authorization")).toBe("Bearer fixture-token");
+        if (path === "/repos/owner/repo/pulls/7")
+          return Response.json({
+            number: 7,
+            state: "closed",
+            draft: false,
+            merged: true,
+            head: { sha, ref: "feat/increment", repo: repository },
+            base: { ref: "main", repo: repository },
+            user: { id: 17 },
+            created_at: "2026-11-28T06:00:00Z",
+            merged_at: mergedAt,
+            merged_by: { id: 71 },
+          });
+        expect(path).toBe("/graphql");
+        expect(options?.method).toBe("POST");
+        const body = JSON.parse(String(options?.body));
+        expect(body.query).toMatch(/^query SwitchyardPlanMerge\(/);
+        expect(body.variables).toEqual({ owner: "owner", repo: "repo", pr: 7 });
+        return Response.json({
+          data: {
+            repository: {
+              nameWithOwner: target.repository,
+              pullRequest: {
+                number: evidence === "wrong PR" ? 8 : 7,
+                headRefOid: sha,
+                merged: true,
+                mergedAt,
+                mergeCommit: evidence === "missing commit" ? null : { oid: otherSha },
+              },
+            },
+          },
+          ...(evidence === "partial response" ? { errors: [{ message: "Incomplete" }] } : {}),
+        });
+      });
+      const client = createGitHubAppClient({
+        clientId: "fixture-client-id",
+        privateKey,
+        fetcher,
+        workflowEvidence: () => true,
+        canReadPullRequestChecks: () => false,
+      });
+      const observation = createGitHubReader(client).readPlanPullRequest(
+        target,
+        undefined,
+        "repository",
+      );
+      if (evidence === "verified")
+        await expect(observation).resolves.toMatchObject({
+          headSha: sha,
+          merge: { mergeSha: otherSha, mergedAt, mergedBy: 71 },
+        });
+      else await expect(observation).rejects.toThrow(/PR merge|plan merge query/);
+      expect(fetcher).toHaveBeenCalledTimes(3);
+    },
+  );
+
   it("rejects legacy statuses resolved to a different SHA", async () => {
     const api = createGitHubReader({
       completeReconciliation: vi.fn(),
+      readPlanMerge: vi.fn(),
       async get(_target, suffix) {
         return {
           data: suffix.includes("check-runs")

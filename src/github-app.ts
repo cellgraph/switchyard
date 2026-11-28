@@ -116,6 +116,7 @@ type ApiRequest = {
   path: string;
   reconcilePullRequest?: number | undefined;
   repositoryReconciliation?: boolean | undefined;
+  reviewThread?: boolean | undefined;
   commitRetryKey?: string | undefined;
   drainSignal?: AbortSignal | undefined;
 } & (
@@ -262,6 +263,7 @@ export function createGitHubAppClient({
       body,
       reconcilePullRequest,
       repositoryReconciliation,
+      reviewThread,
       commitRetryKey,
       drainSignal,
     }: ApiRequest,
@@ -271,7 +273,7 @@ export function createGitHubAppClient({
     checkAuthentication(target);
     if (
       reconcilePullRequest !== undefined &&
-      (commitRetryKey || path === "/graphql") &&
+      (commitRetryKey || reviewThread) &&
       !canReadPullRequestChecks(target, reconcilePullRequest)
     )
       throw new Error("Pull request reconciliation was stopped.");
@@ -457,9 +459,66 @@ export function createGitHubAppClient({
     return token;
   }
 
+  async function installationRead(target: GitHubRepository, read: ApiRequest): Promise<Response> {
+    const cacheKey = `${target.installationId}:${target.repository}`;
+    const { reconcilePullRequest, drainSignal } = read;
+    let token = await tokenFor(target, cacheKey, reconcilePullRequest, drainSignal);
+    let response = await request(target, read, token.value);
+    if (response.status === 401) {
+      tokens.delete(cacheKey);
+      token = await tokenFor(target, cacheKey, reconcilePullRequest, drainSignal);
+      response = await request(target, read, token.value);
+      if (response.status === 401) {
+        tokens.delete(cacheKey);
+        rejectAuthentication(target);
+      }
+    }
+    return response;
+  }
+
   return {
     completeReconciliation(target: GitHubRepository, pullRequest?: number): void {
       clearSecondaryAttempts(now(), (key) => belongsToReconciliation(key, target, pullRequest));
+    },
+
+    readPlanMerge(
+      target: GitHubRepository & { pullRequest: number },
+      drainSignal?: AbortSignal,
+      retryScope?: "repository",
+    ): Promise<unknown> {
+      const query = `query SwitchyardPlanMerge($owner: String!, $repo: String!, $pr: Int!) {
+        repository(owner: $owner, name: $repo) {
+          nameWithOwner
+          pullRequest(number: $pr) {
+            number merged mergedAt headRefOid mergeCommit { oid }
+          }
+        }
+      }`;
+      const [owner, repo] = target.repository.split("/");
+      return queueRead(target.installationId, async () => {
+        checkGitHubDrain(drainSignal);
+        checkAuthentication(target);
+        const repositoryReconciliation = retryScope === "repository";
+        checkRetryDeadline(
+          repositoryReconciliation
+            ? repositoryRetryKey(target)
+            : pullRequestRetryKey(target, target.pullRequest),
+        );
+        const response = await installationRead(target, {
+          path: "/graphql",
+          method: "POST",
+          reconcilePullRequest: target.pullRequest,
+          repositoryReconciliation,
+          drainSignal,
+          body: JSON.stringify({ query, variables: { owner, repo, pr: target.pullRequest } }),
+        });
+        if (!response.ok)
+          throw new Error(`GitHub plan merge query failed (HTTP ${response.status}).`);
+        const payload = object(await readJson(response));
+        if (payload?.errors !== undefined)
+          throw new Error("GitHub returned errors for the plan merge query.");
+        return payload?.data;
+      });
     },
 
     readReviewThread(
@@ -489,6 +548,7 @@ export function createGitHubAppClient({
               path: "/graphql",
               method: "POST",
               reconcilePullRequest: target.pullRequest,
+              reviewThread: true,
               body: JSON.stringify({
                 query,
                 variables: { owner, repo, pr: target.pullRequest, after },
@@ -540,7 +600,6 @@ export function createGitHubAppClient({
       drainSignal?: AbortSignal,
       retryScope?: "repository",
     ): Promise<{ data: unknown; hasNext: boolean }> {
-      const cacheKey = `${target.installationId}:${target.repository}`;
       const path = `/repos/${target.repository}${suffix}`;
       const prRetryKey =
         reconcilePullRequest === undefined
@@ -571,17 +630,7 @@ export function createGitHubAppClient({
           repositoryReconciliation ? repositoryRetryKey(target) : prRetryKey,
           commitRetryKey,
         );
-        let token = await tokenFor(target, cacheKey, reconcilePullRequest, drainSignal);
-        let response = await request(target, read, token.value);
-        if (response.status === 401) {
-          tokens.delete(cacheKey);
-          token = await tokenFor(target, cacheKey, reconcilePullRequest, drainSignal);
-          response = await request(target, read, token.value);
-          if (response.status === 401) {
-            tokens.delete(cacheKey);
-            rejectAuthentication(target);
-          }
-        }
+        const response = await installationRead(target, read);
         if (!response.ok) throw new GitHubResponseError(response.status, path);
         return {
           data: await readJson(response),

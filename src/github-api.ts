@@ -76,7 +76,7 @@ function gitHubDate(value: unknown): value is string {
 }
 
 export function createGitHubReader(
-  client: Pick<GitHubAppClient, "get" | "completeReconciliation">,
+  client: Pick<GitHubAppClient, "get" | "readPlanMerge" | "completeReconciliation">,
   checkApps: ReadonlyMap<string, ReadonlyMap<string, number>> = new Map(),
 ) {
   async function list(
@@ -193,7 +193,6 @@ export function createGitHubReader(
       const baseRef = object(pull.base)?.ref;
       const authorId = object(pull.user)?.id;
       const { created_at: createdAt, merged_at: mergedAt } = pull;
-      const mergeSha = commitSha(pull.merge_commit_sha);
       const mergedBy = object(pull.merged_by)?.id;
       if (
         typeof headRef !== "string" ||
@@ -206,7 +205,22 @@ export function createGitHubReader(
         throw new Error("GitHub did not identify the PR branches or author.");
       let merge = null;
       if (snapshot.merged) {
-        if (!mergeSha || !gitHubDate(mergedAt) || !positiveInteger(mergedBy))
+        if (!gitHubDate(mergedAt) || !positiveInteger(mergedBy))
+          throw new Error("GitHub did not identify the PR merge.");
+        // The versioned REST pull request omits merge_commit_sha.
+        const evidence = object(await client.readPlanMerge(target, signal, retryScope));
+        const repository = object(evidence?.repository);
+        const mergedPull = object(repository?.pullRequest);
+        const mergeSha = commitSha(object(mergedPull?.mergeCommit)?.oid);
+        if (
+          repositoryName(repository?.nameWithOwner) !== target.repository ||
+          mergedPull?.number !== target.pullRequest ||
+          mergedPull.merged !== true ||
+          commitSha(mergedPull.headRefOid) !== snapshot.headSha ||
+          !gitHubDate(mergedPull.mergedAt) ||
+          Date.parse(mergedPull.mergedAt) !== Date.parse(mergedAt) ||
+          !mergeSha
+        )
           throw new Error("GitHub did not identify the PR merge.");
         merge = { mergeSha, mergedAt, mergedBy };
       }
