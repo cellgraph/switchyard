@@ -1616,7 +1616,7 @@ describe("autonomous PR coordination", () => {
     expect(f.store.getWorkflow(otherId)?.githubStatus).toBe("closed");
   });
 
-  it.each(["abandoned continuation", "changed Rex executable"])(
+  it.each(["abandoned continuation", "changed Rex executable", "changed reasoning effort"])(
     "starts a fresh Implementer session after %s",
     async (cause) => {
       const f = fixture();
@@ -1640,6 +1640,8 @@ describe("autonomous PR coordination", () => {
           .prWorkflows()
           .operate(id, { kind: "resume", reason: "Start a fresh native session." });
         f.unavailable = null;
+      } else if (cause === "changed reasoning effort") {
+        f.configured.implementer.agent.context.reasoningEffort = "high";
       } else {
         f.configured.implementer.agent.rex!.executable = "/opt/new-rex";
       }
@@ -1647,6 +1649,7 @@ describe("autonomous PR coordination", () => {
       const next = f.calls.at(-1)!;
       expect(next.sessionId).toBeUndefined();
       expect(next.rex?.executable).toBe(f.configured.implementer.agent.rex!.executable);
+      expect(next.context).toEqual(f.configured.implementer.agent.context);
     },
   );
 

@@ -874,7 +874,9 @@ it("adds plan tables to Phase D SQLite while preserving existing workflows", () 
     });
     original.close();
     const raw = new DatabaseSync(dbPath);
-    raw.exec("DROP TABLE plan_pull_requests; DROP TABLE plan_executions; PRAGMA user_version=22;");
+    raw.exec(
+      "DROP TABLE plan_pull_requests; DROP TABLE plan_executions; ALTER TABLE agent_sessions DROP COLUMN reasoning_effort; PRAGMA user_version=22;",
+    );
     raw.close();
     const upgraded = new WorkflowStore(dbPath);
     try {
