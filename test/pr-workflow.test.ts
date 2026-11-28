@@ -461,6 +461,25 @@ describe("autonomous PR coordination", () => {
     expect(f.calls).toHaveLength(4);
   });
 
+  it("requires the Reviewer to publish its own findings when an earlier review raised the issue", async () => {
+    const f = fixture();
+    f.hasFinding = true;
+    f.editEvidence = () => {
+      f.comments[0]!.pull_request_review_id = 12345;
+    };
+
+    await f.tick();
+    expect(f.calls[0]?.prompt).toContain("Prior Switchyard findings for this assignment: []");
+    expect(f.calls[0]?.prompt).toContain("publish your own root inline finding in this review");
+    expect(f.calls[0]?.prompt).toContain(
+      "Outcome findings requires at least one root inline finding ID from this review.",
+    );
+    await f.tick();
+
+    expect(f.workflow?.state).toBe("escalated");
+    expect(f.roles).toEqual(["reviewer"]);
+  });
+
   it("observes a durable explicit initiation absent from discovery and keeps draft and fork requests ineligible", async () => {
     const f = fixture();
     f.discovery = [];

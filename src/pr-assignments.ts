@@ -169,9 +169,10 @@ export function assignmentTurn(
       prompt.push(
         "Independently review the exact head and run relevant validation. Use a separate worktree if needed. Do not edit, commit, or push to the PR.",
         "Publish one submitted GitHub COMMENT review with commit_id set to the exact target head. Publish each actionable finding as a root inline comment in that same review. Start the review body with 'Review outcome: clean' or 'Review outcome: findings', then summarize validation.",
-        "For each prior finding you independently verify as fixed at this head, add a separate 'Resolved finding: FULL_FINDING_URL' line to the review body. Leave unresolved prior findings out of resolvedFindingIds. Avoid duplicating prior findings as new inline comments.",
-        `Prior accepted findings and findings requiring replacement evidence: ${JSON.stringify(links(input.previousFindingIds))}`,
-        "Return the numeric REST review ID, outcome, all root inline finding IDs, and the resolved prior finding IDs. Return empty arrays where applicable. When you cannot publish a complete review return outcome incomplete and a null reviewId.",
+        `Prior Switchyard findings for this assignment: ${JSON.stringify(links(input.previousFindingIds))}`,
+        "Only the listed Switchyard findings are exempt from new inline publication. If you independently confirm an actionable issue already raised in another review and it is outside that list, publish your own root inline finding in this review.",
+        "For each listed finding you independently verify as fixed at this head, add a separate 'Resolved finding: FULL_FINDING_URL' line to the review body and include its ID in resolvedFindingIds. Leave unresolved listed findings out of resolvedFindingIds.",
+        "Return the numeric REST review ID, outcome, all root inline finding IDs from this review, and the resolved prior finding IDs. Outcome findings requires at least one root inline finding ID from this review. When you cannot publish a complete review return outcome incomplete and a null reviewId.",
       );
       break;
     case "adjudicator":
