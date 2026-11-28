@@ -444,6 +444,43 @@ describe("autonomous PR coordination", () => {
     f.controller.scheduleSweep();
     for (let step = 0; step < 5; step += 1) expect(await f.controller.runPass()).toBe(true);
     expect(f.roles).toEqual(["reviewer", "adjudicator", "implementer", "reviewer"]);
+    const initial = f.calls[0]?.prompt;
+    const adjudication = f.calls[1]?.prompt;
+    const followUp = f.calls[3]?.prompt;
+    const reviewReference = `#pullrequestreview-${String(f.reviews[0]?.id)}`;
+    expect(initial).toContain(
+      "Conduct a comprehensive independent review of the PR against its base",
+    );
+    expect(initial).not.toContain("Prior verified review at");
+    expect(followUp).toContain(`Prior verified review at ${heads[0]}`);
+    expect(followUp).toContain(reviewReference);
+    expect(followUp).toContain(findingUrl(target, f.findingId));
+    expect(followUp).toContain(
+      "verifying corrections, checking affected invariants and looking for regressions",
+    );
+    expect(followUp).toContain(
+      "Broaden the review when substantial changes or material architectural changes warrant it",
+    );
+    expect(followUp).toContain("comparison or prior review is insufficient");
+    for (const prompt of [initial, followUp]) {
+      expect(prompt).toContain(
+        "In every round, report newly discovered consequential defects, including those outside the revision diff",
+      );
+      expect(prompt).toContain(
+        "the plausible trigger, the consequence and the behavior that needs correction",
+      );
+    }
+    expect(adjudication).toContain("likelihood, impact, recoverability and correction cost");
+    expect(adjudication).toContain("A technically valid finding may be nonblocking");
+    expect(adjudication).toContain("Accept findings that warrant correction before acceptance");
+    expect(adjudication).toContain("Reject unsupported or immaterial findings");
+    expect(adjudication).toContain("Defer worthwhile nonblocking work with a linked issue");
+    expect(adjudication).toContain(
+      "Escalate consequential decisions that require operator judgment",
+    );
+    expect(adjudication).toContain(
+      "create a same-repository GitHub issue whose body contains the full finding URL",
+    );
     expect(f.workflow).toMatchObject({
       state: "ready",
       headSha: heads[1],
@@ -569,6 +606,11 @@ describe("autonomous PR coordination", () => {
       await f.tick();
       expect(f.workflow?.state).toBe("ready");
       expect(f.allowance.revisions.reservedOrUsed).toBe(1);
+      expect(f.calls.at(-1)?.prompt).toContain(`Prior verified review at ${heads[0]}`);
+      if (!hasFinding)
+        expect(f.calls.at(-1)?.prompt).toContain(
+          "Prior Switchyard findings for this assignment: []",
+        );
     },
   );
 
@@ -597,6 +639,9 @@ describe("autonomous PR coordination", () => {
     f.reviews.length = 0;
     f.move(1);
     await f.tick();
+    expect(f.workflow?.state).toBe("awaiting_review");
+    expect(f.calls.at(-1)?.prompt).toContain("Conduct a comprehensive independent review");
+    expect(f.calls.at(-1)?.prompt).not.toContain("Prior verified review at");
     await f.tick();
     expect(f.roles).toEqual(["reviewer", "reviewer"]);
     expect(f.workflow).toMatchObject({ state: "ready", headSha: heads[1] });
