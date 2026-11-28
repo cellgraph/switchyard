@@ -63,6 +63,8 @@ Resume to verify the references and confirm quiescence from the correlated Rex b
 
 The default limits are three Reviewer rounds and three Implementer revisions. Review corrections and required CI failures share the revision limit. A revision requires an available subsequent review round. Pending CI can settle before a combined fix is assigned. Grant and resume explicitly when further execution is needed. GitHub closure stops coordination and reopening can reactivate the existing workflow. Operator holds remain effective. GitHub merge is recorded as an observed terminal state.
 
+Use an allowance pause to reassess the value of another round. Inspect the unresolved findings, the scope of the latest revision and any outstanding required checks. Before granting additional execution, identify what consequential risk or required evidence the next assignment would address. The handoff requirements still apply at the limit. [Risk-based review guidance](reviews.md#risk-based-review)
+
 ## Verify handoff evidence
 
 The Reviewer submits a review on the exact head and returns its numeric REST ID and all root inline finding IDs. The review states its outcome and identifies any previously accepted finding independently verified as fixed. The Adjudicator publishes each decision and its reasoning as a direct inline reply. For a deferral the reply references a same-repository issue that links to the finding. The Implementer publishes a verified signed commit directly atop the assigned head. A changed head requires exact-head review and checks. Older accepted findings remain blocking until a current-head review verifies their resolution.
