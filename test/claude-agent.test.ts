@@ -15,7 +15,13 @@ const fixture = `
   const valueOf = (flag) => args[args.indexOf(flag) + 1];
   const id = args.includes("--resume") ? valueOf("--resume") : ${JSON.stringify(nativeId)};
   const emit = (message) => console.log(JSON.stringify(message));
-  if (prompt === "auth stderr") {
+  if (prompt.startsWith("effort rejection")) {
+    const effort = prompt === "effort rejection mismatch" ? "ultra" : "xhigh";
+    if (prompt === "effort rejection with output")
+      emit({ type: "system", subtype: "init", session_id: id });
+    console.error("error: option '--effort <level>' argument '" + effort + "' is invalid. It must be one of: low, medium, high, max");
+    process.exitCode = prompt === "effort rejection zero exit" ? 0 : 1;
+  } else if (prompt === "auth stderr") {
     console.error("Not logged in: secret diagnostics");
     process.exitCode = 1;
   } else {
@@ -144,6 +150,40 @@ it("reports launch, native execution and authentication failures without raw dia
     reason: "Could not launch the Claude Code CLI.",
   });
 });
+
+it("reports an explicit effort rejected by the CLI parser before start or resume", async () => {
+  const local = createClaudeAgent({
+    provider: "claude-code",
+    workingDirectory: directory,
+    reasoningEffort: "xhigh",
+  });
+  const turn = { prompt: "effort rejection", onSession: vi.fn() };
+  const rejection = {
+    outcome: "not_started",
+    reason:
+      "The installed Claude Code CLI rejected the requested reasoning effort. Use a supported effort level or update the CLI.",
+  };
+  expect(await local.start(turn)).toEqual(rejection);
+  expect(await local.resume(nativeId, turn)).toEqual(rejection);
+  expect(turn.onSession).not.toHaveBeenCalled();
+});
+
+it.each(["with output", "mismatch", "zero exit"])(
+  "preserves uncertainty for an effort diagnostic %s",
+  async (suffix) => {
+    const local = createClaudeAgent({
+      provider: "claude-code",
+      workingDirectory: directory,
+      reasoningEffort: "xhigh",
+    });
+    expect(await local.start({ prompt: `effort rejection ${suffix}`, onSession: vi.fn() })).toEqual(
+      {
+        outcome: "unknown",
+        reason: "Claude Code did not report a complete terminal result.",
+      },
+    );
+  },
+);
 
 it("distinguishes a zero exit with no terminal result from a terminal result with no response", async () => {
   const local = adapter();

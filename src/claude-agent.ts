@@ -37,7 +37,7 @@ export function createClaudeAgent({
     } catch {
       return { outcome: "not_started", reason: "Could not launch the Claude Code CLI." };
     }
-    const exit = new Promise<void>((resolve) => child.once("close", () => resolve()));
+    const exit = new Promise<number | null>((resolve) => child.once("close", resolve));
     let launched = false;
     let processError = false;
     let stderr = "";
@@ -54,11 +54,13 @@ export function createClaudeAgent({
     child.stdin.on("error", () => {});
     child.stdin.end(turn.prompt);
 
+    let receivedOutput = false;
     let invalidEvidence = false;
     let sessionConfirmed = false;
     let terminal: Record<string, unknown> | undefined;
     try {
       for await (const line of createInterface({ input: child.stdout, crlfDelay: Infinity })) {
+        receivedOutput = true;
         if (!line.trim()) continue;
         const event = JSON.parse(line) as Record<string, unknown> | null;
         if (!event || typeof event.type !== "string") {
@@ -84,9 +86,28 @@ export function createClaudeAgent({
       // Keep draining stdout while waiting for the process to close.
       child.stdout.resume();
     }
-    await exit;
+    const exitCode = await exit;
     if (processError && !launched)
       return { outcome: "not_started", reason: "Could not launch the Claude Code CLI." };
+    // The argument parser rejects the request before opening a native session.
+    const rejectedEffort =
+      /^error: option '--effort <level>' argument '([a-z]+)' is invalid\. It must be one of: [a-z]+(?:, [a-z]+)*$/.exec(
+        stderr.trim(),
+      )?.[1];
+    if (
+      reasoningEffort !== undefined &&
+      rejectedEffort === reasoningEffort &&
+      exitCode === 1 &&
+      !receivedOutput &&
+      !invalidEvidence &&
+      !processError &&
+      !turn.signal?.aborted
+    )
+      return {
+        outcome: "not_started",
+        reason:
+          "The installed Claude Code CLI rejected the requested reasoning effort. Use a supported effort level or update the CLI.",
+      };
     const authFailed =
       authenticationFailure(stderr) ||
       authenticationFailure(terminal?.result) ||
