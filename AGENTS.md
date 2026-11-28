@@ -34,6 +34,7 @@ Apply these principles when planning, implementing, and reviewing changes.
 
 ## Git and review
 
+- Use the [risk-based review guidance](docs/reviews.md#risk-based-review) when reporting, adjudicating, or following up on findings.
 - Use semantic commit messages and feature branches. Send changes to `main` through a pull request.
 - Implementation PRs need independent automated Codex review and passing CI. Do not require owner approval by default.
 - Do not change GitHub repository security settings as a workaround for automation.

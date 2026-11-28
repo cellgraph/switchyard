@@ -115,6 +115,12 @@ Persist plan, increment, assignment and PR progress so the controller can resume
 
 **Self-hosting acceptance.** Switchyard executes an approved development plan for the Switchyard repository itself, from the first implementation assignment through subsequent increments. The operator interacts primarily through plan approval, consequential decisions, attention requests and final acceptance. Switchyard carries context between agents without manual prompt transfer.
 
+## Review instruction follow-up
+
+Repeated comprehensive reviews of PR #33 showed diminishing returns as later rounds surfaced narrower variants of the same edge case. For example, successive rounds found that a plan branch reservation could lapse after merge, first for a superseded assignment and then for an unselected PR on the accepted assignment's branch. [Superseded branch finding](https://github.com/cellgraph/switchyard/pull/33#discussion_r4725429979) · [Unselected PR finding](https://github.com/cellgraph/switchyard/pull/33#discussion_r4725545973)
+
+In a future update to Switchyard's assignment instructions, have the Reviewer use targeted follow-up reviews after revisions and have the Adjudicator explicitly apply risk-based judgment when deciding whether a finding blocks acceptance. Preserve exact-head evidence and the ability to surface consequential findings in any round. [Risk-based review guidance](../reviews.md#risk-based-review) · [Operator allowance checkpoints](../autonomous-pr-workflow.md#inspect-and-direct-a-workflow)
+
 ## Remaining implementation choices
 
 - Establish the exact GitHub identities and reference checks that corroborate native structured results, including how to handle evidence edited, deleted or no longer attributable. Determine the minimal source of truth for required-check names and producer identity.
