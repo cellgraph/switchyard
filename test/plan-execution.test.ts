@@ -577,6 +577,7 @@ it("holds multiple candidates and invalid evidence, then honors an explicit veri
   const f = await fixture();
   await f.sweep();
   f.publish(1, 5, head);
+  f.pulls.get(5)!.baseRef = "other";
   f.openPull(f.assignment(), 6, secondHead);
   await f.sweep();
   expect(f.read().attention?.reason).toContain("conflicting pull requests");
@@ -606,6 +607,18 @@ it("holds multiple candidates and invalid evidence, then honors an explicit veri
   await f.sweep();
   expect(f.read().increments[0]!.publication).toMatchObject({ pullRequest: 6, source: "operator" });
   expect(f.assignment().claim).toMatchObject({ pullRequest: 5, headSha: head });
+  expect(f.store.prWorkflows().list(`${target.repository}#5`)).toEqual([]);
+
+  await f.sweep();
+  expect(f.store.findWorkflow(target.repository, 6)?.state).toBe("ready");
+  f.merge(6);
+  await f.sweep();
+  expect(f.read().increments[0]!.merge?.headSha).toBe(secondHead);
+  await f.reconcilePull(5);
+  expect(f.store.findWorkflow(target.repository, 5)).toMatchObject({
+    githubStatus: "eligible",
+    state: "awaiting_review",
+  });
   expect(f.store.prWorkflows().list(`${target.repository}#5`)).toEqual([]);
 });
 
