@@ -36,6 +36,7 @@ type Dependencies = {
   reconcile: ReturnType<typeof createReconciler>;
   execute: ReturnType<typeof createAgentController>["execute"];
   inspect: ReturnType<typeof createRexExecution>["inspect"];
+  otherExecutions?: () => string[];
   now?: () => number;
 };
 
@@ -55,6 +56,7 @@ export function createPrCoordinator({
   reconcile,
   execute,
   inspect,
+  otherExecutions = () => [],
   now = Date.now,
 }: Dependencies) {
   const pr = store.prWorkflows();
@@ -67,7 +69,7 @@ export function createPrCoordinator({
   }
 
   async function reconcileOtherExecutions(workflowId: string) {
-    for (const id of pr.blockingExecutions(workflowId)) {
+    for (const id of [...pr.blockingExecutions(workflowId), ...otherExecutions()]) {
       const result = await inspectExisting(id);
       // A correlated process exit can free this placement for other PRs. The original
       // assignment still needs native evidence or an operator decision.
@@ -85,6 +87,13 @@ export function createPrCoordinator({
     target: PullRequestTarget,
     configuration?: PrWorkflowConfig,
     signal?: AbortSignal,
+    gate?: {
+      allows: () => boolean;
+      confirm: (headSha: string) => Promise<boolean>;
+      implementationExecutionId?: string;
+      implementationProducerId?: number;
+      context?: string;
+    },
   ) => {
     const workflow = store.findWorkflow(target.repository, target.pullRequest);
     if (!workflow) return false;
@@ -92,9 +101,13 @@ export function createPrCoordinator({
     const guard = { workflow, version: pr.version(workflow.id) };
     const assignments = pr.list(workflow.id);
     const pending = assignments.findLast((item) => !item.proof && !item.superseded);
-    if (!configuration || !isActive(workflow) || workflow.githubStatus !== "eligible") {
-      if (!configuration && workflow.state === "ready")
-        store.transition(workflow.id, { type: "readiness", ready: false });
+    if (
+      !configuration ||
+      !isActive(workflow) ||
+      workflow.githubStatus !== "eligible" ||
+      gate?.allows() === false
+    ) {
+      if (workflow.state === "ready") pr.setReady(guard, false);
       if (pending && pr.needsExecutionRecovery(workflow.id)) {
         const observed = await inspectExisting(pending.executionId);
         if ("observation" in observed) {
@@ -118,7 +131,7 @@ export function createPrCoordinator({
 
     async function confirmHead() {
       checkGitHubDrain(signal);
-      if (!pr.unchanged(guard)) return false;
+      if (!pr.unchanged(guard) || gate?.allows() === false) return false;
       const latest = await github.readPullRequest(target, signal);
       checkGitHubDrain(signal);
       if (!pr.unchanged(guard)) return false;
@@ -131,13 +144,14 @@ export function createPrCoordinator({
         });
         throw new PullRequestHeadChangedError();
       }
-      return true;
+      return !gate || (await gate.confirm(latest.headSha));
     }
 
     async function refreshChecks() {
       checkGitHubDrain(signal);
-      if (!pr.unchanged(guard)) return false;
+      if (!pr.unchanged(guard) || gate?.allows() === false) return false;
       await reconcile(target, signal, false);
+      if (gate && !(await gate.confirm(guard.workflow.headSha))) return false;
       checkGitHubDrain(signal);
       return pr.unchanged(guard);
     }
@@ -165,13 +179,22 @@ export function createPrCoordinator({
                 item.producerId === assignment.producerId,
             )
           : undefined;
-      const previousExecution = prior?.proof ? executions.get(prior.executionId) : null;
+      const previousId = prior
+        ? prior.proof
+          ? prior.executionId
+          : undefined
+        : assignment.input.role === "implementer" &&
+            configured.producerId === gate?.implementationProducerId
+          ? gate?.implementationExecutionId
+          : undefined;
+      const previousExecution = previousId ? executions.get(previousId) : null;
       const session =
         previousExecution?.status === "completed"
           ? executions.session(previousExecution.sessionId)
           : null;
       const rex = configured.agent.rex;
       const contextMatches =
+        session?.agentName === configured.agent.agentName &&
         session?.rex &&
         rex &&
         session.rex.endpoint === rex.endpoint &&
@@ -196,21 +219,26 @@ export function createPrCoordinator({
           requiredFailures.some((name) => !failedChecks.includes(name));
         return !ciChanged;
       }
+      const turn = assignmentTurn(
+        assignment,
+        target,
+        direction && direction.id <= assignment.operatorVersion ? direction.reason : undefined,
+      );
       const result = await execute({
         id: assignment.executionId,
         assignmentId: assignment.id,
         ...(contextMatches && session.nativeId ? { sessionId: session.id } : configured.agent),
-        ...assignmentTurn(
-          assignment,
-          target,
-          direction && direction.id <= assignment.operatorVersion ? direction.reason : undefined,
-        ),
+        ...turn,
+        prompt: gate?.context ? `${turn.prompt}\n${gate.context}` : turn.prompt,
         ...(signal ? { signal } : {}),
         confirmLaunch: requiredFailures.length
           ? async () => (await refreshChecks()) && ciStillApplies()
           : confirmHead,
         mayLaunch: () =>
-          !signal?.aborted && pr.unchanged(guard) && (!requiredFailures.length || ciStillApplies()),
+          !signal?.aborted &&
+          gate?.allows() !== false &&
+          pr.unchanged(guard) &&
+          (!requiredFailures.length || ciStillApplies()),
         waitForResult: false,
       });
       const claim = parseClaim(assignment, result.result?.structuredOutput);

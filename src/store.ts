@@ -4,6 +4,7 @@ import { statSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { agentSchema, createAgentStore } from "./agent-store.ts";
 import type { GitHubRateLimits, GitHubRateLimitState, GitHubRepository } from "./github-app.ts";
+import { createPlanStore, planSchema } from "./plan-store.ts";
 import { createPrStore, prSchema } from "./pr-store.ts";
 import { createReviewStore, reviewSchema } from "./review-store.ts";
 import {
@@ -43,7 +44,7 @@ export function localProcessAlive(pid: number | null): boolean {
 }
 
 const applicationId = 0x53575944; // SWYD
-const schemaVersion = 22;
+const schemaVersion = 23;
 const unsupportedDatabase =
   "Unsupported Switchyard database identity or schema version. Use a fresh SWITCHYARD_DB_PATH for this implementation.";
 
@@ -85,6 +86,7 @@ const schema = `
   CREATE TABLE controller_worker (slot INTEGER PRIMARY KEY CHECK(slot=1), record TEXT NOT NULL);
   ${reviewSchema}
   ${prSchema}
+  ${planSchema}
   PRAGMA application_id = ${applicationId};
   PRAGMA user_version = ${schemaVersion};
 `;
@@ -251,6 +253,10 @@ export class WorkflowStore {
     );
   }
 
+  plans() {
+    return createPlanStore(this.#db, (run) => this.#transaction(run));
+  }
+
   reviews() {
     return createReviewStore(this.#db, (run) => this.#transaction(run));
   }
@@ -360,12 +366,17 @@ export class WorkflowStore {
       url.searchParams.set("immutable", "1");
       using probe = new DatabaseSync(url.href, { readOnly: true });
       const { id, version } = databaseIdentity(probe);
-      if (id !== applicationId || version !== schemaVersion) throw new Error(unsupportedDatabase);
+      if (id !== applicationId || (version !== 22 && version !== schemaVersion))
+        throw new Error(unsupportedDatabase);
     }
 
     this.#transaction(() => {
       const { id, version } = databaseIdentity(this.#db);
       if (id === applicationId && version === schemaVersion) return;
+      if (id === applicationId && version === 22) {
+        this.#db.exec(`${planSchema} PRAGMA user_version = ${schemaVersion};`);
+        return;
+      }
       if (
         id !== 0 ||
         version !== 0 ||

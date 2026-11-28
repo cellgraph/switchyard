@@ -62,6 +62,7 @@ export function createController({
   github,
   reconcile,
   coordinate,
+  coordinatePlans,
   reportError,
   signal,
   now = Date.now,
@@ -71,6 +72,7 @@ export function createController({
   github: Pick<GitHubReader, "listOpenPullRequests" | "completeReconciliation">;
   reconcile: (target: PullRequestTarget, signal?: AbortSignal, complete?: boolean) => Promise<void>;
   coordinate?: (target: PullRequestTarget, signal?: AbortSignal) => Promise<boolean>;
+  coordinatePlans?: (target: GitHubRepository, signal?: AbortSignal) => Promise<void>;
   reportError: (message: string) => void;
   signal?: AbortSignal;
   now?: () => number;
@@ -162,12 +164,24 @@ export function createController({
     }
     for (const [target, { discover, pullRequests }] of selection) {
       if (signal?.aborted) return false;
+      let discovered = false;
       if (discover) {
         for (const { pullRequest } of pr.requests(target.repository)) pullRequests.add(pullRequest);
-        const discovered = await attempt(target, undefined, async () => {
+        if (coordinatePlans) {
+          for (const plan of store.plans().list(target.repository)) {
+            const publication = plan.increments.find(({ merge }) => !merge)?.publication;
+            if (
+              publication &&
+              store.findWorkflow(target.repository, publication.pullRequest)?.githubStatus !==
+                "merged"
+            )
+              pullRequests.add(publication.pullRequest);
+          }
+        }
+        discovered = await attempt(target, undefined, async () => {
           for (const number of await github.listOpenPullRequests(target, signal))
             pullRequests.add(number);
-          github.completeReconciliation(target);
+          if (!coordinatePlans) github.completeReconciliation(target);
           // An untracked PR absent from a complete listing has no active retry owner.
           const prefix = `pr:${target.installationId}:${target.repository}:`;
           retireInactiveGitHubRetry(
@@ -194,6 +208,16 @@ export function createController({
         )
           succeeded = false;
       }
+      if (
+        coordinatePlans &&
+        discover &&
+        !(await attempt(target, undefined, async () => {
+          await coordinatePlans(target, signal);
+          // Both discovery steps share the repository secondary-rate-limit retry owner.
+          if (discovered) github.completeReconciliation(target);
+        }))
+      )
+        succeeded = false;
     }
     retireInactiveGitHubRetry(rateLimits, isRetryOwnerActive);
     return succeeded && !signal?.aborted;
