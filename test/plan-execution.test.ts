@@ -321,6 +321,10 @@ async function fixture() {
     calls,
     errors,
     sweep,
+    reconcilePull(pullRequest: number) {
+      controller.notify({ ...target, pullRequest });
+      return controller.runPass();
+    },
     approved,
     github,
     operate,
@@ -630,6 +634,82 @@ it.each([false, true])(
     else expect(increment.publication).toBeNull();
   },
 );
+
+it.each([false, true])(
+  "holds a late PR from a superseded assignment when replacement is already associated: %s",
+  async (associated) => {
+    const f = await fixture();
+    await f.sweep();
+    const first = f.assignment();
+    f.publish(1, 5, head);
+    f.pulls.delete(5);
+    f.advance(180_000);
+    await f.sweep();
+    f.operate({ kind: "retry", assignmentId: first.id, reason: "Authorize replacement." });
+    f.operate({ kind: "resume", reason: "Proceed with the replacement." });
+    await f.sweep();
+    f.publish(1, 6, secondHead);
+    if (associated) {
+      await f.sweep();
+      await f.sweep();
+      await f.sweep();
+      expect(f.store.findWorkflow(target.repository, 6)?.state).toBe("ready");
+      f.merge(6);
+    }
+
+    f.openPull(first, 5, head);
+    f.restart();
+    await f.sweep();
+    expect(f.read()).toMatchObject({
+      state: "attention",
+      attention: {
+        reason: expect.stringContaining("superseded Implementer assignment"),
+        references: expect.arrayContaining([`https://github.com/${target.repository}/pull/5`]),
+      },
+    });
+    expect(f.read().increments[0]!.publication?.pullRequest).toBe(associated ? 6 : undefined);
+    expect(f.read().increments[0]!.merge).toBeNull();
+    expect(f.read().increments[1]!.assignments).toEqual([]);
+
+    f.pulls.get(5)!.state = "closed";
+    f.operate({ kind: "resume", reason: "The superseded PR was closed without merging." });
+    await f.sweep();
+    expect(f.read().state).toBe("running");
+    expect(f.read().increments[0]!.publication?.pullRequest).toBe(6);
+    if (associated) expect(f.read().increments[0]!.merge?.headSha).toBe(secondHead);
+  },
+);
+
+it("withdraws plan handoff on PR-only reconciliation when the base changes at the same head", async () => {
+  const f = await fixture();
+  await f.sweep();
+  f.publish(1, 5, head);
+  await f.sweep();
+  await f.sweep();
+  await f.sweep();
+  const workflow = () => f.store.findWorkflow(target.repository, 5);
+  expect(workflow()).toMatchObject({ state: "ready", headSha: head });
+
+  f.pulls.get(5)!.baseRef = "other";
+  await f.reconcilePull(5);
+  expect(f.read().state).toBe("running");
+  expect(workflow()).toMatchObject({
+    state: "awaiting_review",
+    githubStatus: "eligible",
+    headSha: head,
+  });
+  const out = vi.spyOn(console, "info").mockImplementation(() => {});
+  const reader = () => {
+    throw new Error("Inspection should use the local database.");
+  };
+  await runPlanCommand(["plan", "attention"], f.dbPath, reader);
+  expect(JSON.parse(String(out.mock.lastCall![0]))).toEqual([]);
+
+  f.pulls.get(5)!.baseRef = "main";
+  await f.reconcilePull(5);
+  expect(workflow()).toMatchObject({ state: "ready", headSha: head });
+  expect(f.calls).toHaveLength(2);
+});
 
 it("records consequential direction and requires a fresh grant for a terminal assignment", async () => {
   const f = await fixture();

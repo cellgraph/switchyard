@@ -107,8 +107,7 @@ export function createPrCoordinator({
       workflow.githubStatus !== "eligible" ||
       gate?.allows() === false
     ) {
-      if (!configuration && workflow.state === "ready")
-        store.transition(workflow.id, { type: "readiness", ready: false });
+      if (workflow.state === "ready") pr.setReady(guard, false);
       if (pending && pr.needsExecutionRecovery(workflow.id)) {
         const observed = await inspectExisting(pending.executionId);
         if ("observation" in observed) {

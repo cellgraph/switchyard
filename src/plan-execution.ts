@@ -215,6 +215,26 @@ export function createPlanCoordinator({
       );
     }
 
+    const latePublications = new Set<string>();
+    for (const superseded of increment.assignments.slice(0, -1)) {
+      const candidates = await github.listBranchPullRequests(target, superseded.branch, signal);
+      for (const pullRequest of candidates) {
+        checkGitHubDrain(signal);
+        const selected = { ...target, pullRequest };
+        const snapshot = await github.readPlanPullRequest(selected, signal, "repository");
+        if (snapshot.state === "open" || snapshot.merged) latePublications.add(pullUrl(selected));
+      }
+      checkGitHubDrain(signal);
+    }
+    if (latePublications.size) {
+      pause(
+        "GitHub reports a PR for a superseded Implementer assignment.",
+        "Inspect the competing PRs. Close any open superseded PR without merging before resuming, or stop the plan if it was merged.",
+        [...latePublications],
+      );
+      return;
+    }
+
     if (increment.publication) {
       const { pullRequest } = increment.publication;
       const selected = { ...target, pullRequest };
