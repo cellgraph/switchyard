@@ -15,6 +15,13 @@ export type PullRequestState = {
   merged: boolean;
   headRepository: string | null;
 };
+export type PlanPullRequest = PullRequestState & {
+  headRef: string;
+  baseRef: string;
+  authorId: number;
+  createdAt: string;
+  merge: { mergeSha: string; mergedAt: string; mergedBy: number } | null;
+};
 
 export interface GitHubReader {
   completeReconciliation(target: GitHubRepository, pullRequest?: number): void;
@@ -25,6 +32,47 @@ export interface GitHubReader {
     headSha: string,
     signal?: AbortSignal,
   ): Promise<CheckEvidence[]>;
+}
+
+export type PlanGitHubReader = Pick<
+  ReturnType<typeof createGitHubReader>,
+  | "listBranchPullRequests"
+  | "readPlanPullRequest"
+  | "readPlanFile"
+  | "readDefaultBranch"
+  | "readCommit"
+  | "readComparison"
+>;
+
+function readPullRequestState(data: unknown, target: PullRequestTarget): PullRequestState {
+  const pullRequest = object(data);
+  const head = object(pullRequest?.head);
+  const headSha = commitSha(head?.sha);
+  const state = pullRequest?.state;
+  const headRepository = repositoryName(object(head?.repo)?.full_name);
+  const baseRepository = repositoryName(object(object(pullRequest?.base)?.repo)?.full_name);
+  if (
+    pullRequest?.number !== target.pullRequest ||
+    !headSha ||
+    (state !== "open" && state !== "closed") ||
+    typeof pullRequest.draft !== "boolean" ||
+    typeof pullRequest.merged !== "boolean" ||
+    (state === "open" && pullRequest.merged) ||
+    (!headRepository && head?.repo !== null) ||
+    baseRepository !== target.repository
+  )
+    throw new Error("GitHub returned an invalid pull request response.");
+  return {
+    headSha,
+    state,
+    draft: pullRequest.draft,
+    merged: pullRequest.merged,
+    headRepository: headRepository ?? null,
+  };
+}
+
+function gitHubDate(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
 }
 
 export function createGitHubReader(
@@ -56,16 +104,101 @@ export function createGitHubReader(
     throw new Error(`GitHub pagination limit exceeded for ${path}.`);
   }
 
+  async function pullNumbers(target: GitHubRepository, path: string, signal?: AbortSignal) {
+    const items = await list(target, path, signal);
+    const numbers = items.map((item) => {
+      const number = object(item)?.number;
+      if (!positiveInteger(number))
+        throw new Error("GitHub returned an invalid pull request number.");
+      return number;
+    });
+    return [...new Set(numbers)];
+  }
+
+  async function pullData(target: PullRequestTarget, signal?: AbortSignal) {
+    return (await client.get(target, `/pulls/${target.pullRequest}`, target.pullRequest, signal))
+      .data;
+  }
+
   return {
-    async listOpenPullRequests(target: GitHubRepository, signal?: AbortSignal) {
-      const items = await list(target, "/pulls?state=open&sort=created&direction=asc", signal);
-      const numbers = items.map((item) => {
-        const number = object(item)?.number;
-        if (!positiveInteger(number))
-          throw new Error("GitHub returned an invalid open pull request number.");
-        return number;
-      });
-      return [...new Set(numbers)];
+    listOpenPullRequests(target: GitHubRepository, signal?: AbortSignal) {
+      return pullNumbers(target, "/pulls?state=open&sort=created&direction=asc", signal);
+    },
+    listBranchPullRequests(target: GitHubRepository, branch: string, signal?: AbortSignal) {
+      const owner = target.repository.split("/")[0];
+      return pullNumbers(
+        target,
+        `/pulls?state=all&head=${encodeURIComponent(`${owner}:${branch}`)}`,
+        signal,
+      );
+    },
+    async readDefaultBranch(target: GitHubRepository) {
+      const { data } = await client.get(target, "");
+      const repository = object(data);
+      const branch = repository?.default_branch;
+      if (
+        repositoryName(repository?.full_name) !== target.repository ||
+        typeof branch !== "string" ||
+        !branch
+      )
+        throw new Error("GitHub did not identify the repository's default branch.");
+      return branch;
+    },
+    async readPlanFile(target: GitHubRepository, path: string, revision: string) {
+      const commit = await client.get(target, `/git/commits/${encodeURIComponent(revision)}`);
+      if (commitSha(object(commit.data)?.sha) !== revision)
+        throw new Error("GitHub did not resolve the exact approved commit.");
+      const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+      const { data } = await client.get(
+        target,
+        `/contents/${encodedPath}?ref=${encodeURIComponent(revision)}`,
+      );
+      const file = object(data);
+      const blobSha = commitSha(file?.sha);
+      if (
+        file?.type !== "file" ||
+        file.path !== path ||
+        file.encoding !== "base64" ||
+        !blobSha ||
+        typeof file.content !== "string" ||
+        file.content.length > 96 * 1024
+      )
+        throw new Error(
+          "GitHub did not return a small Markdown file at the exact approved commit.",
+        );
+      const bytes = Buffer.from(file.content, "base64");
+      if (file.size !== bytes.length) throw new Error("GitHub returned incomplete plan content.");
+      return { blobSha, bytes };
+    },
+    async readPlanPullRequest(
+      target: PullRequestTarget,
+      signal?: AbortSignal,
+    ): Promise<PlanPullRequest> {
+      const data = await pullData(target, signal);
+      const snapshot = readPullRequestState(data, target);
+      const pull = object(data)!;
+      const headRef = object(pull.head)?.ref;
+      const baseRef = object(pull.base)?.ref;
+      const authorId = object(pull.user)?.id;
+      const { created_at: createdAt, merged_at: mergedAt } = pull;
+      const mergeSha = commitSha(pull.merge_commit_sha);
+      const mergedBy = object(pull.merged_by)?.id;
+      if (
+        typeof headRef !== "string" ||
+        !headRef ||
+        typeof baseRef !== "string" ||
+        !baseRef ||
+        !positiveInteger(authorId) ||
+        !gitHubDate(createdAt)
+      )
+        throw new Error("GitHub did not identify the PR branches or author.");
+      let merge = null;
+      if (snapshot.merged) {
+        if (!mergeSha || !gitHubDate(mergedAt) || !positiveInteger(mergedBy))
+          throw new Error("GitHub did not identify the PR merge.");
+        merge = { mergeSha, mergedAt, mergedBy };
+      }
+      return { ...snapshot, headRef, baseRef, authorId, createdAt, merge };
     },
     readReviews: (target: PullRequestTarget, signal?: AbortSignal) =>
       list(target, `/pulls/${target.pullRequest}/reviews`, signal, undefined, target.pullRequest),
@@ -96,36 +229,7 @@ export function createGitHubReader(
       target: PullRequestTarget,
       signal?: AbortSignal,
     ): Promise<PullRequestState> {
-      const { data } = await client.get(
-        target,
-        `/pulls/${target.pullRequest}`,
-        target.pullRequest,
-        signal,
-      );
-      const pullRequest = object(data);
-      const head = object(pullRequest?.head);
-      const headSha = commitSha(head?.sha);
-      const state = pullRequest?.state;
-      const headRepository = repositoryName(object(head?.repo)?.full_name);
-      const baseRepository = repositoryName(object(object(pullRequest?.base)?.repo)?.full_name);
-      if (
-        pullRequest?.number !== target.pullRequest ||
-        !headSha ||
-        (state !== "open" && state !== "closed") ||
-        typeof pullRequest.draft !== "boolean" ||
-        typeof pullRequest.merged !== "boolean" ||
-        (state === "open" && pullRequest.merged) ||
-        (!headRepository && head?.repo !== null) ||
-        baseRepository !== target.repository
-      )
-        throw new Error("GitHub returned an invalid pull request response.");
-      return {
-        headSha,
-        state,
-        draft: pullRequest.draft,
-        merged: pullRequest.merged,
-        headRepository: headRepository ?? null,
-      };
+      return readPullRequestState(await pullData(target, signal), target);
     },
 
     async readChecks(target: PullRequestTarget, headSha: string, signal?: AbortSignal) {

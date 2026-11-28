@@ -299,7 +299,7 @@ export async function publicationProof(
 }
 
 export async function includesCommit(
-  github: PublicationReader,
+  github: Pick<PublicationReader, "readComparison">,
   target: PullRequestTarget,
   base: string,
   head: string,

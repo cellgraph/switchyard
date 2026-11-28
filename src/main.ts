@@ -17,6 +17,8 @@ import {
   type GitHubRepository,
 } from "./github-app.ts";
 import { positiveInteger } from "./github-data.ts";
+import { runPlanCommand } from "./plan-command.ts";
+import { createPlanCoordinator, planBlockingExecutions } from "./plan-execution.ts";
 import { canReadPullRequestChecks, createReconciler } from "./reconcile.ts";
 import { runPrCommand } from "./pr-command.ts";
 import { createPrCoordinator } from "./pr-workflow.ts";
@@ -52,7 +54,12 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const dbPath = process.env.SWITCHYARD_DB_PATH ?? "switchyard.sqlite";
   process.umask(0o077);
-  if (runPrCommand(args, dbPath) || (await runAgentCommand(args, dbPath))) return;
+  if (
+    runPrCommand(args, dbPath) ||
+    (await runPlanCommand(args, dbPath, makeReader)) ||
+    (await runAgentCommand(args, dbPath))
+  )
+    return;
   if (args[0] === "--review-status") {
     const workflowId = args[1];
     if (args.length !== 2 || !workflowId) throw new Error("Usage: --review-status WORKFLOW_ID");
@@ -117,6 +124,7 @@ async function main(): Promise<void> {
     const github = makeReader(store, config.repositories, config.checkApps);
     const executions = store.agentExecutions();
     const rex = createRexExecution(executions);
+    const execute = createAgentController(executions, undefined, rex).execute;
     const reconcile = createReconciler(
       store,
       github,
@@ -126,16 +134,25 @@ async function main(): Promise<void> {
       store,
       github,
       reconcile,
-      execute: createAgentController(executions, undefined, rex).execute,
+      execute,
       inspect: rex.inspect,
+      otherExecutions: () => planBlockingExecutions(store),
     });
+    const planCoordinator = createPlanCoordinator({ store, github, execute, inspect: rex.inspect });
     const controller = createController({
       store,
       repositories: config.repositories,
       github,
       reconcile,
-      coordinate: (target, signal) =>
-        coordinator(target, config.workflows.get(target.repository), signal),
+      coordinate: async (target, signal) =>
+        coordinator(
+          target,
+          config.workflows.get(target.repository),
+          signal,
+          await planCoordinator.pullGate(target, signal),
+        ),
+      coordinatePlans: (target, signal) =>
+        planCoordinator.coordinate(target, config.workflows.get(target.repository), signal),
       reportError,
       signal: abort.signal,
     });

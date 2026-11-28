@@ -10,7 +10,7 @@ import type { FindingDisposition, ReviewMetadata } from "../src/review.ts";
 const workflowId = "owner/repo#7";
 const head = "a".repeat(40);
 const nextHead = "b".repeat(40);
-const currentSchemaVersion = 22;
+const currentSchemaVersion = 23;
 const completedAt = "2026-01-01T00:00:00.000Z";
 const review = {
   id: "review-1",
@@ -87,6 +87,8 @@ describe("fresh database and durable review references", () => {
         "pr_assignments",
         "pr_operator_events",
         "pr_attention",
+        "plan_executions",
+        "plan_pull_requests",
       ]),
     );
     for (const obsolete of ["review_snapshots", "review_publications", "finding_actions"])

@@ -62,6 +62,7 @@ export function createController({
   github,
   reconcile,
   coordinate,
+  coordinatePlans,
   reportError,
   signal,
   now = Date.now,
@@ -71,6 +72,7 @@ export function createController({
   github: Pick<GitHubReader, "listOpenPullRequests" | "completeReconciliation">;
   reconcile: (target: PullRequestTarget, signal?: AbortSignal, complete?: boolean) => Promise<void>;
   coordinate?: (target: PullRequestTarget, signal?: AbortSignal) => Promise<boolean>;
+  coordinatePlans?: (target: GitHubRepository, signal?: AbortSignal) => Promise<void>;
   reportError: (message: string) => void;
   signal?: AbortSignal;
   now?: () => number;
@@ -164,6 +166,17 @@ export function createController({
       if (signal?.aborted) return false;
       if (discover) {
         for (const { pullRequest } of pr.requests(target.repository)) pullRequests.add(pullRequest);
+        if (coordinatePlans) {
+          for (const plan of store.plans().list(target.repository)) {
+            const publication = plan.increments.find(({ merge }) => !merge)?.publication;
+            if (
+              publication &&
+              store.findWorkflow(target.repository, publication.pullRequest)?.githubStatus !==
+                "merged"
+            )
+              pullRequests.add(publication.pullRequest);
+          }
+        }
         const discovered = await attempt(target, undefined, async () => {
           for (const number of await github.listOpenPullRequests(target, signal))
             pullRequests.add(number);
@@ -194,6 +207,15 @@ export function createController({
         )
           succeeded = false;
       }
+      if (
+        coordinatePlans &&
+        discover &&
+        !(await attempt(target, undefined, async () => {
+          await coordinatePlans(target, signal);
+          github.completeReconciliation(target);
+        }))
+      )
+        succeeded = false;
     }
     retireInactiveGitHubRetry(rateLimits, isRetryOwnerActive);
     return succeeded && !signal?.aborted;
