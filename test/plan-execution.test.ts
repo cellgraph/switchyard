@@ -676,7 +676,26 @@ it.each([false, true])(
     await f.sweep();
     expect(f.read().state).toBe("running");
     expect(f.read().increments[0]!.publication?.pullRequest).toBe(6);
-    if (associated) expect(f.read().increments[0]!.merge?.headSha).toBe(secondHead);
+    if (associated) {
+      expect(f.read().increments[0]!.merge?.headSha).toBe(secondHead);
+      f.publish(2, 7, head);
+      await f.sweep();
+      await f.sweep();
+      await f.sweep();
+      expect(f.store.findWorkflow(target.repository, 7)?.state).toBe("ready");
+      f.merge(7);
+      await f.sweep();
+      expect(f.read().state).toBe("completed");
+
+      f.pulls.get(5)!.state = "open";
+      f.restart();
+      const calls = f.calls.length;
+      await f.reconcilePull(5);
+      await f.sweep();
+      expect(f.store.prWorkflows().list(`${target.repository}#5`)).toEqual([]);
+      expect(f.store.findWorkflow(target.repository, 5)?.state).toBe("awaiting_review");
+      expect(f.calls).toHaveLength(calls);
+    }
   },
 );
 

@@ -11,6 +11,7 @@ import {
   type PlanAssignment,
   type PlanClaim,
   type PlanExecution,
+  type PlanIncrement,
 } from "./plan-store.ts";
 import type { createRexExecution } from "./rex-execution.ts";
 import type { WorkflowStore } from "./store.ts";
@@ -557,10 +558,17 @@ export function createPlanCoordinator({
         (increment) => increment.publication?.pullRequest === target.pullRequest,
       ),
     );
-    const reservations = repositoryPlans.filter((plan) =>
-      plan.increments.some((increment) => !increment.merge && increment.assignments.length > 0),
-    );
-    if (!bound && !reservations.length) return undefined;
+    function reservedAssignments(increment: PlanIncrement) {
+      // A merge releases only the assignment that supplied the accepted PR.
+      return increment.merge ? increment.assignments.slice(0, -1) : increment.assignments;
+    }
+    if (
+      !bound &&
+      !repositoryPlans.some((plan) =>
+        plan.increments.some((increment) => reservedAssignments(increment).length > 0),
+      )
+    )
+      return undefined;
     const initial = await github.readPlanPullRequest(target, signal);
     const increment = bound?.increments.find(
       (item) => item.publication?.pullRequest === target.pullRequest,
@@ -575,10 +583,7 @@ export function createPlanCoordinator({
               plan.state === "running" &&
               matches(plan, increment.assignments.at(-1)!, snapshot, true)
             );
-          if (
-            !increment.merge &&
-            increment.assignments.some(({ branch }) => snapshot.headRef === branch)
-          )
+          if (reservedAssignments(increment).some(({ branch }) => snapshot.headRef === branch))
             return false;
         }
       }
