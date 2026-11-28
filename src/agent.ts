@@ -1,9 +1,12 @@
+import type { ModelReasoningEffort } from "@openai/codex-sdk";
+
 export type AgentProvider = "codex" | "claude-code";
 
 export type AgentContext = {
   provider: AgentProvider;
   workingDirectory: string;
   model?: string;
+  reasoningEffort?: ModelReasoningEffort;
   configDirectory?: string;
 };
 

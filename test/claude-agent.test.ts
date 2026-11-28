@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createClaudeAgent } from "../src/claude-agent.ts";
@@ -75,6 +76,7 @@ it("starts through the native CLI with inherited configuration and schema passth
     provider: "claude-code",
     workingDirectory: directory,
     model: "sonnet",
+    reasoningEffort: "high",
     configDirectory: "/native/profile",
   });
   const onSession = vi.fn();
@@ -94,6 +96,8 @@ it("starts through the native CLI with inherited configuration and schema passth
       "--verbose",
       "--model",
       "sonnet",
+      "--effort",
+      "high",
       "--json-schema",
       JSON.stringify(outputSchema),
     ],
@@ -162,53 +166,87 @@ it("requests native cancellation and keeps a missing outcome uncertain", async (
   expect((await local.start(turn)).outcome).toBe("not_started");
 });
 
-it("runs, inspects, and continues local assignments across CLI processes without a PR", () => {
-  const prompt = join(directory, "prompt");
-  writeFileSync(prompt, "start");
-  const first = cli(
-    "run",
-    "--provider",
-    "claude-code",
-    "--cwd",
-    directory,
-    "--prompt",
-    prompt,
-    "--execution",
-    "first",
-  );
-  expect(first.status, first.stderr).toBe(0);
-  expect(first.stderr).toBe('Execution ID: "first"\n');
-  const started = JSON.parse(first.stdout);
-  expect(started).toMatchObject({
-    execution: { id: "first", assignmentId: "first", status: "completed" },
-    session: { nativeId, placement: "local" },
-    result: { outcome: "completed" },
-  });
-  const saved = cli("status", "first");
-  expect(saved.status, saved.stderr).toBe(0);
-  expect(JSON.parse(saved.stdout)).toEqual({
-    execution: started.execution,
-    session: started.session,
-  });
-  expect(JSON.parse(cli("recover").stdout)).toEqual({ unknownExecutions: 0 });
+it.each(["named overrides", "legacy defaults"])(
+  "runs, inspects, and continues local assignments with %s",
+  (mode) => {
+    const prompt = join(directory, "prompt");
+    writeFileSync(prompt, "start");
+    const defaults = { provider: "claude-code", workingDirectory: directory };
+    const context =
+      mode === "named overrides"
+        ? { ...defaults, model: "sonnet", reasoningEffort: "high" }
+        : defaults;
+    const agents = join(directory, "agents.json");
+    writeFileSync(
+      agents,
+      JSON.stringify({ agents: { fixture: { placement: "local", ...context } } }),
+    );
+    const first = cli(
+      "run",
+      "--agent",
+      "fixture",
+      "--agents",
+      agents,
+      "--prompt",
+      prompt,
+      "--execution",
+      "first",
+    );
+    expect(first.status, first.stderr).toBe(0);
+    expect(first.stderr).toBe('Execution ID: "first"\n');
+    const started = JSON.parse(first.stdout);
+    expect(started).toMatchObject({
+      execution: { id: "first", assignmentId: "first", status: "completed" },
+      session: { nativeId, placement: "local" },
+      result: { outcome: "completed" },
+    });
+    expect(started.session.context).toEqual(context);
+    const overrides = mode === "named overrides" ? ["--model", "sonnet", "--effort", "high"] : [];
+    const nativeArgs = ["--print", "--output-format", "stream-json", "--verbose", ...overrides];
+    expect(JSON.parse(started.result.response).args).toEqual(nativeArgs);
+    if (mode === "legacy defaults") {
+      using db = new DatabaseSync(join(directory, "local.sqlite"));
+      db.exec("ALTER TABLE agent_sessions DROP COLUMN reasoning_effort; PRAGMA user_version = 23;");
+    }
+    writeFileSync(
+      agents,
+      JSON.stringify({
+        agents: {
+          fixture: { placement: "local", ...defaults, model: "changed", reasoningEffort: "low" },
+        },
+      }),
+    );
+    const saved = cli("status", "first");
+    expect(saved.status, saved.stderr).toBe(0);
+    expect(JSON.parse(saved.stdout)).toEqual({
+      execution: started.execution,
+      session: started.session,
+    });
+    expect(JSON.parse(cli("recover").stdout)).toEqual({ unknownExecutions: 0 });
 
-  writeFileSync(prompt, "continue");
-  const second = cli("run", "--session", started.session.id, "--prompt", prompt);
-  expect(second.status, second.stderr).toBe(0);
-  const continued = JSON.parse(second.stdout);
-  expect(second.stderr).toBe(`Execution ID: ${JSON.stringify(continued.execution.id)}\n`);
-  expect(continued).toMatchObject({
-    execution: { sessionId: started.session.id, status: "completed" },
-    session: started.session,
-  });
-  writeFileSync(prompt, "partial");
-  const uncertain = cli("run", "--session", started.session.id, "--prompt", prompt);
-  expect(uncertain.status, uncertain.stderr).toBe(1);
-  expect(JSON.parse(uncertain.stdout)).toMatchObject({
-    execution: { sessionId: started.session.id, status: "unknown" },
-    session: started.session,
-  });
-});
+    writeFileSync(prompt, "continue");
+    const second = cli("run", "--session", started.session.id, "--prompt", prompt);
+    expect(second.status, second.stderr).toBe(0);
+    const continued = JSON.parse(second.stdout);
+    expect(second.stderr).toBe(`Execution ID: ${JSON.stringify(continued.execution.id)}\n`);
+    expect(continued).toMatchObject({
+      execution: { sessionId: started.session.id, status: "completed" },
+      session: started.session,
+    });
+    expect(JSON.parse(continued.result.response).args).toEqual([
+      ...nativeArgs,
+      "--resume",
+      nativeId,
+    ]);
+    writeFileSync(prompt, "partial");
+    const uncertain = cli("run", "--session", started.session.id, "--prompt", prompt);
+    expect(uncertain.status, uncertain.stderr).toBe(1);
+    expect(JSON.parse(uncertain.stdout)).toMatchObject({
+      execution: { sessionId: started.session.id, status: "unknown" },
+      session: started.session,
+    });
+  },
+);
 
 it("fails a confirmed turn with no structured output, blocks replay and permits continuation", () => {
   const prompt = join(directory, "prompt");

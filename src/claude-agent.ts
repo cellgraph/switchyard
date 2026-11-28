@@ -12,6 +12,7 @@ import {
 export function createClaudeAgent({
   workingDirectory,
   model,
+  reasoningEffort,
   configDirectory,
 }: AgentContext): AgentAdapter {
   async function run(turn: AgentTurn, nativeId?: string): Promise<AgentResult> {
@@ -19,7 +20,8 @@ export function createClaudeAgent({
       return { outcome: "not_started", reason: "Canceled before Claude Code launch." };
 
     const args = ["--print", "--output-format", "stream-json", "--verbose"];
-    if (model) args.push("--model", model);
+    if (model !== undefined) args.push("--model", model);
+    if (reasoningEffort !== undefined) args.push("--effort", reasoningEffort);
     if (nativeId) args.push("--resume", nativeId);
     if (turn.outputSchema !== undefined)
       args.push("--json-schema", JSON.stringify(turn.outputSchema));

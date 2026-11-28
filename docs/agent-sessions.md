@@ -38,7 +38,7 @@ sudo -u switchyard -H /usr/local/bin/rex --autostart=false \
   -S ssh://exedev@switchyard-agent.exe.xyz/run/user/1000/rex/server.sock server status
 ```
 
-The named agent file can contain several entries sharing one VM and Rex session. Each entry needs `provider`, `placement` and an absolute `workingDirectory`. Optional `model` and absolute `configDirectory` apply on the execution host. A named local agent sets `placement` to `local` and omits `rex`.
+The named agent file can contain several entries sharing one VM and Rex session. Each entry needs `provider`, `placement` and an absolute `workingDirectory`. Optional `model`, `reasoningEffort` and absolute `configDirectory` apply on the execution host. A named local agent sets `placement` to `local` and omits `rex`.
 
 ```json
 {
@@ -47,6 +47,8 @@ The named agent file can contain several entries sharing one VM and Rex session.
       "provider": "claude-code",
       "placement": "rex",
       "workingDirectory": "/home/exedev/checkout",
+      "model": "sonnet",
+      "reasoningEffort": "high",
       "rex": {
         "endpoint": "ssh://exedev@switchyard-agent.exe.xyz/run/user/1000/rex/server.sock",
         "session": "session:00000000-0000-0000-0000-000000000000",
@@ -59,6 +61,17 @@ The named agent file can contain several entries sharing one VM and Rex session.
   }
 }
 ```
+
+Map the Reviewer, Adjudicator and Implementer roles to named agents in the [PR workflow configuration](autonomous-pr-workflow.md). Each named agent can request its own model and effort independently.
+
+| Provider    | Native option              | Supported `reasoningEffort` values                                        |
+| ----------- | -------------------------- | ------------------------------------------------------------------------- |
+| Codex       | SDK `modelReasoningEffort` | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, `persistent` |
+| Claude Code | CLI `--effort`             | `low`, `medium`, `high`, `xhigh`, `max`                                   |
+
+Omit either setting to use the native session, profile or runtime defaults. Model availability and effort support for a particular model depend on the native provider and installed runtime. Native rejections are reported through the execution outcome.
+
+Explicit continuation with `agent run --session` uses the recorded model and effort requests, even after edits to the named agent file. For workflow dispatch, a change to either setting makes the prior session incompatible with that named configuration. Older sessions have no explicit effort request. `agent status` shows the recorded requests in `session.context` and omits keys for settings that were absent.
 
 Substitute the real session ID and paths. `executable` is on the controller. The other paths are on the agent VM. The executor validates the working directory directly because Rex can fall back to the user's home for an invalid terminal cwd.
 

@@ -795,3 +795,21 @@ it("contains the pinned SDK child crash with the original durable claim and a si
   expect(controller.executions.get(outcome.execution.id)).toEqual(outcome.execution);
   expect(runs.size).toBe(1);
 });
+
+it("passes recorded model and effort through the Rex executor on start and resume", async () => {
+  const controller = subsystem();
+  const requested = { ...context(), model: "configured", reasoningEffort: "xhigh" as const };
+  const started = await controller.execute({
+    ...intent("execution", "inspect context"),
+    context: requested,
+  });
+  expect(started.result).toEqual({ outcome: "completed", response: JSON.stringify(requested) });
+  const continued = await controller.execute({
+    id: "continued",
+    assignmentId: "next-assignment",
+    sessionId: started.session.id,
+    prompt: "inspect context",
+  });
+  expect(continued.result).toEqual(started.result);
+  expect(continued.session).toEqual(started.session);
+});

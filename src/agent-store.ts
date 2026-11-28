@@ -53,6 +53,7 @@ export const agentSchema = `
     provider TEXT NOT NULL CHECK(provider IN ('codex','claude-code')),
     working_directory TEXT NOT NULL,
     model TEXT,
+    reasoning_effort TEXT,
     config_directory TEXT,
     native_id TEXT,
     created_at TEXT NOT NULL,
@@ -143,7 +144,7 @@ export function createAgentStore(
       .prepare(
         `
       SELECT id, agent_name AS agentName, rex_config AS rex, provider, working_directory AS workingDirectory, model,
-             config_directory AS configDirectory, native_id AS nativeId, created_at AS createdAt
+             reasoning_effort AS reasoningEffort, config_directory AS configDirectory, native_id AS nativeId, created_at AS createdAt
       FROM agent_sessions WHERE id=?
     `,
       )
@@ -154,11 +155,21 @@ export function createAgentStore(
           provider: AgentProvider;
           workingDirectory: string;
           model: string | null;
+          reasoningEffort: NonNullable<AgentContext["reasoningEffort"]> | null;
           configDirectory: string | null;
         })
       | undefined;
     if (!row) return null;
-    const { provider, workingDirectory, model, configDirectory, agentName, rex, ...record } = row;
+    const {
+      provider,
+      workingDirectory,
+      model,
+      reasoningEffort,
+      configDirectory,
+      agentName,
+      rex,
+      ...record
+    } = row;
     return {
       ...record,
       placement: rex ? "rex" : "local",
@@ -168,6 +179,7 @@ export function createAgentStore(
         provider,
         workingDirectory,
         ...(model === null ? {} : { model }),
+        ...(reasoningEffort === null ? {} : { reasoningEffort }),
         ...(configDirectory === null ? {} : { configDirectory }),
       },
     };
@@ -354,6 +366,7 @@ export function createAgentStore(
               : recorded.context.provider !== input.context.provider ||
                 recorded.context.workingDirectory !== input.context.workingDirectory ||
                 recorded.context.model !== input.context.model ||
+                recorded.context.reasoningEffort !== input.context.reasoningEffort ||
                 recorded.context.configDirectory !== input.context.configDirectory ||
                 recorded.agentName !== input.agentName ||
                 JSON.stringify(recorded.rex) !== JSON.stringify(input.rex))
@@ -390,12 +403,13 @@ export function createAgentStore(
             throw new Error("Session has an unresolved execution. Inspect it before continuing.");
           record = saved;
         } else {
-          const { provider, workingDirectory, model, configDirectory } = input.context;
+          const { provider, workingDirectory, model, reasoningEffort, configDirectory } =
+            input.context;
           const id = randomUUID();
           db.prepare(
             `
-            INSERT INTO agent_sessions (id, placement, agent_name, rex_config, provider, working_directory, model, config_directory, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO agent_sessions (id, placement, agent_name, rex_config, provider, working_directory, model, reasoning_effort, config_directory, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `,
           ).run(
             id,
@@ -405,6 +419,7 @@ export function createAgentStore(
             provider,
             workingDirectory,
             model ?? null,
+            reasoningEffort ?? null,
             configDirectory ?? null,
             now,
           );

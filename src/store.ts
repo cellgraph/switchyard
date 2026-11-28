@@ -44,7 +44,7 @@ export function localProcessAlive(pid: number | null): boolean {
 }
 
 const applicationId = 0x53575944; // SWYD
-const schemaVersion = 23;
+const schemaVersion = 24;
 const unsupportedDatabase =
   "Unsupported Switchyard database identity or schema version. Use a fresh SWITCHYARD_DB_PATH for this implementation.";
 
@@ -366,15 +366,19 @@ export class WorkflowStore {
       url.searchParams.set("immutable", "1");
       using probe = new DatabaseSync(url.href, { readOnly: true });
       const { id, version } = databaseIdentity(probe);
-      if (id !== applicationId || (version !== 22 && version !== schemaVersion))
+      if (id !== applicationId || (version !== 22 && version !== 23 && version !== schemaVersion))
         throw new Error(unsupportedDatabase);
     }
 
     this.#transaction(() => {
       const { id, version } = databaseIdentity(this.#db);
       if (id === applicationId && version === schemaVersion) return;
-      if (id === applicationId && version === 22) {
-        this.#db.exec(`${planSchema} PRAGMA user_version = ${schemaVersion};`);
+      if (id === applicationId && (version === 22 || version === 23)) {
+        if (version === 22) this.#db.exec(planSchema);
+        this.#db.exec(`
+          ALTER TABLE agent_sessions ADD COLUMN reasoning_effort TEXT;
+          PRAGMA user_version = ${schemaVersion};
+        `);
         return;
       }
       if (

@@ -207,6 +207,7 @@ export function createPrCoordinator({
         session.context.provider === configured.agent.context.provider &&
         session.context.workingDirectory === configured.agent.context.workingDirectory &&
         session.context.model === configured.agent.context.model &&
+        session.context.reasoningEffort === configured.agent.context.reasoningEffort &&
         session.context.configDirectory === configured.agent.context.configDirectory;
       const requiredFailures =
         assignment.input.role === "implementer" ? assignment.input.failedChecks : [];

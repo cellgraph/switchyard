@@ -11,6 +11,8 @@ await runRemoteExecutor(process.argv[2]!, process.env.REX_BLOCK, (context) => {
     if (turn.prompt === earlyExitPrompt)
       return runSdkEarlyExitTurn(join(context.workingDirectory, "early-exit-codex"), turn.prompt);
     turn.onSession(nativeId);
+    if (turn.prompt === "inspect context")
+      return { outcome: "completed", response: JSON.stringify(context) };
     if (turn.prompt === "wait for release" || turn.prompt === "wait then fail") {
       const release = join(process.argv[2]!, "release");
       writeFileSync(join(process.argv[2]!, "waiting"), "", { mode: 0o600 });

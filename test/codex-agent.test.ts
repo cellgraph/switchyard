@@ -69,8 +69,13 @@ it("starts a native thread and passes through the prompt and schema using native
   expect(onSession).toHaveBeenCalledExactlyOnceWith(thread.thread_id);
 });
 
-it("continues the recorded thread with an optional model and config directory", async () => {
-  const adapter = createCodexAgent({ ...context, model: "configured", configDirectory: "/codex" });
+it("passes explicit model and effort to new and resumed threads", async () => {
+  const adapter = createCodexAgent({
+    ...context,
+    model: "configured",
+    reasoningEffort: "xhigh",
+    configDirectory: "/codex",
+  });
   const onSession = vi.fn();
   stream([thread, message("continued"), completed]);
   expect(await adapter.resume(thread.thread_id, { prompt: "continue", onSession })).toEqual({
@@ -85,9 +90,17 @@ it("continues the recorded thread with an optional model and config directory", 
   expect(sdk.resumeThread).toHaveBeenCalledWith(thread.thread_id, {
     workingDirectory: "/repo",
     model: "configured",
+    modelReasoningEffort: "xhigh",
   });
   expect(onSession).toHaveBeenCalledExactlyOnceWith(thread.thread_id);
 
+  stream([thread, message("started"), completed]);
+  expect((await adapter.start({ prompt: "start", onSession })).outcome).toBe("completed");
+  expect(sdk.startThread).toHaveBeenCalledWith({
+    workingDirectory: "/repo",
+    model: "configured",
+    modelReasoningEffort: "xhigh",
+  });
   onSession.mockClear();
   stream([{ ...thread, thread_id: "different-id" }, message("unexpected"), completed]);
   expect((await adapter.resume(thread.thread_id, { prompt: "continue", onSession })).outcome).toBe(

@@ -11,6 +11,7 @@ import {
 export function createCodexAgent({
   workingDirectory,
   model,
+  reasoningEffort,
   configDirectory,
 }: AgentContext): AgentAdapter {
   async function run(turn: AgentTurn, nativeId?: string): Promise<AgentResult> {
@@ -20,6 +21,7 @@ export function createCodexAgent({
     const options: ThreadOptions = {
       workingDirectory,
       ...(model === undefined ? {} : { model }),
+      ...(reasoningEffort === undefined ? {} : { modelReasoningEffort: reasoningEffort }),
     };
     let thread;
     try {

@@ -1,3 +1,4 @@
+import type { ModelReasoningEffort } from "@openai/codex-sdk";
 import { readFileSync } from "node:fs";
 import { isAbsolute, posix } from "node:path";
 import type { AgentContext } from "./agent.ts";
@@ -43,8 +44,14 @@ function absolute(value: unknown, remote: boolean): value is string {
   );
 }
 
+const supportedEfforts = {
+  codex: ["minimal", "low", "medium", "high", "xhigh", "max", "ultra", "persistent"],
+  "claude-code": ["low", "medium", "high", "xhigh", "max"],
+} satisfies Record<AgentContext["provider"], ModelReasoningEffort[]>;
+
 export function parseAgentContext(value: unknown, remote: boolean): AgentContext {
-  const { provider, workingDirectory, model, configDirectory } = record(value) ?? {};
+  const { provider, workingDirectory, model, reasoningEffort, configDirectory } =
+    record(value) ?? {};
   if (
     (provider !== "codex" && provider !== "claude-code") ||
     !absolute(workingDirectory, remote) ||
@@ -55,10 +62,17 @@ export function parseAgentContext(value: unknown, remote: boolean): AgentContext
       "An agent requires a native provider, an absolute working directory, and valid model and config directory overrides.",
     );
   }
+  const levels = supportedEfforts[provider];
+  const effort = levels.find((level) => level === reasoningEffort);
+  if (reasoningEffort !== undefined && effort === undefined)
+    throw new Error(
+      `Invalid reasoningEffort for ${provider}. Supported levels: ${levels.join(", ")}.`,
+    );
   return {
     provider,
     workingDirectory,
     ...(model === undefined ? {} : { model }),
+    ...(effort === undefined ? {} : { reasoningEffort: effort }),
     ...(configDirectory === undefined ? {} : { configDirectory }),
   };
 }
